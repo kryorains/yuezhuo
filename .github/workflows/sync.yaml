@@ -21,4 +21,4 @@ jobs:
           git remote add eduxiji \
             "https://oauth2:${EDUXIJI_GITLAB_TOKEN}@${EDUXIJI_GITLAB_REPO_URL}"
 
-          git push eduxiji HEAD:${{ github.ref_name }}
+          git push -f eduxiji HEAD:${{ github.ref_name }}
