@@ -114,6 +114,7 @@ fn is_removable(inst: &Inst) -> bool {
     matches!(
         inst.kind,
         InstKind::Nop
+            | InstKind::Alloca { .. }
             | InstKind::Phi { .. }
             | InstKind::Load { .. }
             | InstKind::Unary { .. }
