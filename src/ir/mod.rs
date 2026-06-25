@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
-mod core;
 pub mod lower;
+pub mod pass;
+mod repr;
 mod verify;
 
-pub use self::core::*;
+pub use repr::*;

@@ -102,16 +102,23 @@ fn main() {
     let mut parser = Parser::new(&source);
     let prog = parser.parse_program();
 
+    let mut module =
+        ir::lower::lower_program(&prog).unwrap_or_else(|e| panic!("IR lower failed: {:?}", e));
+    let opt_level = if opt_o1 {
+        ir::pass::OptLevel::O1
+    } else {
+        ir::pass::OptLevel::O0
+    };
+    ir::pass::run_pipeline(&mut module, opt_level);
+
     if emit_ir {
-        let module =
-            ir::lower::lower_program(&prog).unwrap_or_else(|e| panic!("IR lower failed: {:?}", e));
         fs::write(&output, format!("{:#?}", module))
             .unwrap_or_else(|e| panic!("Write {:?} failed: {}", output, e));
         eprintln!("Wrote {:?}", output);
         return;
     }
 
-    let asm = codegen::emit_asm(target, &prog, opt_o1);
+    let asm = codegen::emit_asm(target, &module);
     fs::write(&output, asm).unwrap_or_else(|e| panic!("Write {:?} failed: {}", output, e));
     eprintln!("Wrote {:?}", output);
 }

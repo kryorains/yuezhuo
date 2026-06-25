@@ -17,6 +17,7 @@ impl IrFuncLayout {
                 ValueKind::Inst(block, inst_idx) => {
                     let inst = &func.block(*block).insts[*inst_idx];
                     match &inst.kind {
+                        InstKind::Nop => 0,
                         InstKind::Alloca { ty } => 8 + ir_align_to(ir_size(ty), 8),
                         _ => ir_slot_size(&value.ty),
                     }

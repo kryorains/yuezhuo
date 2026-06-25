@@ -220,6 +220,7 @@ pub struct Inst {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstKind {
+    Nop,
     Phi {
         incomings: Vec<(BlockId, ValueId)>,
     },

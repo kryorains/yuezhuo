@@ -6,6 +6,7 @@ use crate::ir::{
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     pub(super) fn emit_inst(&mut self, inst: &Inst) {
         match &inst.kind {
+            InstKind::Nop => {}
             InstKind::Phi { incomings } => {
                 let result = inst.result.unwrap();
                 for (pred, value) in incomings {
@@ -117,8 +118,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     fn emit_phi_copies(&mut self, pred_idx: usize, target_idx: usize) {
         for inst in &self.func.block(BlockId(target_idx)).insts {
-            let InstKind::Phi { incomings } = &inst.kind else {
-                break;
+            let incomings = match &inst.kind {
+                InstKind::Nop => continue,
+                InstKind::Phi { incomings } => incomings,
+                _ => break,
             };
             let result = inst.result.unwrap();
             if let Some((_, value)) = incomings.iter().find(|(pred, _)| pred.0 == pred_idx) {

@@ -15,6 +15,9 @@ pub(crate) fn emit_ir_data_section(module: &Module, word_directive: &str) -> Str
 
 fn emit_const_words(out: &mut String, init: Option<&Const>, ty: &Type, word_directive: &str) {
     match init {
+        Some(value) if is_zero_const(value) => {
+            out.push_str(&format!("  .zero {}\n", ir_size(ty).max(4)));
+        }
         Some(Const::Array(values)) => {
             if let Type::Array { elem, len } = ty {
                 for idx in 0..*len {
@@ -23,11 +26,20 @@ fn emit_const_words(out: &mut String, init: Option<&Const>, ty: &Type, word_dire
             }
         }
         Some(Const::Zero(_)) | None => {
-            for _ in 0..(ir_size(ty) / 4).max(1) {
-                out.push_str(&format!("  {} 0\n", word_directive));
-            }
+            out.push_str(&format!("  .zero {}\n", ir_size(ty).max(4)));
         }
         Some(value) => out.push_str(&format!("  {} {}\n", word_directive, const_bits(value))),
+    }
+}
+
+fn is_zero_const(value: &Const) -> bool {
+    match value {
+        Const::Int(value) => *value == 0,
+        Const::Bool(value) => !*value,
+        Const::Float(bits) => *bits == 0,
+        Const::Zero(_) => true,
+        Const::Array(values) => values.iter().all(is_zero_const),
+        Const::String(_) => false,
     }
 }
 

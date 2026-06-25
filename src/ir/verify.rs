@@ -66,12 +66,13 @@ impl<'a> Verifier<'a> {
     fn verify_phi_placement(&mut self, block_id: BlockId, block: &Block) {
         let mut seen_non_phi = false;
         for inst in &block.insts {
-            if matches!(inst.kind, InstKind::Phi { .. }) {
-                if seen_non_phi {
+            match inst.kind {
+                InstKind::Nop => {}
+                InstKind::Phi { .. } if seen_non_phi => {
                     self.error(format!("{} has phi after non-phi instruction", block_id));
                 }
-            } else {
-                seen_non_phi = true;
+                InstKind::Phi { .. } => {}
+                _ => seen_non_phi = true,
             }
         }
     }
@@ -98,6 +99,11 @@ impl<'a> Verifier<'a> {
 
     fn verify_inst(&mut self, block: BlockId, inst: &Inst) {
         match &inst.kind {
+            InstKind::Nop => {
+                if inst.result.is_some() {
+                    self.error(format!("{} has nop with result", block));
+                }
+            }
             InstKind::Phi { incomings } => {
                 if inst.result.is_none() {
                     self.error(format!("{} has phi without result", block));

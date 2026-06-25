@@ -8,6 +8,8 @@ COMPILER=${COMPILER:-"$ROOT_DIR/target/debug/compiler"}
 RUNTIME=${RUNTIME:-"$ROOT_DIR/tools/sylib.c"}
 WORK_DIR=${WORK_DIR:-"/tmp/yuezhuo-functional-tests"}
 RUN_TIMEOUT=${RUN_TIMEOUT:-5s}
+COMPILER_FLAGS=${COMPILER_FLAGS:-}
+read -r -a compiler_flags <<< "$COMPILER_FLAGS"
 
 case "$TARGET" in
   x86_64|x86-64|amd64)
@@ -63,7 +65,7 @@ while IFS= read -r sy; do
 
   total=$((total + 1))
 
-  if ! "$COMPILER" "$sy" -S -o "$asm" --target "$TARGET" >"$log" 2>&1; then
+  if ! "$COMPILER" "$sy" -S -o "$asm" --target "$TARGET" "${compiler_flags[@]}" >"$log" 2>&1; then
     printf 'COMPILE_FAIL %s\n' "$rel"
     failed=$((failed + 1))
     compile_fail=$((compile_fail + 1))
