@@ -1,0 +1,2 @@
+examples/perf-aarch64/** filter=lfs diff=lfs merge=lfs -text
+examples/perf-riscv64/** filter=lfs diff=lfs merge=lfs -text
