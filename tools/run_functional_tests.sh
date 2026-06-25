@@ -3,10 +3,31 @@ set -u
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=${1:-"$ROOT_DIR/examples/functional"}
+TARGET=${TARGET:-x86_64}
 COMPILER=${COMPILER:-"$ROOT_DIR/target/debug/compiler"}
 RUNTIME=${RUNTIME:-"$ROOT_DIR/tools/sylib.c"}
 WORK_DIR=${WORK_DIR:-"/tmp/yuezhuo-functional-tests"}
 RUN_TIMEOUT=${RUN_TIMEOUT:-5s}
+
+case "$TARGET" in
+  x86_64|x86-64|amd64)
+    CC=${CC:-gcc}
+    RUNNER=${RUNNER:-}
+    ;;
+  aarch64|arm64)
+    CC=${CC:-aarch64-linux-gnu-gcc}
+    RUNNER=${RUNNER:-"qemu-aarch64 -L /usr/aarch64-linux-gnu"}
+    ;;
+  riscv64|riscv64gc)
+    CC=${CC:-riscv64-linux-gnu-gcc}
+    RUNNER=${RUNNER:-"qemu-riscv64 -L /usr/riscv64-linux-gnu"}
+    ;;
+  *)
+    printf 'Unknown TARGET=%s\n' "$TARGET" >&2
+    exit 2
+    ;;
+esac
+read -r -a runner_args <<< "$RUNNER"
 
 if [[ ! -x "$COMPILER" ]]; then
   cargo build --manifest-path "$ROOT_DIR/Cargo.toml" >/dev/null || exit 1
@@ -42,14 +63,14 @@ while IFS= read -r sy; do
 
   total=$((total + 1))
 
-  if ! "$COMPILER" "$sy" -S -o "$asm" --target x86_64 >"$log" 2>&1; then
+  if ! "$COMPILER" "$sy" -S -o "$asm" --target "$TARGET" >"$log" 2>&1; then
     printf 'COMPILE_FAIL %s\n' "$rel"
     failed=$((failed + 1))
     compile_fail=$((compile_fail + 1))
     continue
   fi
 
-  if ! gcc "$asm" "$RUNTIME" -o "$exe" -lm >>"$log" 2>&1; then
+  if ! "$CC" "$asm" "$RUNTIME" -o "$exe" -lm >>"$log" 2>&1; then
     printf 'LINK_FAIL    %s\n' "$rel"
     failed=$((failed + 1))
     link_fail=$((link_fail + 1))
@@ -57,9 +78,9 @@ while IFS= read -r sy; do
   fi
 
   if [[ -f "$input" ]]; then
-    timeout "$RUN_TIMEOUT" "$exe" <"$input" >"$actual" 2>>"$log"
+    timeout "$RUN_TIMEOUT" "${runner_args[@]}" "$exe" <"$input" >"$actual" 2>>"$log"
   else
-    timeout "$RUN_TIMEOUT" "$exe" >"$actual" 2>>"$log"
+    timeout "$RUN_TIMEOUT" "${runner_args[@]}" "$exe" >"$actual" 2>>"$log"
   fi
   status=$?
 

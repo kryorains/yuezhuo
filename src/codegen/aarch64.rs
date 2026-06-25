@@ -1,18 +1,13 @@
 use crate::ast::{
     BinaryOp, BlockItem, Decl, Def, Expr, Func, Init, Item, LValue, Program, Stmt, Type, UnaryOp,
 };
-use crate::codegen::Target;
 use std::collections::HashMap;
 
-pub fn emit_asm(target: Target, prog: &Program, _opt_o1: bool) -> String {
-    match target {
-        Target::X86_64 => X86Emitter::new(prog).emit(),
-        Target::AArch64 => crate::codegen::aarch64::emit_asm(prog),
-        Target::Riscv64 => crate::codegen::riscv64::emit_asm(prog),
-    }
+pub fn emit_asm(prog: &Program) -> String {
+    AArch64Emitter::new(prog).emit()
 }
 
-struct X86Emitter<'a> {
+struct AArch64Emitter<'a> {
     prog: &'a Program,
     out: String,
     globals: HashMap<String, GlobalInfo>,
@@ -21,7 +16,7 @@ struct X86Emitter<'a> {
     label_id: usize,
 }
 
-impl<'a> X86Emitter<'a> {
+impl<'a> AArch64Emitter<'a> {
     fn new(prog: &'a Program) -> Self {
         Self {
             prog,
@@ -183,7 +178,7 @@ impl<'a> X86Emitter<'a> {
                 let dims = const_dims(&def.dims, &self.consts);
                 let values = flatten_const_init(def.init.as_ref(), &decl.ty, &dims, &self.consts);
                 for value in values {
-                    self.out.push_str(&format!("  .long {}\n", value.to_bits()));
+                    self.out.push_str(&format!("  .word {}\n", value.to_bits()));
                 }
             }
         }
@@ -197,7 +192,7 @@ impl<'a> X86Emitter<'a> {
 }
 
 struct FuncEmitter<'a, 'b> {
-    parent: &'a mut X86Emitter<'b>,
+    parent: &'a mut AArch64Emitter<'b>,
     func: &'b Func,
     body: String,
     return_label: String,
@@ -210,7 +205,7 @@ struct FuncEmitter<'a, 'b> {
 }
 
 impl<'a, 'b> FuncEmitter<'a, 'b> {
-    fn new(parent: &'a mut X86Emitter<'b>, func: &'b Func) -> Self {
+    fn new(parent: &'a mut AArch64Emitter<'b>, func: &'b Func) -> Self {
         Self {
             parent,
             func,
@@ -229,32 +224,36 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
         self.emit_params();
         self.emit_block_items(&self.func.body.items);
         if self.func.ret == Type::Void {
-            self.body
-                .push_str(&format!("  jmp {}\n", self.return_label));
+            self.body.push_str(&format!("  b {}\n", self.return_label));
         }
 
         let stack_size = align_to(self.stack_size, 16);
         self.parent.out.push_str(&format!(
-            ".globl {0}\n.type {0}, @function\n{0}:\n  pushq %rbp\n  movq %rsp, %rbp\n",
+            ".globl {0}\n.type {0}, %function\n{0}:\n  stp x29, x30, [sp, #-16]!\n  mov x29, sp\n",
             self.func.name
         ));
         if stack_size != 0 {
             self.parent
                 .out
-                .push_str(&format!("  subq ${}, %rsp\n", stack_size));
+                .push_str(&mov_x_imm("x16", stack_size as i64));
+            self.parent.out.push_str("  sub sp, sp, x16\n");
         }
         self.parent.out.push_str(&self.body);
         self.parent
             .out
-            .push_str(&format!("{}:\n  leave\n  ret\n\n", self.return_label));
+            .push_str(&format!("{}:\n", self.return_label));
+        if stack_size != 0 {
+            self.parent
+                .out
+                .push_str(&mov_x_imm("x16", stack_size as i64));
+            self.parent.out.push_str("  add sp, sp, x16\n");
+        }
+        self.parent
+            .out
+            .push_str("  ldp x29, x30, [sp], #16\n  ret\n\n");
     }
 
     fn emit_params(&mut self) {
-        let int_regs = ["%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"];
-        let ptr_regs = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
-        let float_regs = [
-            "%xmm0", "%xmm1", "%xmm2", "%xmm3", "%xmm4", "%xmm5", "%xmm6", "%xmm7",
-        ];
         let mut int_idx = 0usize;
         let mut float_idx = 0usize;
         let mut stack_idx = 0usize;
@@ -278,40 +277,32 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 },
             );
             if is_array {
-                if int_idx < 6 {
-                    self.body
-                        .push_str(&format!("  movq {}, {}(%rbp)\n", ptr_regs[int_idx], offset));
+                if int_idx < 8 {
+                    self.store_frame_x(&format!("x{}", int_idx), offset);
                 } else {
                     let src = 16 + (stack_idx as i32) * 8;
-                    self.body.push_str(&format!("  movq {}(%rbp), %rax\n", src));
-                    self.body
-                        .push_str(&format!("  movq %rax, {}(%rbp)\n", offset));
+                    self.load_frame_x("x17", src);
+                    self.store_frame_x("x17", offset);
                     stack_idx += 1;
                 }
                 int_idx += 1;
             } else if param.ty == Type::Float {
                 if float_idx < 8 {
-                    self.body.push_str(&format!(
-                        "  movss {}, {}(%rbp)\n",
-                        float_regs[float_idx], offset
-                    ));
+                    self.store_frame_s(&format!("s{}", float_idx), offset);
                 } else {
                     let src = 16 + (stack_idx as i32) * 8;
-                    self.body.push_str(&format!("  movl {}(%rbp), %eax\n", src));
-                    self.body
-                        .push_str(&format!("  movl %eax, {}(%rbp)\n", offset));
+                    self.load_frame_w("w17", src);
+                    self.store_frame_w("w17", offset);
                     stack_idx += 1;
                 }
                 float_idx += 1;
             } else {
-                if int_idx < 6 {
-                    self.body
-                        .push_str(&format!("  movl {}, {}(%rbp)\n", int_regs[int_idx], offset));
+                if int_idx < 8 {
+                    self.store_frame_w(&format!("w{}", int_idx), offset);
                 } else {
                     let src = 16 + (stack_idx as i32) * 8;
-                    self.body.push_str(&format!("  movl {}(%rbp), %eax\n", src));
-                    self.body
-                        .push_str(&format!("  movl %eax, {}(%rbp)\n", offset));
+                    self.load_frame_w("w17", src);
+                    self.store_frame_w("w17", offset);
                     stack_idx += 1;
                 }
                 int_idx += 1;
@@ -353,25 +344,23 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
             let values = flatten_init_exprs(init, &dims);
             for (idx, expr) in values.iter().enumerate() {
                 self.emit_array_element_addr(offset, &dims, idx);
-                self.push_rax();
+                self.push_x0();
                 if let Some(expr) = expr {
                     if decl.ty == Type::Float {
                         self.emit_float_expr(expr);
                     } else {
                         self.emit_int_expr(expr);
                     }
+                } else if decl.ty == Type::Float {
+                    self.body.push_str("  fmov s0, wzr\n");
                 } else {
-                    if decl.ty == Type::Float {
-                        self.body.push_str("  pxor %xmm0, %xmm0\n");
-                    } else {
-                        self.body.push_str("  movl $0, %eax\n");
-                    }
+                    self.body.push_str("  mov w0, wzr\n");
                 }
-                self.pop_rcx();
+                self.pop_x1();
                 if decl.ty == Type::Float {
-                    self.body.push_str("  movss %xmm0, (%rcx)\n");
+                    self.body.push_str("  str s0, [x1]\n");
                 } else {
-                    self.body.push_str("  movl %eax, (%rcx)\n");
+                    self.body.push_str("  str w0, [x1]\n");
                 }
             }
         }
@@ -387,18 +376,18 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
         match stmt {
             Stmt::Assign { target, value } => {
                 self.emit_lvalue_addr(target);
-                self.push_rax();
+                self.push_x0();
                 let target_ty = self.lvalue_base_type(target);
                 if target_ty == Type::Float {
                     self.emit_float_expr(value);
                 } else {
                     self.emit_int_expr(value);
                 }
-                self.pop_rcx();
+                self.pop_x1();
                 if target_ty == Type::Float {
-                    self.body.push_str("  movss %xmm0, (%rcx)\n");
+                    self.body.push_str("  str s0, [x1]\n");
                 } else {
-                    self.body.push_str("  movl %eax, (%rcx)\n");
+                    self.body.push_str("  str w0, [x1]\n");
                 }
             }
             Stmt::Expr(expr) => {
@@ -420,10 +409,10 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 let end_label = self.parent.fresh_label("endif");
                 self.emit_cond(cond);
                 self.body
-                    .push_str(&format!("  cmpl $0, %eax\n  je {}\n", else_label));
+                    .push_str(&format!("  cmp w0, #0\n  beq {}\n", else_label));
                 self.emit_stmt(then_branch);
                 self.body
-                    .push_str(&format!("  jmp {}\n{}:\n", end_label, else_label));
+                    .push_str(&format!("  b {}\n{}:\n", end_label, else_label));
                 if let Some(else_branch) = else_branch {
                     self.emit_stmt(else_branch);
                 }
@@ -437,19 +426,19 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 self.body.push_str(&format!("{}:\n", start));
                 self.emit_cond(cond);
                 self.body
-                    .push_str(&format!("  cmpl $0, %eax\n  je {}\n", end));
+                    .push_str(&format!("  cmp w0, #0\n  beq {}\n", end));
                 self.emit_stmt(body);
-                self.body.push_str(&format!("  jmp {}\n{}:\n", start, end));
+                self.body.push_str(&format!("  b {}\n{}:\n", start, end));
                 self.continue_labels.pop();
                 self.break_labels.pop();
             }
             Stmt::Break => {
                 let label = self.break_labels.last().unwrap();
-                self.body.push_str(&format!("  jmp {}\n", label));
+                self.body.push_str(&format!("  b {}\n", label));
             }
             Stmt::Continue => {
                 let label = self.continue_labels.last().unwrap();
-                self.body.push_str(&format!("  jmp {}\n", label));
+                self.body.push_str(&format!("  b {}\n", label));
             }
             Stmt::Return(expr) => {
                 if let Some(expr) = expr {
@@ -459,20 +448,15 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                         self.emit_int_expr(expr);
                     }
                 }
-                self.body
-                    .push_str(&format!("  jmp {}\n", self.return_label));
+                self.body.push_str(&format!("  b {}\n", self.return_label));
             }
         }
     }
 
     fn emit_int_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Int(v) => self
-                .body
-                .push_str(&format!("  movl ${}, %eax\n", *v as i32)),
-            Expr::Float(v) => self
-                .body
-                .push_str(&format!("  movl ${}, %eax\n", *v as i32)),
+            Expr::Int(v) => self.body.push_str(&mov_w_imm("w0", *v as i32)),
+            Expr::Float(v) => self.body.push_str(&mov_w_imm("w0", *v as i32)),
             Expr::String(_) => panic!("string codegen is not implemented yet"),
             Expr::LValue(lvalue) => {
                 self.emit_lvalue_addr(lvalue);
@@ -480,27 +464,26 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                     return;
                 }
                 if self.lvalue_base_type(lvalue) == Type::Float {
-                    self.body.push_str("  cvttss2sil (%rax), %eax\n");
+                    self.body.push_str("  ldr s0, [x0]\n  fcvtzs w0, s0\n");
                 } else {
-                    self.body.push_str("  movl (%rax), %eax\n");
+                    self.body.push_str("  ldr w0, [x0]\n");
                 }
             }
             Expr::Call { name, args } => {
                 let ret = self.emit_call(name, args);
                 if ret == Type::Float {
-                    self.body.push_str("  cvttss2si %xmm0, %eax\n");
+                    self.body.push_str("  fcvtzs w0, s0\n");
                 }
             }
             Expr::Unary { op, expr } => match op {
                 UnaryOp::Pos => self.emit_int_expr(expr),
                 UnaryOp::Neg => {
                     self.emit_int_expr(expr);
-                    self.body.push_str("  negl %eax\n");
+                    self.body.push_str("  neg w0, w0\n");
                 }
                 UnaryOp::Not => {
                     self.emit_cond(expr);
-                    self.body
-                        .push_str("  cmpl $0, %eax\n  sete %al\n  movzbl %al, %eax\n");
+                    self.body.push_str("  cmp w0, #0\n  cset w0, eq\n");
                 }
             },
             Expr::Binary { op, lhs, rhs } => self.emit_int_binary(*op, lhs, rhs),
@@ -513,12 +496,12 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
             let end_label = self.parent.fresh_label("land_end");
             self.emit_cond(lhs);
             self.body
-                .push_str(&format!("  cmpl $0, %eax\n  je {}\n", false_label));
+                .push_str(&format!("  cmp w0, #0\n  beq {}\n", false_label));
             self.emit_cond(rhs);
             self.body
-                .push_str(&format!("  cmpl $0, %eax\n  je {}\n", false_label));
+                .push_str(&format!("  cmp w0, #0\n  beq {}\n", false_label));
             self.body.push_str(&format!(
-                "  movl $1, %eax\n  jmp {}\n{}:\n  movl $0, %eax\n{}:\n",
+                "  mov w0, #1\n  b {}\n{}:\n  mov w0, wzr\n{}:\n",
                 end_label, false_label, end_label
             ));
             return;
@@ -528,12 +511,12 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
             let end_label = self.parent.fresh_label("lor_end");
             self.emit_cond(lhs);
             self.body
-                .push_str(&format!("  cmpl $0, %eax\n  jne {}\n", true_label));
+                .push_str(&format!("  cmp w0, #0\n  bne {}\n", true_label));
             self.emit_cond(rhs);
             self.body
-                .push_str(&format!("  cmpl $0, %eax\n  jne {}\n", true_label));
+                .push_str(&format!("  cmp w0, #0\n  bne {}\n", true_label));
             self.body.push_str(&format!(
-                "  movl $0, %eax\n  jmp {}\n{}:\n  movl $1, %eax\n{}:\n",
+                "  mov w0, wzr\n  b {}\n{}:\n  mov w0, #1\n{}:\n",
                 end_label, true_label, end_label
             ));
             return;
@@ -553,7 +536,7 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 return;
             }
             self.emit_float_binary_value(op, lhs, rhs);
-            self.body.push_str("  cvttss2si %xmm0, %eax\n");
+            self.body.push_str("  fcvtzs w0, s0\n");
             return;
         }
 
@@ -563,18 +546,19 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
         }
 
         self.emit_int_expr(lhs);
-        self.push_rax();
+        self.push_x0();
         self.emit_int_expr(rhs);
-        self.pop_rcx();
+        self.pop_x1();
         match op {
-            BinaryOp::Add => self.body.push_str("  addl %ecx, %eax\n"),
-            BinaryOp::Sub => self.body.push_str("  subl %eax, %ecx\n  movl %ecx, %eax\n"),
-            BinaryOp::Mul => self.body.push_str("  imull %ecx, %eax\n"),
+            BinaryOp::Add => self.body.push_str("  add w0, w1, w0\n"),
+            BinaryOp::Sub => self.body.push_str("  sub w0, w1, w0\n"),
+            BinaryOp::Mul => self.body.push_str("  mul w0, w1, w0\n"),
             BinaryOp::Div | BinaryOp::Mod => {
-                self.body
-                    .push_str("  movl %eax, %r8d\n  movl %ecx, %eax\n  cltd\n  idivl %r8d\n");
+                self.body.push_str("  sdiv w2, w1, w0\n");
                 if op == BinaryOp::Mod {
-                    self.body.push_str("  movl %edx, %eax\n");
+                    self.body.push_str("  msub w0, w2, w0, w1\n");
+                } else {
+                    self.body.push_str("  mov w0, w2\n");
                 }
             }
             BinaryOp::Lt
@@ -583,18 +567,17 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
             | BinaryOp::Ge
             | BinaryOp::Eq
             | BinaryOp::Ne => {
-                self.body.push_str("  cmpl %eax, %ecx\n");
+                self.body.push_str("  cmp w1, w0\n");
                 let cc = match op {
-                    BinaryOp::Lt => "setl",
-                    BinaryOp::Gt => "setg",
-                    BinaryOp::Le => "setle",
-                    BinaryOp::Ge => "setge",
-                    BinaryOp::Eq => "sete",
-                    BinaryOp::Ne => "setne",
+                    BinaryOp::Lt => "lt",
+                    BinaryOp::Gt => "gt",
+                    BinaryOp::Le => "le",
+                    BinaryOp::Ge => "ge",
+                    BinaryOp::Eq => "eq",
+                    BinaryOp::Ne => "ne",
                     _ => unreachable!(),
                 };
-                self.body
-                    .push_str(&format!("  {} %al\n  movzbl %al, %eax\n", cc));
+                self.body.push_str(&format!("  cset w0, {}\n", cc));
             }
             BinaryOp::And | BinaryOp::Or => unreachable!(),
         }
@@ -621,12 +604,12 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
 
         self.emit_int_expr(first);
         for (op, expr) in rest.into_iter().rev() {
-            self.push_rax();
+            self.push_x0();
             self.emit_int_expr(expr);
-            self.pop_rcx();
+            self.pop_x1();
             match op {
-                BinaryOp::Add => self.body.push_str("  addl %ecx, %eax\n"),
-                BinaryOp::Sub => self.body.push_str("  subl %eax, %ecx\n  movl %ecx, %eax\n"),
+                BinaryOp::Add => self.body.push_str("  add w0, w1, w0\n"),
+                BinaryOp::Sub => self.body.push_str("  sub w0, w1, w0\n"),
                 _ => unreachable!(),
             }
         }
@@ -634,48 +617,48 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
 
     fn emit_float_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Int(v) => self.body.push_str(&format!(
-                "  movl ${}, %eax\n  cvtsi2ssl %eax, %xmm0\n",
-                *v as i32
-            )),
+            Expr::Int(v) => self
+                .body
+                .push_str(&format!("{}  scvtf s0, w0\n", mov_w_imm("w0", *v as i32))),
             Expr::Float(v) => {
                 let label = self.parent.fresh_label("float");
                 self.parent.out.push_str(&format!(
-                    ".section .rodata\n{}:\n  .long {}\n.text\n",
+                    ".section .rodata\n.align 2\n{}:\n  .word {}\n.text\n",
                     label,
                     v.to_bits()
                 ));
-                self.body
-                    .push_str(&format!("  movss {}(%rip), %xmm0\n", label));
+                self.body.push_str(&format!(
+                    "  adrp x16, {}\n  add x16, x16, :lo12:{}\n  ldr s0, [x16]\n",
+                    label, label
+                ));
             }
             Expr::String(_) => panic!("string codegen is not implemented yet"),
             Expr::LValue(lvalue) => {
                 self.emit_lvalue_addr(lvalue);
                 if self.lvalue_yields_pointer(lvalue) {
-                    self.body.push_str("  cvtsi2ssq %rax, %xmm0\n");
+                    self.body.push_str("  scvtf s0, x0\n");
                 } else if self.lvalue_base_type(lvalue) == Type::Float {
-                    self.body.push_str("  movss (%rax), %xmm0\n");
+                    self.body.push_str("  ldr s0, [x0]\n");
                 } else {
-                    self.body.push_str("  cvtsi2ssl (%rax), %xmm0\n");
+                    self.body.push_str("  ldr w0, [x0]\n  scvtf s0, w0\n");
                 }
             }
             Expr::Call { name, args } => {
                 let ret = self.emit_call(name, args);
                 if ret != Type::Float {
-                    self.body.push_str("  cvtsi2ssl %eax, %xmm0\n");
+                    self.body.push_str("  scvtf s0, w0\n");
                 }
             }
             Expr::Unary { op, expr } => match op {
                 UnaryOp::Pos => self.emit_float_expr(expr),
                 UnaryOp::Neg => {
                     self.emit_float_expr(expr);
-                    self.body.push_str(
-                        "  movl $-2147483648, %eax\n  movd %eax, %xmm1\n  xorps %xmm1, %xmm0\n",
-                    );
+                    self.body.push_str("  fneg s0, s0\n");
                 }
                 UnaryOp::Not => {
                     self.emit_cond(expr);
-                    self.body.push_str("  cmpl $0, %eax\n  sete %al\n  movzbl %al, %eax\n  cvtsi2ssl %eax, %xmm0\n");
+                    self.body
+                        .push_str("  cmp w0, #0\n  cset w0, eq\n  scvtf s0, w0\n");
                 }
             },
             Expr::Binary { op, lhs, rhs } => {
@@ -691,7 +674,7 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                         | BinaryOp::Or
                 ) {
                     self.emit_int_binary(*op, lhs, rhs);
-                    self.body.push_str("  cvtsi2ssl %eax, %xmm0\n");
+                    self.body.push_str("  scvtf s0, w0\n");
                 } else {
                     self.emit_float_binary_value(*op, lhs, rhs);
                 }
@@ -701,22 +684,14 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
 
     fn emit_float_binary_value(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr) {
         self.emit_float_expr(lhs);
-        self.body
-            .push_str("  subq $8, %rsp\n  movss %xmm0, (%rsp)\n");
-        self.temp_stack += 8;
+        self.push_s0();
         self.emit_float_expr(rhs);
-        self.body
-            .push_str("  movss (%rsp), %xmm1\n  addq $8, %rsp\n");
-        self.temp_stack -= 8;
+        self.pop_s1();
         match op {
-            BinaryOp::Add => self.body.push_str("  addss %xmm1, %xmm0\n"),
-            BinaryOp::Sub => self
-                .body
-                .push_str("  subss %xmm0, %xmm1\n  movaps %xmm1, %xmm0\n"),
-            BinaryOp::Mul => self.body.push_str("  mulss %xmm1, %xmm0\n"),
-            BinaryOp::Div => self
-                .body
-                .push_str("  divss %xmm0, %xmm1\n  movaps %xmm1, %xmm0\n"),
+            BinaryOp::Add => self.body.push_str("  fadd s0, s1, s0\n"),
+            BinaryOp::Sub => self.body.push_str("  fsub s0, s1, s0\n"),
+            BinaryOp::Mul => self.body.push_str("  fmul s0, s1, s0\n"),
+            BinaryOp::Div => self.body.push_str("  fdiv s0, s1, s0\n"),
             BinaryOp::Mod => panic!("float modulo is not supported"),
             _ => unreachable!(),
         }
@@ -724,43 +699,32 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
 
     fn emit_float_compare(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr) {
         self.emit_float_expr(lhs);
-        self.body
-            .push_str("  subq $8, %rsp\n  movss %xmm0, (%rsp)\n");
-        self.temp_stack += 8;
+        self.push_s0();
         self.emit_float_expr(rhs);
-        self.body
-            .push_str("  movss (%rsp), %xmm1\n  addq $8, %rsp\n");
-        self.temp_stack -= 8;
-        self.body.push_str("  ucomiss %xmm0, %xmm1\n");
+        self.pop_s1();
+        self.body.push_str("  fcmp s1, s0\n");
         let cc = match op {
-            BinaryOp::Lt => "setb",
-            BinaryOp::Gt => "seta",
-            BinaryOp::Le => "setbe",
-            BinaryOp::Ge => "setae",
-            BinaryOp::Eq => "sete",
-            BinaryOp::Ne => "setne",
+            BinaryOp::Lt => "mi",
+            BinaryOp::Gt => "gt",
+            BinaryOp::Le => "ls",
+            BinaryOp::Ge => "ge",
+            BinaryOp::Eq => "eq",
+            BinaryOp::Ne => "ne",
             _ => unreachable!(),
         };
-        self.body
-            .push_str(&format!("  {} %al\n  movzbl %al, %eax\n", cc));
+        self.body.push_str(&format!("  cset w0, {}\n", cc));
     }
 
     fn emit_cond(&mut self, expr: &Expr) {
         if self.expr_may_be_float(expr) && self.expr_type(expr) == Type::Float {
             self.emit_float_expr(expr);
-            self.body.push_str(
-                "  pxor %xmm1, %xmm1\n  ucomiss %xmm1, %xmm0\n  setne %al\n  movzbl %al, %eax\n",
-            );
+            self.body.push_str("  fcmp s0, #0.0\n  cset w0, ne\n");
         } else {
             self.emit_int_expr(expr);
         }
     }
 
     fn emit_call(&mut self, name: &str, args: &[Expr]) -> Type {
-        let int_regs = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
-        let float_regs = [
-            "%xmm0", "%xmm1", "%xmm2", "%xmm3", "%xmm4", "%xmm5", "%xmm6", "%xmm7",
-        ];
         let sig = self
             .parent
             .funcs
@@ -776,9 +740,6 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                     })
                     .collect(),
             });
-        let mut int_idx = 0usize;
-        let mut float_idx = 0usize;
-        let mut stack_count = 0usize;
         let arg_sigs = args
             .iter()
             .enumerate()
@@ -789,49 +750,72 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 })
             })
             .collect::<Vec<_>>();
-        for arg_sig in &arg_sigs {
-            if arg_sig.is_array || arg_sig.ty != Type::Float {
-                if int_idx < 6 {
-                    int_idx += 1;
-                } else {
-                    stack_count += 1;
-                }
-            } else if float_idx < 8 {
-                float_idx += 1;
-            } else {
-                stack_count += 1;
-            }
-        }
+
+        let locations = self.call_locations(&arg_sigs);
+        let stack_count = locations
+            .iter()
+            .filter(|location| matches!(location, ArgLocation::Stack))
+            .count();
 
         for (arg, arg_sig) in args.iter().zip(arg_sigs.iter()) {
             if arg_sig.ty == Type::Float && !arg_sig.is_array {
                 self.emit_float_expr(arg);
-                self.body
-                    .push_str("  subq $8, %rsp\n  movq $0, (%rsp)\n  movss %xmm0, (%rsp)\n");
+                self.push_s0();
             } else {
                 self.emit_int_expr(arg);
-                if !arg_sig.is_array {
-                    self.body.push_str("  cltq\n");
-                }
-                self.body.push_str("  pushq %rax\n");
+                self.push_x0();
             }
-            self.temp_stack += 8;
         }
 
-        let saved_bytes = (args.len() as i32) * 8;
-        let call_stack = self.temp_stack + (stack_count as i32) * 8;
-        let pad = if call_stack % 16 == 0 { 0 } else { 8 };
-        if pad != 0 {
-            self.body.push_str("  subq $8, %rsp\n");
-            self.temp_stack += 8;
+        let saved_bytes = (args.len() as i32) * 16;
+        if stack_count != 0 {
+            self.adjust_sp(-((stack_count as i32) * 8));
+            self.temp_stack += (stack_count as i32) * 8;
         }
 
-        int_idx = 0;
-        float_idx = 0;
-        let mut locations = Vec::with_capacity(args.len());
-        for arg_sig in &arg_sigs {
+        let mut pushed_stack = 0usize;
+        for (idx, location) in locations.iter().enumerate() {
+            if matches!(location, ArgLocation::Stack) {
+                let saved_offset = (args.len() - 1 - idx) * 16 + stack_count * 8;
+                self.body.push_str(&format!(
+                    "  ldr x16, [sp, #{}]\n  str x16, [sp, #{}]\n",
+                    saved_offset,
+                    pushed_stack * 8
+                ));
+                pushed_stack += 1;
+            }
+        }
+
+        for (idx, location) in locations.iter().enumerate() {
+            let saved_offset = stack_count * 8 + (args.len() - 1 - idx) * 16;
+            match location {
+                ArgLocation::IntReg(reg_idx) => {
+                    self.body
+                        .push_str(&format!("  ldr x{}, [sp, #{}]\n", reg_idx, saved_offset));
+                }
+                ArgLocation::FloatReg(reg_idx) => {
+                    self.body
+                        .push_str(&format!("  ldr s{}, [sp, #{}]\n", reg_idx, saved_offset));
+                }
+                ArgLocation::Stack => {}
+            }
+        }
+        self.body.push_str(&format!("  bl {}\n", name));
+        let cleanup = saved_bytes + (stack_count as i32) * 8;
+        if cleanup != 0 {
+            self.adjust_sp(cleanup);
+            self.temp_stack -= cleanup;
+        }
+        sig.ret
+    }
+
+    fn call_locations(&self, arg_sigs: &[ParamSig]) -> Vec<ArgLocation> {
+        let mut int_idx = 0usize;
+        let mut float_idx = 0usize;
+        let mut locations = Vec::with_capacity(arg_sigs.len());
+        for arg_sig in arg_sigs {
             if arg_sig.is_array || arg_sig.ty != Type::Float {
-                if int_idx < 6 {
+                if int_idx < 8 {
                     locations.push(ArgLocation::IntReg(int_idx));
                     int_idx += 1;
                 } else {
@@ -844,61 +828,22 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 locations.push(ArgLocation::Stack);
             }
         }
-
-        let mut pushed_stack = 0usize;
-        for (idx, location) in locations.iter().enumerate().rev() {
-            if matches!(location, ArgLocation::Stack) {
-                let offset = pad + (pushed_stack as i32) * 8 + ((args.len() - 1 - idx) as i32) * 8;
-                self.body
-                    .push_str(&format!("  movq {}(%rsp), %rax\n  pushq %rax\n", offset));
-                self.temp_stack += 8;
-                pushed_stack += 1;
-            }
-        }
-
-        let saved_base = pad + (stack_count as i32) * 8;
-        for (idx, location) in locations.iter().enumerate() {
-            let offset = saved_base + ((args.len() - 1 - idx) as i32) * 8;
-            match location {
-                ArgLocation::IntReg(reg_idx) => {
-                    self.body.push_str(&format!(
-                        "  movq {}(%rsp), {}\n",
-                        offset, int_regs[*reg_idx]
-                    ));
-                }
-                ArgLocation::FloatReg(reg_idx) => {
-                    self.body.push_str(&format!(
-                        "  movss {}(%rsp), {}\n",
-                        offset, float_regs[*reg_idx]
-                    ));
-                }
-                ArgLocation::Stack => {}
-            }
-        }
-        self.body
-            .push_str(&format!("  movb ${}, %al\n", float_idx.min(8)));
-        self.body.push_str(&format!("  call {}\n", name));
-        let cleanup = saved_bytes + (stack_count as i32) * 8 + pad;
-        if cleanup != 0 {
-            self.body.push_str(&format!("  addq ${}, %rsp\n", cleanup));
-            self.temp_stack -= cleanup as i32;
-        }
-        sig.ret
+        locations
     }
 
     fn emit_lvalue_addr(&mut self, lvalue: &LValue) {
         if let Some(local) = self.lookup(&lvalue.name).cloned() {
             if local.is_array_param {
-                self.body
-                    .push_str(&format!("  movq {}(%rbp), %rax\n", local.offset));
+                self.load_frame_x("x0", local.offset);
             } else {
-                self.body
-                    .push_str(&format!("  leaq {}(%rbp), %rax\n", local.offset));
+                self.frame_addr("x0", local.offset);
             }
             self.emit_index_offset(&local.dims, &lvalue.indices, local.is_array_param);
         } else if let Some(global) = self.parent.globals.get(&lvalue.name).cloned() {
-            self.body
-                .push_str(&format!("  leaq {}(%rip), %rax\n", lvalue.name));
+            self.body.push_str(&format!(
+                "  adrp x0, {}\n  add x0, x0, :lo12:{}\n",
+                lvalue.name, lvalue.name
+            ));
             self.emit_index_offset(&global.dims, &lvalue.indices, false);
         } else {
             panic!("undefined symbol {}", lvalue.name);
@@ -913,14 +858,15 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 dims.iter().skip(idx + 1)
             };
             let stride = stride_dims.product::<i32>().max(1) * 4;
-            self.push_rax();
+            self.push_x0();
             self.emit_int_expr(index);
-            self.body.push_str("  cltq\n");
+            self.body.push_str("  sxtw x0, w0\n");
             if stride != 1 {
-                self.body.push_str(&format!("  imulq ${}, %rax\n", stride));
+                self.body.push_str(&mov_x_imm("x16", stride as i64));
+                self.body.push_str("  mul x0, x0, x16\n");
             }
-            self.pop_rcx();
-            self.body.push_str("  addq %rcx, %rax\n");
+            self.pop_x1();
+            self.body.push_str("  add x0, x1, x0\n");
         }
     }
 
@@ -945,25 +891,101 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
         }
     }
 
-    fn push_rax(&mut self) {
-        self.body.push_str("  pushq %rax\n");
-        self.temp_stack += 8;
+    fn push_x0(&mut self) {
+        self.body.push_str("  str x0, [sp, #-16]!\n");
+        self.temp_stack += 16;
     }
 
-    fn pop_rcx(&mut self) {
-        self.pop_reg("%rcx");
+    fn pop_x1(&mut self) {
+        self.body.push_str("  ldr x1, [sp], #16\n");
+        self.temp_stack -= 16;
     }
 
-    fn pop_reg(&mut self, reg: &str) {
-        self.body.push_str(&format!("  popq {}\n", reg));
-        self.temp_stack -= 8;
+    fn push_s0(&mut self) {
+        self.body.push_str("  sub sp, sp, #16\n  str s0, [sp]\n");
+        self.temp_stack += 16;
     }
 
-    fn emit_array_element_addr(&mut self, offset: i32, dims: &[i32], flat_idx: usize) {
+    fn pop_s1(&mut self) {
+        self.body.push_str("  ldr s1, [sp]\n  add sp, sp, #16\n");
+        self.temp_stack -= 16;
+    }
+
+    fn adjust_sp(&mut self, amount: i32) {
+        let op = if amount < 0 { "sub" } else { "add" };
+        let value = amount.abs();
+        if value <= 4095 {
+            self.body
+                .push_str(&format!("  {} sp, sp, #{}\n", op, value));
+        } else {
+            self.body.push_str(&mov_x_imm("x16", value as i64));
+            self.body.push_str(&format!("  {} sp, sp, x16\n", op));
+        }
+    }
+
+    fn emit_array_element_addr(&mut self, offset: i32, _dims: &[i32], flat_idx: usize) {
         let byte_offset = (flat_idx as i32) * 4;
-        self.body
-            .push_str(&format!("  leaq {}(%rbp), %rax\n", offset + byte_offset));
-        let _ = dims;
+        self.frame_addr("x0", offset + byte_offset);
+    }
+
+    fn frame_addr(&mut self, dst: &str, offset: i32) {
+        if (0..=4095).contains(&offset) {
+            self.body
+                .push_str(&format!("  add {}, x29, #{}\n", dst, offset));
+        } else {
+            self.body.push_str(&mov_x_imm("x16", offset as i64));
+            self.body.push_str(&format!("  add {}, x29, x16\n", dst));
+        }
+    }
+
+    fn load_frame_x(&mut self, dst: &str, offset: i32) {
+        if (0..=32760).contains(&offset) && offset % 8 == 0 {
+            self.body
+                .push_str(&format!("  ldr {}, [x29, #{}]\n", dst, offset));
+        } else {
+            self.frame_addr("x16", offset);
+            self.body.push_str(&format!("  ldr {}, [x16]\n", dst));
+        }
+    }
+
+    fn load_frame_w(&mut self, dst: &str, offset: i32) {
+        if (0..=16380).contains(&offset) && offset % 4 == 0 {
+            self.body
+                .push_str(&format!("  ldr {}, [x29, #{}]\n", dst, offset));
+        } else {
+            self.frame_addr("x16", offset);
+            self.body.push_str(&format!("  ldr {}, [x16]\n", dst));
+        }
+    }
+
+    fn store_frame_x(&mut self, src: &str, offset: i32) {
+        if (0..=32760).contains(&offset) && offset % 8 == 0 {
+            self.body
+                .push_str(&format!("  str {}, [x29, #{}]\n", src, offset));
+        } else {
+            self.frame_addr("x16", offset);
+            self.body.push_str(&format!("  str {}, [x16]\n", src));
+        }
+    }
+
+    fn store_frame_w(&mut self, src: &str, offset: i32) {
+        if (0..=16380).contains(&offset) && offset % 4 == 0 {
+            self.body
+                .push_str(&format!("  str {}, [x29, #{}]\n", src, offset));
+        } else {
+            self.frame_addr("x16", offset);
+            self.body.push_str(&format!("  str {}, [x16]\n", src));
+        }
+    }
+
+    fn store_frame_s(&mut self, src: &str, offset: i32) {
+        if (0..=16380).contains(&offset) && offset % 4 == 0 {
+            self.body
+                .push_str(&format!("  str {}, [x29, #{}]\n", src, offset));
+        } else {
+            self.frame_addr("x16", offset);
+            self.body.push_str(&format!("  str {}, [x16]\n", src));
+        }
     }
 
     fn alloc(&mut self, size: i32) -> i32 {
@@ -1382,6 +1404,50 @@ fn eval_const_binary(op: BinaryOp, l: i32, r: i32) -> i32 {
         BinaryOp::And => (l != 0 && r != 0) as i32,
         BinaryOp::Or => (l != 0 || r != 0) as i32,
     }
+}
+
+fn mov_w_imm(reg: &str, value: i32) -> String {
+    let mut out = String::new();
+    let value = value as u32;
+    let mut emitted = false;
+    for idx in 0..2 {
+        let part = ((value >> (idx * 16)) & 0xffff) as u16;
+        if part == 0 && emitted {
+            continue;
+        }
+        if !emitted {
+            out.push_str(&format!("  movz {}, #{}, lsl #{}\n", reg, part, idx * 16));
+            emitted = true;
+        } else if part != 0 {
+            out.push_str(&format!("  movk {}, #{}, lsl #{}\n", reg, part, idx * 16));
+        }
+    }
+    if !emitted {
+        out.push_str(&format!("  movz {}, #0\n", reg));
+    }
+    out
+}
+
+fn mov_x_imm(reg: &str, value: i64) -> String {
+    let mut out = String::new();
+    let value = value as u64;
+    let mut emitted = false;
+    for idx in 0..4 {
+        let part = ((value >> (idx * 16)) & 0xffff) as u16;
+        if part == 0 && emitted {
+            continue;
+        }
+        if !emitted {
+            out.push_str(&format!("  movz {}, #{}, lsl #{}\n", reg, part, idx * 16));
+            emitted = true;
+        } else if part != 0 {
+            out.push_str(&format!("  movk {}, #{}, lsl #{}\n", reg, part, idx * 16));
+        }
+    }
+    if !emitted {
+        out.push_str(&format!("  movz {}, #0\n", reg));
+    }
+    out
 }
 
 fn align_to(value: i32, align: i32) -> i32 {
