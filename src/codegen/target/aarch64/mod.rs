@@ -1,0 +1,26 @@
+mod abi;
+mod call;
+mod emitter;
+mod imm;
+mod inst;
+mod memory;
+
+use crate::codegen::common::IrFuncLayout;
+use crate::ir::{Function, Module};
+
+struct AArch64IrEmitter<'a> {
+    ctx: crate::codegen::common::IrModuleCtx<'a>,
+    out: String,
+}
+
+struct AArch64IrFuncEmitter<'a, 'b> {
+    parent: &'a mut AArch64IrEmitter<'b>,
+    func: &'b Function,
+    layout: IrFuncLayout,
+    body: String,
+    return_label: String,
+}
+
+pub fn emit_ir_asm(module: &Module) -> String {
+    emitter::emit_asm(module)
+}

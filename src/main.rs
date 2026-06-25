@@ -111,7 +111,7 @@ fn main() {
         return;
     }
 
-    let asm = codegen::asm::emit_asm(target, &prog, opt_o1);
+    let asm = codegen::emit_asm(target, &prog, opt_o1);
     fs::write(&output, asm).unwrap_or_else(|e| panic!("Write {:?} failed: {}", output, e));
     eprintln!("Wrote {:?}", output);
 }
