@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Func, Program, Stmt, Type};
+use crate::ast::{Block, BlockItem, Expr, Func, Item, Program, Stmt, Type};
 use crate::lexer::Lexer;
 use crate::token::Token;
 
@@ -56,11 +56,11 @@ impl Parser {
     }
 
     pub fn parse_program(&mut self) -> Program {
-        let mut funcs = Vec::new();
+        let mut items = Vec::new();
         while self.cur != Token::Eof {
-            funcs.push(self.parse_func_def());
+            items.push(Item::Func(self.parse_func_def()));
         }
-        Program { funcs }
+        Program { items }
     }
 
     fn parse_func_def(&mut self) -> Func {
@@ -69,17 +69,22 @@ impl Parser {
         self.expect(Token::LParen);
         self.expect(Token::RParen);
         let body = self.parse_block();
-        Func { name, ret, body }
+        Func {
+            name,
+            ret,
+            params: Vec::new(),
+            body,
+        }
     }
 
-    fn parse_block(&mut self) -> Vec<Stmt> {
+    fn parse_block(&mut self) -> Block {
         self.expect(Token::LBrace);
-        let mut stmts = Vec::new();
+        let mut items = Vec::new();
         while self.cur != Token::RBrace {
-            stmts.push(self.parse_stmt());
+            items.push(BlockItem::Stmt(self.parse_stmt()));
         }
         self.expect(Token::RBrace);
-        stmts
+        Block { items }
     }
 
     fn parse_stmt(&mut self) -> Stmt {
@@ -88,7 +93,7 @@ impl Parser {
                 self.bump();
                 let e = self.parse_expr();
                 self.expect(Token::Semicolon);
-                Stmt::Return(e)
+                Stmt::Return(Some(e))
             }
             _ => panic!("Only return stmt is supported for now, got {:?}", self.cur),
         }

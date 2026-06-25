@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Program, Stmt};
+use crate::ast::{BlockItem, Expr, Program, Stmt};
 use crate::codegen::Target;
 
 pub fn emit_asm(target: Target, prog: &Program, _opt_o1: bool) -> String {
@@ -12,21 +12,23 @@ pub fn emit_asm(target: Target, prog: &Program, _opt_o1: bool) -> String {
 
 fn extract_main_return_imm(prog: &Program) -> i32 {
     let main = prog
-        .funcs
-        .iter()
+        .funcs()
         .find(|f| f.name == "main")
         .unwrap_or_else(|| panic!("No main() found"));
 
     let ret_stmt = main
         .body
+        .items
         .iter()
-        .find_map(|s| match s {
-            Stmt::Return(e) => Some(e),
+        .find_map(|item| match item {
+            BlockItem::Stmt(Stmt::Return(Some(e))) => Some(e),
+            _ => None,
         })
         .unwrap_or_else(|| panic!("main() has no return"));
 
     match ret_stmt {
         Expr::Int(v) => i32::try_from(*v).unwrap_or_else(|_| panic!("return const out of i32")),
+        _ => panic!("Only int const return is supported for now"),
     }
 }
 

@@ -1,8 +1,11 @@
-use crate::token::Token;
+use crate::token::{Position, Span, SpannedToken, Token};
 
 pub struct Lexer {
     input: Vec<char>,
     pos: usize,
+    byte_pos: usize,
+    line: usize,
+    column: usize,
 }
 
 impl Lexer {
@@ -10,12 +13,28 @@ impl Lexer {
         Self {
             input: input.chars().collect(),
             pos: 0,
+            byte_pos: 0,
+            line: 1,
+            column: 1,
         }
     }
 
     pub fn next_token(&mut self) -> Token {
-        self.skip_whitespace_and_comments();
+        self.next_spanned_token().token
+    }
 
+    pub fn next_spanned_token(&mut self) -> SpannedToken {
+        self.skip_whitespace_and_comments();
+        let start = self.position();
+        let token = self.lex_token();
+        let end = self.position();
+        SpannedToken {
+            token,
+            span: Span::new(start, end),
+        }
+    }
+
+    fn lex_token(&mut self) -> Token {
         let ch = match self.peek() {
             Some(ch) => ch,
             None => return Token::Eof,
@@ -346,7 +365,22 @@ impl Lexer {
     fn advance(&mut self) -> Option<char> {
         let ch = self.peek()?;
         self.pos += 1;
+        self.byte_pos += ch.len_utf8();
+        if ch == '\n' {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
+        }
         Some(ch)
+    }
+
+    fn position(&self) -> Position {
+        Position {
+            byte: self.byte_pos,
+            line: self.line,
+            column: self.column,
+        }
     }
 
     fn match_char(&mut self, expected: char) -> bool {
