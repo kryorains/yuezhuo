@@ -167,6 +167,10 @@ impl Lexer {
     }
 
     fn lex_number(&mut self) -> Token {
+        if self.peek() == Some('0') && self.peek_next().is_some_and(|c| c == 'x' || c == 'X') {
+            return self.lex_hex_number();
+        }
+
         let mut s = String::new();
         let mut is_float = false;
 
@@ -226,8 +230,72 @@ impl Lexer {
         if is_float {
             Token::FloatConst(s.parse::<f32>().unwrap())
         } else {
-            Token::IntConst(s.parse::<i32>().unwrap())
+            let radix = if s.len() > 1 && s.starts_with('0') {
+                if !s.chars().all(|c| matches!(c, '0'..='7')) {
+                    panic!("Invalid octal integer literal: {}", s);
+                }
+                8
+            } else {
+                10
+            };
+            Token::IntConst(i64::from_str_radix(&s, radix).unwrap())
         }
+    }
+
+    fn lex_hex_number(&mut self) -> Token {
+        self.advance(); // 0
+        self.advance(); // x/X
+
+        let mut int_digits = String::new();
+        while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+            int_digits.push(self.advance().unwrap());
+        }
+
+        let mut frac_digits = String::new();
+        let has_dot = if self.peek() == Some('.') {
+            self.advance();
+            while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                frac_digits.push(self.advance().unwrap());
+            }
+            true
+        } else {
+            false
+        };
+
+        if int_digits.is_empty() && frac_digits.is_empty() {
+            panic!("Invalid hexadecimal literal");
+        }
+
+        if self.peek().is_some_and(|c| c == 'p' || c == 'P') {
+            self.advance();
+            let exponent = self.lex_signed_decimal_exponent("hexadecimal float");
+            return Token::FloatConst(hex_float_value(&int_digits, &frac_digits, exponent));
+        }
+
+        if has_dot {
+            panic!("Hexadecimal float literal requires a binary exponent");
+        }
+
+        Token::IntConst(i64::from_str_radix(&int_digits, 16).unwrap())
+    }
+
+    fn lex_signed_decimal_exponent(&mut self, context: &str) -> i32 {
+        let mut s = String::new();
+        if self.peek().is_some_and(|c| c == '+' || c == '-') {
+            s.push(self.advance().unwrap());
+        }
+
+        let mut has_digits = false;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            has_digits = true;
+            s.push(self.advance().unwrap());
+        }
+
+        if !has_digits {
+            panic!("Invalid {} exponent", context);
+        }
+
+        s.parse::<i32>().unwrap()
     }
 
     fn lex_string_literal(&mut self) -> Token {
@@ -337,4 +405,25 @@ impl Lexer {
             break;
         }
     }
+}
+
+fn hex_float_value(int_digits: &str, frac_digits: &str, exponent: i32) -> f32 {
+    let mut value = 0.0f64;
+
+    for ch in int_digits.chars() {
+        value = value * 16.0 + hex_digit_value(ch) as f64;
+    }
+
+    let mut place = 1.0 / 16.0;
+    for ch in frac_digits.chars() {
+        value += hex_digit_value(ch) as f64 * place;
+        place /= 16.0;
+    }
+
+    (value * 2f64.powi(exponent)) as f32
+}
+
+fn hex_digit_value(ch: char) -> u8 {
+    ch.to_digit(16)
+        .unwrap_or_else(|| panic!("Invalid hexadecimal digit: {}", ch)) as u8
 }

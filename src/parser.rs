@@ -98,7 +98,7 @@ impl Parser {
         match self.cur {
             Token::IntConst(v) => {
                 self.bump();
-                Expr::Int(v as i64)
+                Expr::Int(v)
             }
             _ => panic!(
                 "Only int const expr is supported for now, got {:?}",

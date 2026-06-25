@@ -41,7 +41,7 @@ pub enum Token {
 
     // Symbols and Identifiers
     Ident(String),
-    IntConst(i32),
+    IntConst(i64),
     FloatConst(f32),
     /// Runtime library calls may take string literals (not a SysY type, but must be tokenized).
     StringLiteral(String),
