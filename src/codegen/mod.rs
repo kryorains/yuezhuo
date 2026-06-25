@@ -1,5 +1,6 @@
 pub mod aarch64;
 pub mod asm;
+pub mod common;
 pub mod riscv64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

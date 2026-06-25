@@ -1,6 +1,10 @@
 use crate::ast::{
     BinaryOp, BlockItem, Decl, Def, Expr, Func, Init, Item, LValue, Program, Stmt, Type, UnaryOp,
 };
+use crate::codegen::common::{
+    ArgLocation, ConstValue, FuncSig, FunctionSymbols, LocalInfo, ModuleCtx, ParamSig, align_to,
+    assign_arg_locations, emit_data_section, flatten_init_exprs, value_size,
+};
 use std::collections::HashMap;
 
 pub fn emit_asm(prog: &Program) -> String {
@@ -8,186 +12,27 @@ pub fn emit_asm(prog: &Program) -> String {
 }
 
 struct Riscv64Emitter<'a> {
-    prog: &'a Program,
+    ctx: ModuleCtx<'a>,
     out: String,
-    globals: HashMap<String, GlobalInfo>,
-    consts: HashMap<String, ConstValue>,
-    funcs: HashMap<String, FuncSig>,
-    label_id: usize,
 }
 
 impl<'a> Riscv64Emitter<'a> {
     fn new(prog: &'a Program) -> Self {
         Self {
-            prog,
+            ctx: ModuleCtx::new(prog),
             out: String::new(),
-            globals: HashMap::new(),
-            consts: HashMap::new(),
-            funcs: HashMap::new(),
-            label_id: 0,
         }
     }
 
     fn emit(mut self) -> String {
-        self.collect_func_sigs();
-        self.collect_globals();
-        self.emit_data();
+        self.out.push_str(&emit_data_section(&self.ctx, ".word"));
         self.out.push_str(".text\n");
-        for item in &self.prog.items {
+        for item in &self.ctx.prog.items {
             if let Item::Func(func) = item {
                 FuncEmitter::new(&mut self, func).emit();
             }
         }
         self.out
-    }
-
-    fn collect_func_sigs(&mut self) {
-        self.add_runtime_sigs();
-        for func in self.prog.funcs() {
-            let params = func
-                .params
-                .iter()
-                .map(|param| ParamSig {
-                    ty: param.ty.clone(),
-                    is_array: !param.dims.is_empty(),
-                })
-                .collect();
-            self.funcs.insert(
-                func.name.clone(),
-                FuncSig {
-                    ret: func.ret.clone(),
-                    params,
-                },
-            );
-        }
-    }
-
-    fn add_runtime_sigs(&mut self) {
-        for (name, ret, params) in [
-            ("getint", Type::Int, vec![]),
-            ("getch", Type::Int, vec![]),
-            ("getfloat", Type::Float, vec![]),
-            (
-                "getarray",
-                Type::Int,
-                vec![ParamSig {
-                    ty: Type::Int,
-                    is_array: true,
-                }],
-            ),
-            (
-                "getfarray",
-                Type::Int,
-                vec![ParamSig {
-                    ty: Type::Float,
-                    is_array: true,
-                }],
-            ),
-            (
-                "putint",
-                Type::Void,
-                vec![ParamSig {
-                    ty: Type::Int,
-                    is_array: false,
-                }],
-            ),
-            (
-                "putch",
-                Type::Void,
-                vec![ParamSig {
-                    ty: Type::Int,
-                    is_array: false,
-                }],
-            ),
-            (
-                "putfloat",
-                Type::Void,
-                vec![ParamSig {
-                    ty: Type::Float,
-                    is_array: false,
-                }],
-            ),
-            (
-                "putarray",
-                Type::Void,
-                vec![
-                    ParamSig {
-                        ty: Type::Int,
-                        is_array: false,
-                    },
-                    ParamSig {
-                        ty: Type::Int,
-                        is_array: true,
-                    },
-                ],
-            ),
-            (
-                "putfarray",
-                Type::Void,
-                vec![
-                    ParamSig {
-                        ty: Type::Int,
-                        is_array: false,
-                    },
-                    ParamSig {
-                        ty: Type::Float,
-                        is_array: true,
-                    },
-                ],
-            ),
-            ("starttime", Type::Void, vec![]),
-            ("stoptime", Type::Void, vec![]),
-        ] {
-            self.funcs.insert(name.to_string(), FuncSig { ret, params });
-        }
-    }
-
-    fn collect_globals(&mut self) {
-        for item in &self.prog.items {
-            let Item::Decl(decl) = item else { continue };
-            for def in &decl.defs {
-                let dims = const_dims(&def.dims, &self.consts);
-                self.globals.insert(
-                    def.name.clone(),
-                    GlobalInfo {
-                        ty: decl.ty.clone(),
-                        dims,
-                    },
-                );
-                if decl.is_const && def.dims.is_empty() {
-                    if let Some(Init::Expr(expr)) = &def.init {
-                        let value = eval_const_value(expr, &decl.ty, &self.consts);
-                        self.consts.insert(def.name.clone(), value);
-                    }
-                }
-            }
-        }
-    }
-
-    fn emit_data(&mut self) {
-        let mut any = false;
-        for item in &self.prog.items {
-            let Item::Decl(decl) = item else { continue };
-            if !any {
-                self.out.push_str(".data\n");
-                any = true;
-            }
-            for def in &decl.defs {
-                self.out
-                    .push_str(&format!(".globl {}\n{}:\n", def.name, def.name));
-                let dims = const_dims(&def.dims, &self.consts);
-                let values = flatten_const_init(def.init.as_ref(), &decl.ty, &dims, &self.consts);
-                for value in values {
-                    self.out.push_str(&format!("  .word {}\n", value.to_bits()));
-                }
-            }
-        }
-    }
-
-    fn fresh_label(&mut self, prefix: &str) -> String {
-        let label = format!(".L_{}_{}", prefix, self.label_id);
-        self.label_id += 1;
-        label
     }
 }
 
@@ -202,6 +47,20 @@ struct FuncEmitter<'a, 'b> {
     temp_stack: i32,
     break_labels: Vec<String>,
     continue_labels: Vec<String>,
+}
+
+impl FunctionSymbols for FuncEmitter<'_, '_> {
+    fn module_ctx(&self) -> &ModuleCtx<'_> {
+        &self.parent.ctx
+    }
+
+    fn scopes(&self) -> &[HashMap<String, LocalInfo>] {
+        &self.scopes
+    }
+
+    fn const_scopes(&self) -> &[HashMap<String, ConstValue>] {
+        &self.const_scopes
+    }
 }
 
 impl<'a, 'b> FuncEmitter<'a, 'b> {
@@ -403,8 +262,8 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 then_branch,
                 else_branch,
             } => {
-                let else_label = self.parent.fresh_label("else");
-                let end_label = self.parent.fresh_label("endif");
+                let else_label = self.parent.ctx.fresh_label("else");
+                let end_label = self.parent.ctx.fresh_label("endif");
                 self.emit_cond(cond);
                 self.body.push_str(&format!("  beqz a0, {}\n", else_label));
                 self.emit_stmt(then_branch);
@@ -416,8 +275,8 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 self.body.push_str(&format!("{}:\n", end_label));
             }
             Stmt::While { cond, body } => {
-                let start = self.parent.fresh_label("while");
-                let end = self.parent.fresh_label("endwhile");
+                let start = self.parent.ctx.fresh_label("while");
+                let end = self.parent.ctx.fresh_label("endwhile");
                 self.continue_labels.push(start.clone());
                 self.break_labels.push(end.clone());
                 self.body.push_str(&format!("{}:\n", start));
@@ -489,8 +348,8 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
 
     fn emit_int_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr) {
         if op == BinaryOp::And {
-            let false_label = self.parent.fresh_label("land_false");
-            let end_label = self.parent.fresh_label("land_end");
+            let false_label = self.parent.ctx.fresh_label("land_false");
+            let end_label = self.parent.ctx.fresh_label("land_end");
             self.emit_cond(lhs);
             self.body.push_str(&format!("  beqz a0, {}\n", false_label));
             self.emit_cond(rhs);
@@ -502,8 +361,8 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
             return;
         }
         if op == BinaryOp::Or {
-            let true_label = self.parent.fresh_label("lor_true");
-            let end_label = self.parent.fresh_label("lor_end");
+            let true_label = self.parent.ctx.fresh_label("lor_true");
+            let end_label = self.parent.ctx.fresh_label("lor_end");
             self.emit_cond(lhs);
             self.body.push_str(&format!("  bnez a0, {}\n", true_label));
             self.emit_cond(rhs);
@@ -610,7 +469,7 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 .body
                 .push_str(&format!("  li a0, {}\n  fcvt.s.w fa0, a0\n", *v as i32)),
             Expr::Float(v) => {
-                let label = self.parent.fresh_label("float");
+                let label = self.parent.ctx.fresh_label("float");
                 self.parent.out.push_str(&format!(
                     ".section .rodata\n.align 2\n{}:\n  .word {}\n.text\n",
                     label,
@@ -712,6 +571,7 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
     fn emit_call(&mut self, name: &str, args: &[Expr]) -> Type {
         let sig = self
             .parent
+            .ctx
             .funcs
             .get(name)
             .cloned()
@@ -736,7 +596,7 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
             })
             .collect::<Vec<_>>();
 
-        let locations = self.call_locations(&arg_sigs);
+        let locations = assign_arg_locations(&arg_sigs, 8, 8);
         let stack_count = locations
             .iter()
             .filter(|location| matches!(location, ArgLocation::Stack))
@@ -789,28 +649,6 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
         sig.ret
     }
 
-    fn call_locations(&self, arg_sigs: &[ParamSig]) -> Vec<ArgLocation> {
-        let mut int_idx = 0usize;
-        let mut float_idx = 0usize;
-        let mut locations = Vec::with_capacity(arg_sigs.len());
-        for arg_sig in arg_sigs {
-            if arg_sig.is_array || arg_sig.ty != Type::Float {
-                if int_idx < 8 {
-                    locations.push(ArgLocation::IntReg(int_idx));
-                    int_idx += 1;
-                } else {
-                    locations.push(ArgLocation::Stack);
-                }
-            } else if float_idx < 8 {
-                locations.push(ArgLocation::FloatReg(float_idx));
-                float_idx += 1;
-            } else {
-                locations.push(ArgLocation::Stack);
-            }
-        }
-        locations
-    }
-
     fn emit_lvalue_addr(&mut self, lvalue: &LValue) {
         if let Some(local) = self.lookup(&lvalue.name).cloned() {
             if local.is_array_param {
@@ -819,7 +657,7 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
                 self.frame_addr("a0", local.offset);
             }
             self.emit_index_offset(&local.dims, &lvalue.indices, local.is_array_param);
-        } else if let Some(global) = self.parent.globals.get(&lvalue.name).cloned() {
+        } else if let Some(global) = self.parent.ctx.globals.get(&lvalue.name).cloned() {
             self.body.push_str(&format!("  la a0, {}\n", lvalue.name));
             self.emit_index_offset(&global.dims, &lvalue.indices, false);
         } else {
@@ -843,27 +681,6 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
             }
             self.pop_x1();
             self.body.push_str("  add a0, a1, a0\n");
-        }
-    }
-
-    fn expr_yields_pointer(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::LValue(lvalue) => self.lvalue_yields_pointer(lvalue),
-            _ => false,
-        }
-    }
-
-    fn lvalue_yields_pointer(&self, lvalue: &LValue) -> bool {
-        if let Some(local) = self.lookup(&lvalue.name) {
-            if local.is_array_param {
-                lvalue.indices.len() <= local.dims.len()
-            } else {
-                lvalue.indices.len() < local.dims.len()
-            }
-        } else if let Some(global) = self.parent.globals.get(&lvalue.name) {
-            lvalue.indices.len() < global.dims.len()
-        } else {
-            false
         }
     }
 
@@ -1010,125 +827,6 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
         self.const_scopes.last_mut().unwrap().insert(name, value);
     }
 
-    fn lookup(&self, name: &str) -> Option<&LocalInfo> {
-        self.scopes.iter().rev().find_map(|scope| scope.get(name))
-    }
-
-    fn const_dims(&self, dims: &[Expr]) -> Vec<i32> {
-        dims.iter().map(|dim| self.eval_const_int(dim)).collect()
-    }
-
-    fn eval_const_int(&self, expr: &Expr) -> i32 {
-        self.eval_const_value(expr, &Type::Int).as_i32()
-    }
-
-    fn eval_const_value(&self, expr: &Expr, target: &Type) -> ConstValue {
-        match target {
-            Type::Float => ConstValue::Float(eval_const_float(expr, &self.visible_consts())),
-            _ => ConstValue::Int(eval_const_int(expr, &self.visible_consts())),
-        }
-    }
-
-    fn visible_consts(&self) -> HashMap<String, ConstValue> {
-        let mut out = self.parent.consts.clone();
-        for scope in &self.const_scopes {
-            out.extend(scope.iter().map(|(name, value)| (name.clone(), *value)));
-        }
-        out
-    }
-
-    fn lvalue_base_type(&self, lvalue: &LValue) -> Type {
-        self.lookup(&lvalue.name)
-            .map(|local| local.ty.clone())
-            .or_else(|| {
-                self.parent
-                    .globals
-                    .get(&lvalue.name)
-                    .map(|global| global.ty.clone())
-            })
-            .unwrap_or(Type::Int)
-    }
-
-    fn expr_type(&self, expr: &Expr) -> Type {
-        match expr {
-            Expr::Float(_) => Type::Float,
-            Expr::Int(_) | Expr::String(_) => Type::Int,
-            Expr::LValue(lvalue) => {
-                if self.lvalue_yields_pointer(lvalue) {
-                    Type::Int
-                } else {
-                    self.lvalue_base_type(lvalue)
-                }
-            }
-            Expr::Call { name, .. } => self
-                .parent
-                .funcs
-                .get(name)
-                .map(|sig| sig.ret.clone())
-                .unwrap_or(Type::Int),
-            Expr::Unary { op, expr } => match op {
-                UnaryOp::Not => Type::Int,
-                UnaryOp::Pos | UnaryOp::Neg => self.expr_type(expr),
-            },
-            Expr::Binary { op, lhs, rhs } => match op {
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                    if self.expr_type(lhs) == Type::Float || self.expr_type(rhs) == Type::Float {
-                        Type::Float
-                    } else {
-                        Type::Int
-                    }
-                }
-                BinaryOp::Mod
-                | BinaryOp::Lt
-                | BinaryOp::Gt
-                | BinaryOp::Le
-                | BinaryOp::Ge
-                | BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::And
-                | BinaryOp::Or => Type::Int,
-            },
-        }
-    }
-
-    fn expr_may_be_float(&self, expr: &Expr) -> bool {
-        let mut stack = vec![expr];
-        while let Some(expr) = stack.pop() {
-            match expr {
-                Expr::Float(_) => return true,
-                Expr::LValue(lvalue) => {
-                    if !self.lvalue_yields_pointer(lvalue)
-                        && self.lvalue_base_type(lvalue) == Type::Float
-                    {
-                        return true;
-                    }
-                }
-                Expr::Call { name, .. } => {
-                    if self
-                        .parent
-                        .funcs
-                        .get(name)
-                        .is_some_and(|sig| sig.ret == Type::Float)
-                    {
-                        return true;
-                    }
-                }
-                Expr::Unary { expr, .. } => stack.push(expr),
-                Expr::Binary { op, lhs, rhs } => {
-                    if matches!(
-                        op,
-                        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
-                    ) {
-                        stack.push(rhs);
-                        stack.push(lhs);
-                    }
-                }
-                Expr::Int(_) | Expr::String(_) => {}
-            }
-        }
-        false
-    }
-
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
         self.const_scopes.push(HashMap::new());
@@ -1138,283 +836,4 @@ impl<'a, 'b> FuncEmitter<'a, 'b> {
         self.scopes.pop();
         self.const_scopes.pop();
     }
-}
-
-#[derive(Debug, Clone)]
-struct LocalInfo {
-    ty: Type,
-    offset: i32,
-    dims: Vec<i32>,
-    is_array_param: bool,
-}
-
-#[derive(Debug, Clone)]
-struct GlobalInfo {
-    ty: Type,
-    dims: Vec<i32>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ParamSig {
-    ty: Type,
-    is_array: bool,
-}
-
-#[derive(Debug, Clone)]
-struct FuncSig {
-    ret: Type,
-    params: Vec<ParamSig>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ConstValue {
-    Int(i32),
-    Float(f32),
-}
-
-impl ConstValue {
-    fn to_bits(self) -> u32 {
-        match self {
-            ConstValue::Int(value) => value as u32,
-            ConstValue::Float(value) => value.to_bits(),
-        }
-    }
-
-    fn as_i32(self) -> i32 {
-        match self {
-            ConstValue::Int(value) => value,
-            ConstValue::Float(value) => value as i32,
-        }
-    }
-
-    fn as_f32(self) -> f32 {
-        match self {
-            ConstValue::Int(value) => value as f32,
-            ConstValue::Float(value) => value,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ArgLocation {
-    IntReg(usize),
-    FloatReg(usize),
-    Stack,
-}
-
-fn const_dims(dims: &[Expr], consts: &HashMap<String, ConstValue>) -> Vec<i32> {
-    dims.iter().map(|dim| eval_const_int(dim, consts)).collect()
-}
-
-fn value_size(dims: &[i32]) -> i32 {
-    element_count(dims) as i32 * 4
-}
-
-fn element_count(dims: &[i32]) -> usize {
-    if dims.is_empty() {
-        1
-    } else {
-        dims.iter().product::<i32>() as usize
-    }
-}
-
-fn flatten_const_init(
-    init: Option<&Init>,
-    ty: &Type,
-    dims: &[i32],
-    consts: &HashMap<String, ConstValue>,
-) -> Vec<ConstValue> {
-    let count = element_count(dims);
-    let mut values = init
-        .map(|init| {
-            flatten_init_exprs(init, dims)
-                .into_iter()
-                .map(|expr| {
-                    expr.map(|expr| eval_const_value(expr, ty, consts))
-                        .unwrap_or_else(|| zero_const_value(ty))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    values.resize(count, zero_const_value(ty));
-    values
-}
-
-fn flatten_init_exprs<'a>(init: &'a Init, dims: &[i32]) -> Vec<Option<&'a Expr>> {
-    let mut out = vec![None; element_count(dims)];
-    fill_init(init, dims, 0, &mut out);
-    out
-}
-
-fn fill_init<'a>(
-    init: &'a Init,
-    dims: &[i32],
-    start: usize,
-    out: &mut [Option<&'a Expr>],
-) -> usize {
-    if start >= out.len() {
-        return start;
-    }
-
-    match init {
-        Init::Expr(expr) => {
-            out[start] = Some(expr);
-            start + 1
-        }
-        Init::List(values) => {
-            if dims.is_empty() {
-                if let Some(first) = values.first() {
-                    return fill_init(first, dims, start, out);
-                }
-                return start;
-            }
-
-            let sub_size = if dims.len() > 1 {
-                element_count(&dims[1..])
-            } else {
-                1
-            };
-            let mut pos = start;
-            for value in values {
-                match value {
-                    Init::List(_) if dims.len() > 1 => {
-                        fill_init(value, &dims[1..], pos, out);
-                        pos += sub_size;
-                    }
-                    _ => {
-                        pos = fill_init(value, &dims[1..], pos, out);
-                    }
-                }
-                if pos >= out.len() {
-                    break;
-                }
-            }
-            pos
-        }
-    }
-}
-
-fn eval_const_value(
-    expr: &Expr,
-    target: &Type,
-    consts: &HashMap<String, ConstValue>,
-) -> ConstValue {
-    if *target == Type::Float {
-        ConstValue::Float(eval_const_float(expr, consts))
-    } else {
-        ConstValue::Int(eval_const_int(expr, consts))
-    }
-}
-
-fn zero_const_value(target: &Type) -> ConstValue {
-    if *target == Type::Float {
-        ConstValue::Float(0.0)
-    } else {
-        ConstValue::Int(0)
-    }
-}
-
-fn eval_const_int(expr: &Expr, consts: &HashMap<String, ConstValue>) -> i32 {
-    match expr {
-        Expr::Int(v) => *v as i32,
-        Expr::Float(v) => *v as i32,
-        Expr::LValue(lvalue) if lvalue.indices.is_empty() => consts
-            .get(&lvalue.name)
-            .map(|value| value.as_i32())
-            .unwrap_or(0),
-        Expr::Unary { op, expr } => {
-            let v = eval_const_int(expr, consts);
-            match op {
-                UnaryOp::Pos => v,
-                UnaryOp::Neg => -v,
-                UnaryOp::Not => (v == 0) as i32,
-            }
-        }
-        Expr::Binary { op, lhs, rhs } => {
-            let l = eval_const_int(lhs, consts);
-            let r = eval_const_int(rhs, consts);
-            eval_const_binary(*op, l, r)
-        }
-        _ => 0,
-    }
-}
-
-fn eval_const_float(expr: &Expr, consts: &HashMap<String, ConstValue>) -> f32 {
-    match expr {
-        Expr::Float(v) => *v,
-        Expr::Int(v) => *v as f32,
-        Expr::LValue(lvalue) if lvalue.indices.is_empty() => consts
-            .get(&lvalue.name)
-            .map(|value| value.as_f32())
-            .unwrap_or(0.0),
-        Expr::Unary { op, expr } => {
-            let value = eval_const_float(expr, consts);
-            match op {
-                UnaryOp::Pos => value,
-                UnaryOp::Neg => -value,
-                UnaryOp::Not => (value == 0.0) as i32 as f32,
-            }
-        }
-        Expr::Binary { op, lhs, rhs } => {
-            let lhs_is_float = const_expr_is_float(lhs, consts);
-            let rhs_is_float = const_expr_is_float(rhs, consts);
-            if !lhs_is_float && !rhs_is_float {
-                return eval_const_int(expr, consts) as f32;
-            }
-            let l = eval_const_float(lhs, consts);
-            let r = eval_const_float(rhs, consts);
-            match op {
-                BinaryOp::Add => l + r,
-                BinaryOp::Sub => l - r,
-                BinaryOp::Mul => l * r,
-                BinaryOp::Div => l / r,
-                BinaryOp::Mod => (l as i32 % r as i32) as f32,
-                BinaryOp::Lt => (l < r) as i32 as f32,
-                BinaryOp::Gt => (l > r) as i32 as f32,
-                BinaryOp::Le => (l <= r) as i32 as f32,
-                BinaryOp::Ge => (l >= r) as i32 as f32,
-                BinaryOp::Eq => (l == r) as i32 as f32,
-                BinaryOp::Ne => (l != r) as i32 as f32,
-                BinaryOp::And => (l != 0.0 && r != 0.0) as i32 as f32,
-                BinaryOp::Or => (l != 0.0 || r != 0.0) as i32 as f32,
-            }
-        }
-        _ => 0.0,
-    }
-}
-
-fn const_expr_is_float(expr: &Expr, consts: &HashMap<String, ConstValue>) -> bool {
-    match expr {
-        Expr::Float(_) => true,
-        Expr::LValue(lvalue) if lvalue.indices.is_empty() => {
-            matches!(consts.get(&lvalue.name), Some(ConstValue::Float(_)))
-        }
-        Expr::Unary { expr, .. } => const_expr_is_float(expr, consts),
-        Expr::Binary { lhs, rhs, .. } => {
-            const_expr_is_float(lhs, consts) || const_expr_is_float(rhs, consts)
-        }
-        _ => false,
-    }
-}
-
-fn eval_const_binary(op: BinaryOp, l: i32, r: i32) -> i32 {
-    match op {
-        BinaryOp::Add => l + r,
-        BinaryOp::Sub => l - r,
-        BinaryOp::Mul => l * r,
-        BinaryOp::Div => l / r,
-        BinaryOp::Mod => l % r,
-        BinaryOp::Lt => (l < r) as i32,
-        BinaryOp::Gt => (l > r) as i32,
-        BinaryOp::Le => (l <= r) as i32,
-        BinaryOp::Ge => (l >= r) as i32,
-        BinaryOp::Eq => (l == r) as i32,
-        BinaryOp::Ne => (l != r) as i32,
-        BinaryOp::And => (l != 0 && r != 0) as i32,
-        BinaryOp::Or => (l != 0 || r != 0) as i32,
-    }
-}
-
-fn align_to(value: i32, align: i32) -> i32 {
-    (value + align - 1) / align * align
 }
