@@ -1,1 +1,9 @@
 /target
+
+/examples/*.s
+/examples/*.o
+/examples/*.aarch64
+/examples/*.riscv64
+/examples/*.x86
+
+*.pdf

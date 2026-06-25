@@ -8,4 +8,8 @@ description = "🐦‍🔥 Yuezhuo - SysY compiler."
 keywords = ["compiler"]
 license = "MIT"
 
+[[bin]]
+name = "compiler"
+path = "src/main.rs"
+
 [dependencies]
