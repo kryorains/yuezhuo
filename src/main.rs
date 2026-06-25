@@ -1,5 +1,6 @@
 mod ast;
 mod codegen;
+mod ir;
 mod lexer;
 mod parser;
 mod token;
@@ -16,7 +17,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <input.sysy> -S -o <out.s> [-O1] [--target x86_64|aarch64|riscv64] [--lex]",
+            "Usage: {} <input.sysy> (-S|--ir) -o <out> [-O1] [--target x86_64|aarch64|riscv64] [--lex]",
             args[0]
         );
         process::exit(2);
@@ -27,6 +28,7 @@ fn main() {
     let mut target = default_target();
     let mut lex_only = false;
     let mut emit_asm = false; // -S
+    let mut emit_ir = false;
     let mut opt_o1 = false;
 
     let mut i = 1;
@@ -41,6 +43,9 @@ fn main() {
             }
             "-S" => {
                 emit_asm = true;
+            }
+            "--ir" => {
+                emit_ir = true;
             }
             "-O1" => {
                 opt_o1 = true;
@@ -89,14 +94,22 @@ fn main() {
         return;
     }
 
-    // Contest interface always uses -S -o <out.s>
-    if !emit_asm {
-        panic!("This compiler is configured to emit assembly; please pass -S");
+    if !emit_asm && !emit_ir {
+        panic!("Please pass -S or --ir");
     }
-    let output = output.unwrap_or_else(|| panic!("Missing -o <out.s>"));
+    let output = output.unwrap_or_else(|| panic!("Missing -o <out>"));
 
     let mut parser = Parser::new(&source);
     let prog = parser.parse_program();
+
+    if emit_ir {
+        let module =
+            ir::lower::lower_program(&prog).unwrap_or_else(|e| panic!("IR lower failed: {:?}", e));
+        fs::write(&output, format!("{:#?}", module))
+            .unwrap_or_else(|e| panic!("Write {:?} failed: {}", output, e));
+        eprintln!("Wrote {:?}", output);
+        return;
+    }
 
     let asm = codegen::asm::emit_asm(target, &prog, opt_o1);
     fs::write(&output, asm).unwrap_or_else(|e| panic!("Write {:?} failed: {}", output, e));
