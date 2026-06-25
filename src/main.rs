@@ -17,7 +17,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <input.sysy> (-S|--ir) -o <out> [-O1] [--target x86_64|aarch64|riscv64] [--lex]",
+            "Usage: {} <input.sysy> [output.s] [-S|--ir] [-o <out>] [-O0|-O1|-O2] [--target x86_64|aarch64|riscv64] [--lex]",
             args[0]
         );
         process::exit(2);
@@ -47,7 +47,8 @@ fn main() {
             "--ir" => {
                 emit_ir = true;
             }
-            "-O1" => {
+            "-O0" => {}
+            "-O1" | "-O2" => {
                 opt_o1 = true;
             }
             "--target" => {
@@ -70,6 +71,9 @@ fn main() {
             s => {
                 if input.is_none() {
                     input = Some(PathBuf::from(s));
+                } else if output.is_none() && !emit_ir && !lex_only {
+                    output = Some(PathBuf::from(s));
+                    emit_asm = true;
                 } else {
                     panic!("Unexpected extra arg: {}", s);
                 }
