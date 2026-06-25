@@ -1,0 +1,40 @@
+name: Override build architecture
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - ci/riscv64
+          - ci/aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CI_PUSH_TOKEN }}
+
+      - name: Rebase target branch
+        env:
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "kryorains"
+          git config user.email "kryorains@kryorains.io"
+
+          git fetch origin \
+            refs/heads/main:refs/remotes/origin/main \
+            "refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
+          git switch -C "${BRANCH}" "origin/${BRANCH}"
+          git rebase origin/main
+          git push --force-with-lease origin "HEAD:${BRANCH}"

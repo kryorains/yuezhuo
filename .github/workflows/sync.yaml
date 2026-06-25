@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      - ci/riscv64
+      - ci/aarch64
 
 jobs:
   sync:

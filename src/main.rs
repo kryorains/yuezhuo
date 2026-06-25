@@ -137,5 +137,10 @@ fn parse_target(s: &str) -> codegen::Target {
 }
 
 fn default_target() -> codegen::Target {
-    codegen::Target::Riscv64
+    match env::consts::ARCH {
+        "aarch64" => codegen::Target::AArch64,
+        "riscv64" => codegen::Target::Riscv64,
+        "x86_64" => codegen::Target::X86_64,
+        _ => codegen::Target::X86_64,
+    }
 }
