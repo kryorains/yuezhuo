@@ -30,8 +30,13 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             self.push_x0();
             self.load_value(*index);
             if stride != 1 {
-                self.body
-                    .push_str(&format!("  li t0, {}\n  mul a0, a0, t0\n", stride));
+                if stride > 0 && (stride & (stride - 1)) == 0 {
+                    self.body
+                        .push_str(&format!("  slli a0, a0, {}\n", stride.trailing_zeros()));
+                } else {
+                    self.body
+                        .push_str(&format!("  li t0, {}\n  mul a0, a0, t0\n", stride));
+                }
             }
             self.pop_x1();
             self.body.push_str("  add a0, a1, a0\n");
@@ -128,21 +133,24 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         if amount == 0 {
             return;
         }
-        self.body.push_str(&format!("  li t0, {}\n", amount));
-        self.body.push_str("  add sp, sp, t0\n");
+        if fits_i12(amount) {
+            self.body.push_str(&format!("  addi sp, sp, {}\n", amount));
+        } else {
+            self.body.push_str(&format!("  li t0, {}\n", amount));
+            self.body.push_str("  add sp, sp, t0\n");
+        }
     }
 
     pub(super) fn frame_addr(&mut self, dst: &str, offset: i32) {
         self.base_addr(dst, "s0", offset);
     }
 
-    fn sp_addr(&mut self, dst: &str, offset: i32) {
-        self.base_addr(dst, "sp", offset);
-    }
-
     fn base_addr(&mut self, dst: &str, base: &str, offset: i32) {
         if offset == 0 {
             self.body.push_str(&format!("  mv {}, {}\n", dst, base));
+        } else if fits_i12(offset) {
+            self.body
+                .push_str(&format!("  addi {}, {}, {}\n", dst, base, offset));
         } else {
             self.body.push_str(&format!("  li t0, {}\n", offset));
             self.body
@@ -151,48 +159,99 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_frame_x(&mut self, dst: &str, offset: i32) {
-        self.frame_addr("t1", offset);
-        self.body.push_str(&format!("  ld {}, 0(t1)\n", dst));
+        self.load_base_x(dst, "s0", offset);
     }
 
     pub(super) fn load_frame_w(&mut self, dst: &str, offset: i32) {
-        self.frame_addr("t1", offset);
-        self.body.push_str(&format!("  lw {}, 0(t1)\n", dst));
+        self.load_base_w(dst, "s0", offset);
     }
 
     pub(super) fn load_frame_s(&mut self, dst: &str, offset: i32) {
-        self.frame_addr("t1", offset);
-        self.body.push_str(&format!("  flw {}, 0(t1)\n", dst));
+        self.load_base_s(dst, "s0", offset);
     }
 
     pub(super) fn store_frame_x(&mut self, src: &str, offset: i32) {
-        self.frame_addr("t1", offset);
-        self.body.push_str(&format!("  sd {}, 0(t1)\n", src));
+        self.store_base_x(src, "s0", offset);
     }
 
     pub(super) fn store_frame_w(&mut self, src: &str, offset: i32) {
-        self.frame_addr("t1", offset);
-        self.body.push_str(&format!("  sw {}, 0(t1)\n", src));
+        self.store_base_w(src, "s0", offset);
     }
 
     pub(super) fn store_frame_s(&mut self, src: &str, offset: i32) {
-        self.frame_addr("t1", offset);
-        self.body.push_str(&format!("  fsw {}, 0(t1)\n", src));
+        self.store_base_s(src, "s0", offset);
     }
 
     pub(super) fn load_sp_x(&mut self, dst: &str, offset: i32) {
-        self.sp_addr("t1", offset);
-        self.body.push_str(&format!("  ld {}, 0(t1)\n", dst));
+        self.load_base_x(dst, "sp", offset);
     }
 
     pub(super) fn load_sp_s(&mut self, dst: &str, offset: i32) {
-        self.sp_addr("t1", offset);
-        self.body.push_str(&format!("  flw {}, 0(t1)\n", dst));
+        self.load_base_s(dst, "sp", offset);
     }
 
     pub(super) fn store_sp_x(&mut self, src: &str, offset: i32) {
-        self.sp_addr("t1", offset);
-        self.body.push_str(&format!("  sd {}, 0(t1)\n", src));
+        self.store_base_x(src, "sp", offset);
+    }
+
+    fn load_base_x(&mut self, dst: &str, base: &str, offset: i32) {
+        if fits_i12(offset) {
+            self.body
+                .push_str(&format!("  ld {}, {}({})\n", dst, offset, base));
+        } else {
+            self.base_addr("t1", base, offset);
+            self.body.push_str(&format!("  ld {}, 0(t1)\n", dst));
+        }
+    }
+
+    fn load_base_w(&mut self, dst: &str, base: &str, offset: i32) {
+        if fits_i12(offset) {
+            self.body
+                .push_str(&format!("  lw {}, {}({})\n", dst, offset, base));
+        } else {
+            self.base_addr("t1", base, offset);
+            self.body.push_str(&format!("  lw {}, 0(t1)\n", dst));
+        }
+    }
+
+    fn load_base_s(&mut self, dst: &str, base: &str, offset: i32) {
+        if fits_i12(offset) {
+            self.body
+                .push_str(&format!("  flw {}, {}({})\n", dst, offset, base));
+        } else {
+            self.base_addr("t1", base, offset);
+            self.body.push_str(&format!("  flw {}, 0(t1)\n", dst));
+        }
+    }
+
+    fn store_base_x(&mut self, src: &str, base: &str, offset: i32) {
+        if fits_i12(offset) {
+            self.body
+                .push_str(&format!("  sd {}, {}({})\n", src, offset, base));
+        } else {
+            self.base_addr("t1", base, offset);
+            self.body.push_str(&format!("  sd {}, 0(t1)\n", src));
+        }
+    }
+
+    fn store_base_w(&mut self, src: &str, base: &str, offset: i32) {
+        if fits_i12(offset) {
+            self.body
+                .push_str(&format!("  sw {}, {}({})\n", src, offset, base));
+        } else {
+            self.base_addr("t1", base, offset);
+            self.body.push_str(&format!("  sw {}, 0(t1)\n", src));
+        }
+    }
+
+    fn store_base_s(&mut self, src: &str, base: &str, offset: i32) {
+        if fits_i12(offset) {
+            self.body
+                .push_str(&format!("  fsw {}, {}({})\n", src, offset, base));
+        } else {
+            self.base_addr("t1", base, offset);
+            self.body.push_str(&format!("  fsw {}, 0(t1)\n", src));
+        }
     }
 
     pub(super) fn block_label(&self, block_idx: usize) -> String {
@@ -202,6 +261,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     pub(super) fn object_offset(&self, value: ValueId, _ty: &Type) -> i32 {
         self.layout.offset(value) + 8
     }
+}
+
+fn fits_i12(value: i32) -> bool {
+    (-2048..=2047).contains(&value)
 }
 
 fn gep_elem_type(ty: &Type) -> Type {

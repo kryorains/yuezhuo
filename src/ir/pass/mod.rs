@@ -30,6 +30,7 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel) {
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(LocalForwardPass::new());
             pipeline.add(ConstFoldPass::new());
+            pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());
         }
     }

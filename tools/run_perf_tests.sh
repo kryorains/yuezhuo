@@ -11,9 +11,12 @@ RUN_TIMEOUT=${RUN_TIMEOUT:-30s}
 MAX_INPUT_BYTES=${MAX_INPUT_BYTES:-1048576}
 OPT_LEVELS=${OPT_LEVELS:-"O0 O1"}
 TEST_FILTER=${TEST_FILTER:-}
+TEST_LIMIT=${TEST_LIMIT:-0}
 BASELINE=${BASELINE:-0}
 BASELINE_OPT=${BASELINE_OPT:-"-O2"}
 BASELINE_CFLAGS=${BASELINE_CFLAGS:-"-x c -std=gnu99 -Wno-implicit-function-declaration"}
+BASELINE_NORMALIZE=${BASELINE_NORMALIZE:-1}
+LINK_CFLAGS=${LINK_CFLAGS:-"-O2"}
 
 case "$TARGET" in
   x86_64|x86-64|amd64)
@@ -38,6 +41,7 @@ read -r -a runner_args <<< "$RUNNER"
 read -r -a opt_levels <<< "$OPT_LEVELS"
 read -r -a baseline_opt_args <<< "$BASELINE_OPT"
 read -r -a baseline_cflag_args <<< "$BASELINE_CFLAGS"
+read -r -a link_cflag_args <<< "$LINK_CFLAGS"
 
 if [[ ! -x "$COMPILER" ]]; then
   cargo build --manifest-path "$ROOT_DIR/Cargo.toml" >/dev/null || exit 1
@@ -53,6 +57,9 @@ printf 'test\topt\tstatus\tcompile_ms\tlink_ms\trun_ms\tasm_lines\tinput_bytes\t
   "$CC" --version | head -1
   printf 'baseline=%s\n' "$BASELINE"
   printf 'baseline_opt=%s\n' "$BASELINE_OPT"
+  printf 'baseline_normalize=%s\n' "$BASELINE_NORMALIZE"
+  printf 'link_cflags=%s\n' "$LINK_CFLAGS"
+  printf 'test_limit=%s\n' "$TEST_LIMIT"
   printf 'run_timeout=%s\n' "$RUN_TIMEOUT"
   printf 'max_input_bytes=%s\n' "$MAX_INPUT_BYTES"
 } >"$WORK_DIR/config.txt"
@@ -61,6 +68,7 @@ total=0
 passed=0
 failed=0
 skipped=0
+processed=0
 
 now_ms() {
   date +%s%3N
@@ -119,6 +127,12 @@ score_ratio() {
   fi
 }
 
+normalize_sysy_for_gcc() {
+  local src=$1
+  local dst=$2
+  perl -pe 's{^(\s*)const\s+int\s+([A-Za-z_]\w*)\s*=\s*([-+]?(?:0[xX][0-9A-Fa-f]+|\d+))\s*;\s*(//.*)?$}{$1 . "enum { $2 = $3 };" . (defined($4) ? " $4" : "")}e' "$src" >"$dst"
+}
+
 while IFS= read -r sy; do
   out=${sy%.sy}.out
   input=${sy%.sy}.in
@@ -138,6 +152,11 @@ while IFS= read -r sy; do
     continue
   fi
 
+  if (( TEST_LIMIT > 0 && processed >= TEST_LIMIT )); then
+    break
+  fi
+  processed=$((processed + 1))
+
   stem=${rel//\//__}
   stem=${stem%.sy}
   baseline_ms=NA
@@ -148,7 +167,13 @@ while IFS= read -r sy; do
     baseline_expected="$WORK_DIR/$stem.expected"
     baseline_log="$WORK_DIR/$stem.gcc.log"
 
-    if "$CC" "${baseline_cflag_args[@]}" "${baseline_opt_args[@]}" "$sy" "$RUNTIME" -o "$baseline_exe" -lm >"$baseline_log" 2>&1; then
+    baseline_src=$sy
+    if [[ "$BASELINE_NORMALIZE" == "1" ]]; then
+      baseline_src="$WORK_DIR/$stem.gcc.c"
+      normalize_sysy_for_gcc "$sy" "$baseline_src"
+    fi
+
+    if "$CC" "${baseline_cflag_args[@]}" "${baseline_opt_args[@]}" "$baseline_src" "$RUNTIME" -o "$baseline_exe" -lm >"$baseline_log" 2>&1; then
       start=$(now_ms)
       run_exe "$baseline_exe" "$input" "$baseline_actual" "$baseline_log"
       baseline_status=$?
@@ -191,7 +216,7 @@ while IFS= read -r sy; do
     asm_lines=$(wc -l <"$asm")
 
     start=$(now_ms)
-    if ! "$CC" "$asm" "$RUNTIME" -o "$exe" -lm >>"$log" 2>&1; then
+    if ! "$CC" "${link_cflag_args[@]}" "$asm" "$RUNTIME" -o "$exe" -lm >>"$log" 2>&1; then
       end=$(now_ms)
       printf '%s\t%s\tLINK_FAIL\t%s\t%s\t0\t%s\t%s\t%s\tNA\n' "$rel" "$opt" "$compile_ms" "$(elapsed_ms "$start" "$end")" "$asm_lines" "$bytes" "$baseline_ms" >>"$report"
       printf 'LINK_FAIL    %s %s\n' "$opt" "$rel"
@@ -224,7 +249,7 @@ while IFS= read -r sy; do
   done
 done < <(find "$TEST_ROOT" -name '*.sy' | sort)
 
-printf '\nTOTAL=%s PASS=%s FAIL=%s SKIPPED_BY_SIZE=%s\n' "$total" "$passed" "$failed" "$skipped"
+printf '\nFILES=%s TOTAL=%s PASS=%s FAIL=%s SKIPPED_BY_SIZE=%s\n' "$processed" "$total" "$passed" "$failed" "$skipped"
 printf 'REPORT=%s\n' "$report"
 printf 'ARTIFACTS=%s\n' "$WORK_DIR"
 

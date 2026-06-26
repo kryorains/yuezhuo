@@ -14,6 +14,7 @@ impl IrFuncLayout {
         };
         for (idx, value) in func.values.iter().enumerate() {
             let size = match &value.kind {
+                ValueKind::Param => ir_slot_size(&value.ty),
                 ValueKind::Inst(block, inst_idx) => {
                     let inst = &func.block(*block).insts[*inst_idx];
                     match &inst.kind {
@@ -22,7 +23,7 @@ impl IrFuncLayout {
                         _ => ir_slot_size(&value.ty),
                     }
                 }
-                _ => ir_slot_size(&value.ty),
+                ValueKind::Const(_) | ValueKind::Global(_) => 0,
             };
             if size != 0 {
                 layout.alloc(ValueId(idx), size);
