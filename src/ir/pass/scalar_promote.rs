@@ -1,7 +1,10 @@
+use super::dominators::{ControlFlowGraph, Dominators};
+use super::util::{resolve_replacement, rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
-use super::util::{ValueReplacements, rewrite_function_uses};
-use crate::ir::{BlockId, Function, Inst, InstKind, Module, Terminator, Type, ValueId};
-use std::collections::{HashMap, HashSet};
+use crate::ir::{
+    BlockId, Function, Inst, InstKind, Module, Terminator, Type, Value, ValueId, ValueKind,
+};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(super) struct ScalarPromotePass;
 
@@ -20,51 +23,91 @@ impl ModulePass for ScalarPromotePass {
 }
 
 fn promote_function(func: &mut Function) {
-    let mut candidates = collect_scalar_allocas(func);
+    if func.blocks.len() > 512 || func.values.len() > 4096 {
+        return;
+    }
+
+    let cfg = ControlFlowGraph::new(func);
+    let reachable = reachable_blocks(func, &cfg);
+    let dom = Dominators::new(func, &cfg);
+    let candidates = collect_candidates(func, &reachable, &dom);
     if candidates.is_empty() {
         return;
     }
 
-    let mut use_blocks = HashMap::<ValueId, BlockId>::new();
-    let mut rejected = HashSet::<ValueId>::new();
-    collect_uses(func, &candidates, &mut use_blocks, &mut rejected);
-    candidates.retain(|value| use_blocks.contains_key(value) && !rejected.contains(value));
-    candidates.retain(|value| has_ordered_stores_before_loads(func, *value, use_blocks[value]));
-    if candidates.is_empty() {
-        return;
-    }
-
+    let phi_values = insert_phis(func, &candidates, &dom);
+    let phi_allocas = phi_values
+        .iter()
+        .map(|((block, alloca), phi)| (*phi, (*block, *alloca)))
+        .collect::<HashMap<_, _>>();
+    let mut stacks = candidates
+        .iter()
+        .copied()
+        .map(|alloca| (alloca, Vec::<ValueId>::new()))
+        .collect::<HashMap<_, _>>();
     let mut replacements = ValueReplacements::new();
-    let mut current_values = HashMap::<ValueId, ValueId>::new();
 
-    for block in &mut func.blocks {
-        for inst in &mut block.insts {
-            match &inst.kind {
-                InstKind::Alloca { .. } if inst.result.is_some_and(|r| candidates.contains(&r)) => {
-                    inst.result = None;
-                    inst.kind = InstKind::Nop;
-                }
-                InstKind::Store { ptr, value } if candidates.contains(ptr) => {
-                    current_values.insert(*ptr, *value);
-                    inst.kind = InstKind::Nop;
-                }
-                InstKind::Load { ptr } if candidates.contains(ptr) => {
-                    let result = inst.result.expect("load must have a result");
-                    let value = current_values[ptr];
-                    replacements.insert(result, value);
-                    inst.result = None;
-                    inst.kind = InstKind::Nop;
-                }
-                _ => {}
-            }
-        }
-    }
+    rename_block(
+        func,
+        func.entry,
+        &cfg,
+        &dom,
+        &candidates,
+        &phi_values,
+        &phi_allocas,
+        &mut stacks,
+        &mut replacements,
+    );
 
     rewrite_function_uses(func, &replacements);
+    if let Err(errors) = func.verify() {
+        panic!(
+            "scalar promotion produced invalid IR in {}: {:?}",
+            func.name, errors
+        );
+    }
 }
 
-fn collect_scalar_allocas(func: &Function) -> HashSet<ValueId> {
-    let mut allocas = HashSet::new();
+fn reachable_blocks(func: &Function, cfg: &ControlFlowGraph) -> HashSet<BlockId> {
+    let mut reachable = HashSet::new();
+    let mut worklist = VecDeque::from([func.entry]);
+    while let Some(block) = worklist.pop_front() {
+        if !reachable.insert(block) {
+            continue;
+        }
+        for succ in &cfg.succs[block.0] {
+            worklist.push_back(*succ);
+        }
+    }
+    reachable
+}
+
+fn collect_candidates(
+    func: &Function,
+    reachable: &HashSet<BlockId>,
+    dom: &Dominators,
+) -> Vec<ValueId> {
+    let mut candidates = Vec::new();
+    let mut ordered_allocas = collect_scalar_allocas(func);
+    ordered_allocas.sort_by_key(|value| value.0);
+
+    for alloca in ordered_allocas {
+        let mut info = CandidateInfo::new();
+        collect_candidate_info(func, alloca, reachable, &mut info);
+        if info.rejected || info.loads.is_empty() || info.stores.is_empty() {
+            continue;
+        }
+        if !loads_are_defined(func, alloca, &info, dom) {
+            continue;
+        }
+        candidates.push(alloca);
+    }
+
+    candidates
+}
+
+fn collect_scalar_allocas(func: &Function) -> Vec<ValueId> {
+    let mut allocas = Vec::new();
     for block in &func.blocks {
         for inst in &block.insts {
             let Some(result) = inst.result else {
@@ -74,125 +117,299 @@ fn collect_scalar_allocas(func: &Function) -> HashSet<ValueId> {
                 continue;
             };
             if !matches!(ty, Type::Array { .. }) {
-                allocas.insert(result);
+                allocas.push(result);
             }
         }
     }
     allocas
 }
 
-fn collect_uses(
+struct CandidateInfo {
+    loads: Vec<(BlockId, usize)>,
+    stores: Vec<(BlockId, usize)>,
+    store_blocks: HashSet<BlockId>,
+    rejected: bool,
+}
+
+impl CandidateInfo {
+    fn new() -> Self {
+        Self {
+            loads: Vec::new(),
+            stores: Vec::new(),
+            store_blocks: HashSet::new(),
+            rejected: false,
+        }
+    }
+}
+
+fn collect_candidate_info(
     func: &Function,
-    candidates: &HashSet<ValueId>,
-    use_blocks: &mut HashMap<ValueId, BlockId>,
-    rejected: &mut HashSet<ValueId>,
+    alloca: ValueId,
+    reachable: &HashSet<BlockId>,
+    info: &mut CandidateInfo,
 ) {
     for block_idx in 0..func.blocks.len() {
         let block = BlockId(block_idx);
-        for inst in &func.blocks[block_idx].insts {
-            collect_inst_uses(inst, block, candidates, use_blocks, rejected);
+        for inst_idx in 0..func.blocks[block_idx].insts.len() {
+            let inst = &func.blocks[block_idx].insts[inst_idx];
+            if !reachable.contains(&block) {
+                if inst_uses_value_as_escape(&inst.kind, alloca) {
+                    info.rejected = true;
+                }
+                continue;
+            }
+            match &inst.kind {
+                InstKind::Load { ptr } if *ptr == alloca => info.loads.push((block, inst_idx)),
+                InstKind::Store { ptr, value } if *ptr == alloca => {
+                    if *value == alloca {
+                        info.rejected = true;
+                    }
+                    info.stores.push((block, inst_idx));
+                    info.store_blocks.insert(block);
+                }
+                _ => {
+                    if inst_uses_value_as_escape(&inst.kind, alloca) {
+                        info.rejected = true;
+                    }
+                }
+            }
         }
         if let Some(terminator) = &func.blocks[block_idx].terminator {
-            collect_terminator_uses(terminator, candidates, rejected);
+            if terminator_uses_value(terminator, alloca) {
+                info.rejected = true;
+            }
         }
     }
 }
 
-fn collect_inst_uses(
-    inst: &Inst,
-    block: BlockId,
-    candidates: &HashSet<ValueId>,
-    use_blocks: &mut HashMap<ValueId, BlockId>,
-    rejected: &mut HashSet<ValueId>,
-) {
-    match &inst.kind {
-        InstKind::Nop | InstKind::Alloca { .. } => {}
-        InstKind::Load { ptr } if candidates.contains(ptr) => record_use(*ptr, block, use_blocks),
-        InstKind::Store { ptr, value } if candidates.contains(ptr) => {
-            record_use(*ptr, block, use_blocks);
-            reject_if_candidate(*value, candidates, rejected);
-        }
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => {
-            reject_if_candidate(*ptr, candidates, rejected);
-        }
-        InstKind::Store { ptr, value } => {
-            reject_if_candidate(*ptr, candidates, rejected);
-            reject_if_candidate(*value, candidates, rejected);
-        }
-        InstKind::Phi { incomings } => {
-            for (_, value) in incomings {
-                reject_if_candidate(*value, candidates, rejected);
-            }
-        }
-        InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => {
-            reject_if_candidate(*value, candidates, rejected);
+fn inst_uses_value_as_escape(kind: &InstKind, value: ValueId) -> bool {
+    match kind {
+        InstKind::Nop | InstKind::Alloca { .. } => false,
+        InstKind::Load { ptr } => *ptr == value,
+        InstKind::Store { ptr, value: stored } => *ptr == value || *stored == value,
+        InstKind::MemZero { ptr, .. } => *ptr == value,
+        InstKind::Phi { incomings } => incomings.iter().any(|(_, incoming)| *incoming == value),
+        InstKind::Unary { value: operand, .. } | InstKind::Cast { value: operand, .. } => {
+            *operand == value
         }
         InstKind::Binary { lhs, rhs, .. }
         | InstKind::Icmp { lhs, rhs, .. }
-        | InstKind::Fcmp { lhs, rhs, .. } => {
-            reject_if_candidate(*lhs, candidates, rejected);
-            reject_if_candidate(*rhs, candidates, rejected);
-        }
-        InstKind::Gep { base, indices } => {
-            reject_if_candidate(*base, candidates, rejected);
-            for index in indices {
-                reject_if_candidate(*index, candidates, rejected);
-            }
-        }
-        InstKind::Call { args, .. } => {
-            for arg in args {
-                reject_if_candidate(*arg, candidates, rejected);
-            }
-        }
+        | InstKind::Fcmp { lhs, rhs, .. } => *lhs == value || *rhs == value,
+        InstKind::Gep { base, indices } => *base == value || indices.contains(&value),
+        InstKind::Call { args, .. } => args.contains(&value),
     }
 }
 
-fn collect_terminator_uses(
-    terminator: &Terminator,
-    candidates: &HashSet<ValueId>,
-    rejected: &mut HashSet<ValueId>,
-) {
+fn terminator_uses_value(terminator: &Terminator, value: ValueId) -> bool {
     match terminator {
-        Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
-            reject_if_candidate(*value, candidates, rejected);
-        }
-        Terminator::Return(None) | Terminator::Jump(_) => {}
+        Terminator::Return(Some(ret)) | Terminator::Branch { cond: ret, .. } => *ret == value,
+        Terminator::Return(None) | Terminator::Jump(_) => false,
     }
 }
 
-fn record_use(value: ValueId, block: BlockId, use_blocks: &mut HashMap<ValueId, BlockId>) {
-    use_blocks
-        .entry(value)
-        .and_modify(|existing| {
-            if *existing != block {
-                *existing = BlockId(usize::MAX);
+fn loads_are_defined(
+    func: &Function,
+    alloca: ValueId,
+    info: &CandidateInfo,
+    dom: &Dominators,
+) -> bool {
+    for (load_block, load_idx) in &info.loads {
+        let mut defined = false;
+        for (store_block, store_idx) in &info.stores {
+            if store_block == load_block {
+                if store_idx < load_idx {
+                    defined = true;
+                    break;
+                }
+            } else if dom.dominates(*store_block, *load_block) {
+                defined = true;
+                break;
             }
-        })
-        .or_insert(block);
+        }
+        if !defined {
+            return false;
+        }
+    }
+
+    promoted_type(func, alloca).is_some()
 }
 
-fn reject_if_candidate(
-    value: ValueId,
-    candidates: &HashSet<ValueId>,
-    rejected: &mut HashSet<ValueId>,
+fn insert_phis(
+    func: &mut Function,
+    candidates: &[ValueId],
+    dom: &Dominators,
+) -> HashMap<(BlockId, ValueId), ValueId> {
+    let mut phi_values = HashMap::new();
+
+    for alloca in candidates {
+        let Some(ty) = promoted_type(func, *alloca) else {
+            continue;
+        };
+        let mut worklist = store_blocks(func, *alloca)
+            .into_iter()
+            .collect::<VecDeque<_>>();
+        let mut placed = HashSet::<BlockId>::new();
+
+        while let Some(block) = worklist.pop_front() {
+            for frontier in &dom.frontier[block.0] {
+                if !placed.insert(*frontier) {
+                    continue;
+                }
+                let phi = insert_phi(func, *frontier, ty.clone());
+                phi_values.insert((*frontier, *alloca), phi);
+                worklist.push_back(*frontier);
+            }
+        }
+    }
+
+    phi_values
+}
+
+fn store_blocks(func: &Function, alloca: ValueId) -> HashSet<BlockId> {
+    let mut blocks = HashSet::new();
+    for block_idx in 0..func.blocks.len() {
+        for inst in &func.blocks[block_idx].insts {
+            if matches!(inst.kind, InstKind::Store { ptr, .. } if ptr == alloca) {
+                blocks.insert(BlockId(block_idx));
+            }
+        }
+    }
+    blocks
+}
+
+fn insert_phi(func: &mut Function, block: BlockId, ty: Type) -> ValueId {
+    let pos = func.blocks[block.0]
+        .insts
+        .iter()
+        .take_while(|inst| matches!(inst.kind, InstKind::Nop | InstKind::Phi { .. }))
+        .count();
+    let result = ValueId(func.values.len());
+    func.values.push(Value {
+        name: None,
+        ty,
+        kind: ValueKind::Inst(block, pos),
+    });
+    func.blocks[block.0].insts.insert(
+        pos,
+        Inst {
+            result: Some(result),
+            kind: InstKind::Phi {
+                incomings: Vec::new(),
+            },
+        },
+    );
+    reindex_block(func, block);
+    result
+}
+
+fn reindex_block(func: &mut Function, block: BlockId) {
+    for inst_idx in 0..func.blocks[block.0].insts.len() {
+        let Some(result) = func.blocks[block.0].insts[inst_idx].result else {
+            continue;
+        };
+        func.values[result.0].kind = ValueKind::Inst(block, inst_idx);
+    }
+}
+
+fn rename_block(
+    func: &mut Function,
+    block: BlockId,
+    cfg: &ControlFlowGraph,
+    dom: &Dominators,
+    candidates: &[ValueId],
+    phi_values: &HashMap<(BlockId, ValueId), ValueId>,
+    phi_allocas: &HashMap<ValueId, (BlockId, ValueId)>,
+    stacks: &mut HashMap<ValueId, Vec<ValueId>>,
+    replacements: &mut ValueReplacements,
 ) {
-    if candidates.contains(&value) {
-        rejected.insert(value);
-    }
-}
+    let mut pushed = Vec::<ValueId>::new();
 
-fn has_ordered_stores_before_loads(func: &Function, alloca: ValueId, block: BlockId) -> bool {
-    if block.0 == usize::MAX {
-        return false;
+    for inst in &func.blocks[block.0].insts {
+        let Some(result) = inst.result else {
+            continue;
+        };
+        if let Some((_, alloca)) = phi_allocas.get(&result) {
+            stacks.get_mut(alloca).unwrap().push(result);
+            pushed.push(*alloca);
+        }
     }
 
-    let mut has_value = false;
-    for inst in &func.block(block).insts {
-        match &inst.kind {
-            InstKind::Store { ptr, .. } if *ptr == alloca => has_value = true,
-            InstKind::Load { ptr } if *ptr == alloca && !has_value => return false,
+    for inst_idx in 0..func.blocks[block.0].insts.len() {
+        let inst = func.blocks[block.0].insts[inst_idx].clone();
+        match inst.kind {
+            InstKind::Alloca { .. } if inst.result.is_some_and(|r| candidates.contains(&r)) => {
+                func.blocks[block.0].insts[inst_idx].result = None;
+                func.blocks[block.0].insts[inst_idx].kind = InstKind::Nop;
+            }
+            InstKind::Store { ptr, value } if candidates.contains(&ptr) => {
+                let value = resolve_replacement(value, replacements);
+                stacks.get_mut(&ptr).unwrap().push(value);
+                pushed.push(ptr);
+                func.blocks[block.0].insts[inst_idx].kind = InstKind::Nop;
+            }
+            InstKind::Load { ptr } if candidates.contains(&ptr) => {
+                let Some(result) = inst.result else {
+                    continue;
+                };
+                let stack = stacks.get(&ptr).unwrap();
+                let Some(value) = stack.last().copied() else {
+                    continue;
+                };
+                replacements.insert(result, value);
+                func.blocks[block.0].insts[inst_idx].result = None;
+                func.blocks[block.0].insts[inst_idx].kind = InstKind::Nop;
+            }
             _ => {}
         }
     }
-    true
+
+    for succ in &cfg.succs[block.0] {
+        for alloca in candidates {
+            let Some(phi) = phi_values.get(&(*succ, *alloca)).copied() else {
+                continue;
+            };
+            let Some(value) = stacks.get(alloca).and_then(|stack| stack.last()).copied() else {
+                continue;
+            };
+            add_phi_incoming(func, phi, block, resolve_replacement(value, replacements));
+        }
+    }
+
+    for child in &dom.children[block.0] {
+        rename_block(
+            func,
+            *child,
+            cfg,
+            dom,
+            candidates,
+            phi_values,
+            phi_allocas,
+            stacks,
+            replacements,
+        );
+    }
+
+    for alloca in pushed.into_iter().rev() {
+        stacks.get_mut(&alloca).unwrap().pop();
+    }
+}
+
+fn add_phi_incoming(func: &mut Function, phi: ValueId, pred: BlockId, value: ValueId) {
+    let ValueKind::Inst(block, inst_idx) = func.value(phi).kind else {
+        panic!("phi value must be an instruction");
+    };
+    let InstKind::Phi { incomings } = &mut func.blocks[block.0].insts[inst_idx].kind else {
+        panic!("phi value must point to a phi instruction");
+    };
+    incomings.push((pred, value));
+}
+
+fn promoted_type(func: &Function, alloca: ValueId) -> Option<Type> {
+    let ValueKind::Inst(block, inst_idx) = func.value(alloca).kind else {
+        return None;
+    };
+    let InstKind::Alloca { ty } = &func.block(block).insts[inst_idx].kind else {
+        return None;
+    };
+    Some(ty.clone())
 }

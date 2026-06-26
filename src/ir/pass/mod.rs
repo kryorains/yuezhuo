@@ -1,5 +1,6 @@
 mod const_fold;
 mod dce;
+mod dominators;
 mod local_forward;
 mod scalar_promote;
 mod simplify_cfg;
