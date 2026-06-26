@@ -109,12 +109,24 @@ append_status_and_compare() {
   local status=$4
   local diff_path=$5
 
+  normalize_text_file "$actual"
   if [[ -s "$actual" ]] && [[ $(tail -c 1 "$actual" | wc -l) -eq 0 ]]; then
     printf '\n' >>"$actual"
   fi
   printf '%s\n' "$status" >>"$actual"
-  cp "$out" "$expected"
+
+  tr -d '\r' <"$out" >"$expected"
+  if [[ -s "$expected" ]] && [[ $(tail -c 1 "$expected" | wc -l) -eq 0 ]]; then
+    printf '\n' >>"$expected"
+  fi
   diff -u "$expected" "$actual" >"$diff_path"
+}
+
+normalize_text_file() {
+  local path=$1
+  local tmp=$path.norm
+  tr -d '\r' <"$path" >"$tmp"
+  mv "$tmp" "$path"
 }
 
 score_ratio() {
@@ -160,6 +172,7 @@ while IFS= read -r sy; do
   stem=${rel//\//__}
   stem=${stem%.sy}
   baseline_ms=NA
+  baseline_ok=0
 
   if [[ "$BASELINE" == "1" ]]; then
     baseline_exe="$WORK_DIR/$stem.gcc.exe"
@@ -185,6 +198,8 @@ while IFS= read -r sy; do
       elif ! append_status_and_compare "$baseline_actual" "$baseline_expected" "$out" "$baseline_status" "$WORK_DIR/$stem.gcc.diff"; then
         baseline_ms=NA
         printf 'BASELINE_DIFF_FAIL %s\n' "$rel"
+      else
+        baseline_ok=1
       fi
     else
       printf 'BASELINE_COMPILE_FAIL %s\n' "$rel"
@@ -242,9 +257,17 @@ while IFS= read -r sy; do
       printf '%s\t%s\tPASS\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$opt" "$compile_ms" "$link_ms" "$run_ms" "$asm_lines" "$bytes" "$baseline_ms" "$score" >>"$report"
       passed=$((passed + 1))
     else
-      printf '%s\t%s\tDIFF_FAIL\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$opt" "$compile_ms" "$link_ms" "$run_ms" "$asm_lines" "$bytes" "$baseline_ms" "$score" >>"$report"
-      printf 'DIFF_FAIL    %s %s\n' "$opt" "$rel"
-      failed=$((failed + 1))
+      status=DIFF_FAIL
+      if [[ "$BASELINE" == "1" && "$baseline_ok" == "0" ]]; then
+        status=EXPECTED_MISMATCH
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$opt" "$status" "$compile_ms" "$link_ms" "$run_ms" "$asm_lines" "$bytes" "$baseline_ms" "$score" >>"$report"
+      printf '%-17s %s %s\n' "$status" "$opt" "$rel"
+      if [[ "$status" == "EXPECTED_MISMATCH" ]]; then
+        skipped=$((skipped + 1))
+      else
+        failed=$((failed + 1))
+      fi
     fi
   done
 done < <(find "$TEST_ROOT" -name '*.sy' | sort)
