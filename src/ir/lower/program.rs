@@ -101,6 +101,8 @@ impl<'a> Lowerer<'a> {
             ("putf", Type::Void, vec![Type::Ptr(Box::new(Type::I32))]),
             ("starttime", Type::Void, vec![]),
             ("stoptime", Type::Void, vec![]),
+            ("_sysy_starttime", Type::Void, vec![Type::I32]),
+            ("_sysy_stoptime", Type::Void, vec![Type::I32]),
         ] {
             self.funcs
                 .insert(name.to_string(), FunctionSig { ret, params });

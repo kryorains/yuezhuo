@@ -124,5 +124,7 @@ void putf(const char *fmt, ...) {
   va_end(ap);
 }
 
-void starttime(void) {}
-void stoptime(void) {}
+void _sysy_starttime(int lineno) { (void)lineno; }
+void _sysy_stoptime(int lineno) { (void)lineno; }
+void starttime(void) { _sysy_starttime(0); }
+void stoptime(void) { _sysy_stoptime(0); }
