@@ -23,10 +23,12 @@ impl ModulePass for ScalarPromotePass {
 }
 
 fn promote_function(func: &mut Function) {
+    // 当前实现使用较朴素的数据结构；大函数先跳过，避免编译时间爆炸。
     if func.blocks.len() > 512 || func.values.len() > 4096 {
         return;
     }
 
+    // mem2reg 的核心流程：找候选 alloca -> 插 phi -> 沿支配树重命名。
     let cfg = ControlFlowGraph::new(func);
     let reachable = reachable_blocks(func, &cfg);
     let dom = Dominators::new(func, &cfg);
@@ -87,6 +89,7 @@ fn collect_candidates(
     reachable: &HashSet<BlockId>,
     dom: &Dominators,
 ) -> Vec<ValueId> {
+    // 候选必须是标量 alloca，且地址不能逃逸，只能被 load/store 以受控方式访问。
     let mut candidates = Vec::new();
     let mut ordered_allocas = collect_scalar_allocas(func);
     ordered_allocas.sort_by_key(|value| value.0);
@@ -213,6 +216,7 @@ fn loads_are_defined(
     info: &CandidateInfo,
     dom: &Dominators,
 ) -> bool {
+    // 保证每个 load 在所有可见路径上至少能看到一个先前 store，避免读未定义值。
     for (load_block, load_idx) in &info.loads {
         let mut defined = false;
         for (store_block, store_idx) in &info.stores {
@@ -239,6 +243,7 @@ fn insert_phis(
     candidates: &[ValueId],
     dom: &Dominators,
 ) -> HashMap<(BlockId, ValueId), ValueId> {
+    // 从所有 store 所在块出发，在 dominance frontier 上放置必要的 phi。
     let mut phi_values = HashMap::new();
 
     for alloca in candidates {
@@ -278,6 +283,7 @@ fn store_blocks(func: &Function, alloca: ValueId) -> HashSet<BlockId> {
 }
 
 fn insert_phi(func: &mut Function, block: BlockId, ty: Type) -> ValueId {
+    // phi 必须插在块开头，跳过已有 Nop/phi，保持块内 phi 区域连续。
     let pos = func.blocks[block.0]
         .insts
         .iter()
@@ -322,6 +328,7 @@ fn rename_block(
     stacks: &mut HashMap<ValueId, Vec<ValueId>>,
     replacements: &mut ValueReplacements,
 ) {
+    // 沿支配树 DFS。每个 alloca 有一条值栈，表示当前路径上最新的 SSA 定义。
     let mut pushed = Vec::<ValueId>::new();
 
     for inst in &func.blocks[block.0].insts {
@@ -335,6 +342,7 @@ fn rename_block(
     }
 
     for inst_idx in 0..func.blocks[block.0].insts.len() {
+        // alloca/load/store 被提升后都变成 Nop；真正的数据流由值栈和替换表表达。
         let inst = func.blocks[block.0].insts[inst_idx].clone();
         match inst.kind {
             InstKind::Alloca { .. } if inst.result.is_some_and(|r| candidates.contains(&r)) => {
@@ -364,6 +372,7 @@ fn rename_block(
     }
 
     for succ in &cfg.succs[block.0] {
+        // 当前块处理完后，把每个候选变量的当前值填到后继块对应 phi 的 incoming 里。
         for alloca in candidates {
             let Some(phi) = phi_values.get(&(*succ, *alloca)).copied() else {
                 continue;
@@ -390,6 +399,7 @@ fn rename_block(
     }
 
     for alloca in pushed.into_iter().rev() {
+        // 离开当前支配树节点时回滚值栈，恢复父路径的“当前值”。
         stacks.get_mut(&alloca).unwrap().pop();
     }
 }
