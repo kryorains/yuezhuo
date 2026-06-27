@@ -117,17 +117,33 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_phi_copies(&mut self, pred_idx: usize, target_idx: usize) {
-        for inst in &self.func.block(BlockId(target_idx)).insts {
-            let incomings = match &inst.kind {
-                InstKind::Nop => continue,
-                InstKind::Phi { incomings } => incomings,
-                _ => break,
-            };
-            let result = inst.result.unwrap();
-            if let Some((_, value)) = incomings.iter().find(|(pred, _)| pred.0 == pred_idx) {
-                self.load_value(*value);
-                self.store_result(result);
-            }
+        let copies = self
+            .func
+            .block(BlockId(target_idx))
+            .insts
+            .iter()
+            .filter_map(|inst| {
+                let incomings = match &inst.kind {
+                    InstKind::Nop => return None,
+                    InstKind::Phi { incomings } => incomings,
+                    _ => return None,
+                };
+                let result = inst.result.unwrap();
+                incomings
+                    .iter()
+                    .find(|(pred, _)| pred.0 == pred_idx)
+                    .map(|(_, value)| (result, *value))
+            })
+            .collect::<Vec<_>>();
+
+        for (_, value) in &copies {
+            self.load_value(*value);
+            self.push_x0();
+        }
+        for (result, _) in copies.iter().rev() {
+            self.pop_x1();
+            self.body.push_str("  mov x0, x1\n");
+            self.store_result(*result);
         }
     }
 

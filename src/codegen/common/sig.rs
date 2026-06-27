@@ -129,6 +129,22 @@ impl<'a> IrModuleCtx<'a> {
             ),
             ("starttime", Type::Void, vec![]),
             ("stoptime", Type::Void, vec![]),
+            (
+                "_sysy_starttime",
+                Type::Void,
+                vec![IrParamSig {
+                    ty: Type::I32,
+                    is_pointer: false,
+                }],
+            ),
+            (
+                "_sysy_stoptime",
+                Type::Void,
+                vec![IrParamSig {
+                    ty: Type::I32,
+                    is_pointer: false,
+                }],
+            ),
         ] {
             self.funcs
                 .insert(name.to_string(), IrFuncSig { ret, params });

@@ -32,8 +32,13 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             self.load_value(*index);
             self.body.push_str("  sxtw x0, w0\n");
             if stride != 1 {
-                self.body.push_str(&mov_x_imm("x16", stride as i64));
-                self.body.push_str("  mul x0, x0, x16\n");
+                if stride > 0 && (stride & (stride - 1)) == 0 {
+                    self.body
+                        .push_str(&format!("  lsl x0, x0, #{}\n", stride.trailing_zeros()));
+                } else {
+                    self.body.push_str(&mov_x_imm("x16", stride as i64));
+                    self.body.push_str("  mul x0, x0, x16\n");
+                }
             }
             self.pop_x1();
             self.body.push_str("  add x0, x1, x0\n");
@@ -136,21 +141,29 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             return;
         }
         let op = if amount < 0 { "sub" } else { "add" };
-        self.body.push_str(&mov_x_imm("x16", amount.abs() as i64));
-        self.body.push_str(&format!("  {} sp, sp, x16\n", op));
+        let amount = amount.abs();
+        if amount <= 4095 {
+            self.body
+                .push_str(&format!("  {} sp, sp, #{}\n", op, amount));
+        } else {
+            self.body.push_str(&mov_x_imm("x16", amount as i64));
+            self.body.push_str(&format!("  {} sp, sp, x16\n", op));
+        }
     }
 
     pub(super) fn frame_addr(&mut self, dst: &str, offset: i32) {
         self.base_addr(dst, "x29", offset);
     }
 
-    fn sp_addr(&mut self, dst: &str, offset: i32) {
-        self.base_addr(dst, "sp", offset);
-    }
-
     fn base_addr(&mut self, dst: &str, base: &str, offset: i32) {
         if offset == 0 {
             self.body.push_str(&format!("  mov {}, {}\n", dst, base));
+        } else if (1..=4095).contains(&offset) {
+            self.body
+                .push_str(&format!("  add {}, {}, #{}\n", dst, base, offset));
+        } else if (-4095..=-1).contains(&offset) {
+            self.body
+                .push_str(&format!("  sub {}, {}, #{}\n", dst, base, -offset));
         } else if offset > 0 {
             self.body.push_str(&mov_x_imm("x16", offset as i64));
             self.body
@@ -163,48 +176,99 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_frame_x(&mut self, dst: &str, offset: i32) {
-        self.frame_addr("x17", offset);
-        self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
+        self.load_base_x(dst, "x29", offset);
     }
 
     pub(super) fn load_frame_w(&mut self, dst: &str, offset: i32) {
-        self.frame_addr("x17", offset);
-        self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
+        self.load_base_w(dst, "x29", offset);
     }
 
     pub(super) fn load_frame_s(&mut self, dst: &str, offset: i32) {
-        self.frame_addr("x17", offset);
-        self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
+        self.load_base_s(dst, "x29", offset);
     }
 
     pub(super) fn store_frame_x(&mut self, src: &str, offset: i32) {
-        self.frame_addr("x17", offset);
-        self.body.push_str(&format!("  str {}, [x17]\n", src));
+        self.store_base_x(src, "x29", offset);
     }
 
     pub(super) fn store_frame_w(&mut self, src: &str, offset: i32) {
-        self.frame_addr("x17", offset);
-        self.body.push_str(&format!("  str {}, [x17]\n", src));
+        self.store_base_w(src, "x29", offset);
     }
 
     pub(super) fn store_frame_s(&mut self, src: &str, offset: i32) {
-        self.frame_addr("x17", offset);
-        self.body.push_str(&format!("  str {}, [x17]\n", src));
+        self.store_base_s(src, "x29", offset);
     }
 
     pub(super) fn load_sp_x(&mut self, dst: &str, offset: i32) {
-        self.sp_addr("x17", offset);
-        self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
+        self.load_base_x(dst, "sp", offset);
     }
 
     pub(super) fn load_sp_s(&mut self, dst: &str, offset: i32) {
-        self.sp_addr("x17", offset);
-        self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
+        self.load_base_s(dst, "sp", offset);
     }
 
     pub(super) fn store_sp_x(&mut self, src: &str, offset: i32) {
-        self.sp_addr("x17", offset);
-        self.body.push_str(&format!("  str {}, [x17]\n", src));
+        self.store_base_x(src, "sp", offset);
+    }
+
+    fn load_base_x(&mut self, dst: &str, base: &str, offset: i32) {
+        if let Some(op) = direct_mem_op(offset, 8) {
+            self.body
+                .push_str(&format!("  {} {}, {}\n", op, dst, mem_operand(base, offset)));
+        } else {
+            self.base_addr("x17", base, offset);
+            self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
+        }
+    }
+
+    fn load_base_w(&mut self, dst: &str, base: &str, offset: i32) {
+        if let Some(op) = direct_mem_op(offset, 4) {
+            self.body
+                .push_str(&format!("  {} {}, {}\n", op, dst, mem_operand(base, offset)));
+        } else {
+            self.base_addr("x17", base, offset);
+            self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
+        }
+    }
+
+    fn load_base_s(&mut self, dst: &str, base: &str, offset: i32) {
+        if let Some(op) = direct_mem_op(offset, 4) {
+            self.body
+                .push_str(&format!("  {} {}, {}\n", op, dst, mem_operand(base, offset)));
+        } else {
+            self.base_addr("x17", base, offset);
+            self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
+        }
+    }
+
+    fn store_base_x(&mut self, src: &str, base: &str, offset: i32) {
+        if let Some(op) = direct_store_op(offset, 8) {
+            self.body
+                .push_str(&format!("  {} {}, {}\n", op, src, mem_operand(base, offset)));
+        } else {
+            self.base_addr("x17", base, offset);
+            self.body.push_str(&format!("  str {}, [x17]\n", src));
+        }
+    }
+
+    fn store_base_w(&mut self, src: &str, base: &str, offset: i32) {
+        if let Some(op) = direct_store_op(offset, 4) {
+            self.body
+                .push_str(&format!("  {} {}, {}\n", op, src, mem_operand(base, offset)));
+        } else {
+            self.base_addr("x17", base, offset);
+            self.body.push_str(&format!("  str {}, [x17]\n", src));
+        }
+    }
+
+    fn store_base_s(&mut self, src: &str, base: &str, offset: i32) {
+        if let Some(op) = direct_store_op(offset, 4) {
+            self.body
+                .push_str(&format!("  {} {}, {}\n", op, src, mem_operand(base, offset)));
+        } else {
+            self.base_addr("x17", base, offset);
+            self.body.push_str(&format!("  str {}, [x17]\n", src));
+        }
     }
 
     pub(super) fn block_label(&self, block_idx: usize) -> String {
@@ -213,6 +277,28 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     pub(super) fn object_offset(&self, value: ValueId, _ty: &Type) -> i32 {
         self.layout.offset(value) + 8
+    }
+}
+
+fn direct_mem_op(offset: i32, size: i32) -> Option<&'static str> {
+    if (-256..=255).contains(&offset) {
+        return Some("ldur");
+    }
+    (offset >= 0 && offset % size == 0 && offset / size <= 4095).then_some("ldr")
+}
+
+fn direct_store_op(offset: i32, size: i32) -> Option<&'static str> {
+    if (-256..=255).contains(&offset) {
+        return Some("stur");
+    }
+    (offset >= 0 && offset % size == 0 && offset / size <= 4095).then_some("str")
+}
+
+fn mem_operand(base: &str, offset: i32) -> String {
+    if offset == 0 {
+        format!("[{}]", base)
+    } else {
+        format!("[{}, #{}]", base, offset)
     }
 }
 

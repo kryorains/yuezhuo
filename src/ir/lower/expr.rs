@@ -177,8 +177,13 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn lower_call(&mut self, name: &str, args: &[Expr]) -> Result<ValueId, LowerError> {
+        let (name, implicit_args) = match (name, args.is_empty()) {
+            ("starttime", true) => ("_sysy_starttime", vec![self.const_int(0)]),
+            ("stoptime", true) => ("_sysy_stoptime", vec![self.const_int(0)]),
+            _ => (name, Vec::new()),
+        };
         let sig = self.sigs.get(name).cloned();
-        let mut lowered_args = Vec::new();
+        let mut lowered_args = implicit_args;
         for (idx, arg) in args.iter().enumerate() {
             let value = self.lower_expr(arg)?;
             let value = match sig.as_ref().and_then(|sig| sig.params.get(idx)) {

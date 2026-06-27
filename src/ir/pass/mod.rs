@@ -1,5 +1,6 @@
 mod const_fold;
 mod dce;
+mod dominators;
 mod local_forward;
 mod scalar_promote;
 mod simplify_cfg;
@@ -30,6 +31,7 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel) {
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(LocalForwardPass::new());
             pipeline.add(ConstFoldPass::new());
+            pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());
         }
     }
