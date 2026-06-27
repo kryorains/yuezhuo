@@ -1,5 +1,5 @@
 use super::{X86IrEmitter, X86IrFuncEmitter};
-use crate::codegen::common::{IrFuncLayout, IrModuleCtx, emit_ir_data_section, ir_align_to};
+use crate::codegen::common::{emit_ir_data_section, ir_align_to, IrFuncLayout, IrModuleCtx};
 use crate::ir::{Function, Module};
 
 pub(super) fn emit_asm(module: &Module) -> String {

@@ -1,5 +1,5 @@
 use super::X86IrFuncEmitter;
-use crate::codegen::common::ir_size;
+use crate::codegen::common::{gep_elem_type, ir_size, pointee};
 use crate::ir::{Const, Type, ValueId, ValueKind};
 
 impl<'a, 'b> X86IrFuncEmitter<'a, 'b> {
@@ -130,20 +130,5 @@ impl<'a, 'b> X86IrFuncEmitter<'a, 'b> {
 
     pub(super) fn object_offset(&self, value: ValueId, _ty: &Type) -> i32 {
         self.layout.offset(value) + 8
-    }
-}
-
-fn gep_elem_type(ty: &Type) -> Type {
-    match ty {
-        Type::Ptr(inner) => (**inner).clone(),
-        Type::Array { elem, .. } => (**elem).clone(),
-        _ => Type::I32,
-    }
-}
-
-fn pointee(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Ptr(inner) => Some((**inner).clone()),
-        _ => None,
     }
 }
