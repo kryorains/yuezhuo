@@ -8,6 +8,7 @@ pub(super) struct ControlFlowGraph {
 
 impl ControlFlowGraph {
     pub(super) fn new(func: &Function) -> Self {
+        // 根据每个基本块的 terminator 建出前驱/后继表。
         let mut preds = vec![Vec::new(); func.blocks.len()];
         let mut succs = vec![Vec::new(); func.blocks.len()];
 
@@ -49,6 +50,7 @@ pub(super) struct Dominators {
 
 impl Dominators {
     pub(super) fn new(func: &Function, cfg: &ControlFlowGraph) -> Self {
+        // 支配信息只对入口可达块有意义；不可达块单独保守处理。
         let reachable = reachable_blocks(func, cfg);
         let dom_sets = compute_dom_sets(func, cfg, &reachable);
         let idom = compute_idoms(func, &dom_sets, &reachable);
@@ -85,6 +87,7 @@ fn compute_dom_sets(
     cfg: &ControlFlowGraph,
     reachable: &HashSet<usize>,
 ) -> Vec<HashSet<usize>> {
+    // 朴素迭代算法：dom(B) = {B} ∪ 所有前驱 dom 集合的交集，直到不再变化。
     let n = func.blocks.len();
     let all = reachable.iter().copied().collect::<HashSet<_>>();
     let mut doms = (0..n)
@@ -138,6 +141,7 @@ fn compute_idoms(
     dom_sets: &[HashSet<usize>],
     reachable: &HashSet<usize>,
 ) -> Vec<Option<BlockId>> {
+    // immediate dominator 是严格支配者里“离当前块最近”的那个。
     let mut idom = vec![None; func.blocks.len()];
 
     for block_idx in 0..func.blocks.len() {
@@ -177,6 +181,7 @@ fn compute_frontier(
     idom: &[Option<BlockId>],
     reachable: &HashSet<usize>,
 ) -> Vec<Vec<BlockId>> {
+    // dominance frontier 用来回答“某个定义从哪些汇合点开始不再支配所有路径”。
     let mut frontier = vec![Vec::new(); func.blocks.len()];
 
     for block_idx in 0..func.blocks.len() {
@@ -196,6 +201,7 @@ fn compute_frontier(
             continue;
         };
         for pred in &reachable_preds {
+            // 从每个前驱沿 idom 链向上走到当前块的 idom，沿途都需要把当前块放进 frontier。
             let mut runner = *pred;
             while runner != stop {
                 push_unique(&mut frontier[runner.0], BlockId(block_idx));

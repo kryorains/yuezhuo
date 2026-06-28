@@ -18,6 +18,7 @@ impl ModulePass for SimplifyCfgPass {
 }
 
 fn simplify_function(func: &mut Function) {
+    // 先替换 terminator，并记录被删除的 CFG 边；最后再统一修 phi incoming。
     let mut removed_edges = Vec::new();
 
     for block_idx in 0..func.blocks.len() {
@@ -26,6 +27,7 @@ fn simplify_function(func: &mut Function) {
         };
 
         let (replacement, removed) = match terminator {
+            // then/else 相同的条件跳转没有意义，直接改成无条件跳转。
             Terminator::Branch {
                 cond: _,
                 then_target,
@@ -36,6 +38,7 @@ fn simplify_function(func: &mut Function) {
                 then_target,
                 else_target,
             } => match const_bool(func, cond) {
+                // 条件已经是常量时，删掉永远不会走到的那条边。
                 Some(true) => (
                     Terminator::Jump(then_target),
                     vec![(BlockId(block_idx), else_target)],
@@ -59,6 +62,7 @@ fn simplify_function(func: &mut Function) {
 }
 
 fn remove_phi_incomings(func: &mut Function, pred: BlockId, target: BlockId) {
+    // CFG 边被删后，目标块 phi 中来自这个前驱的值也必须同步删除。
     for inst in &mut func.blocks[target.0].insts {
         let InstKind::Phi { incomings } = &mut inst.kind else {
             if !matches!(inst.kind, InstKind::Nop) {
@@ -71,6 +75,7 @@ fn remove_phi_incomings(func: &mut Function, pred: BlockId, target: BlockId) {
 }
 
 fn const_bool(func: &Function, value: crate::ir::ValueId) -> Option<bool> {
+    // 分支条件允许 bool/int/float 常量：非零视为 true。
     match &func.value(value).kind {
         ValueKind::Const(Const::Bool(value)) => Some(*value),
         ValueKind::Const(Const::Int(value)) => Some(*value != 0),

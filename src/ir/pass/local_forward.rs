@@ -1,5 +1,5 @@
+use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
-use super::util::{ValueReplacements, rewrite_function_uses};
 use crate::ir::{Function, InstKind, Module, Type, ValueId, ValueKind};
 use std::collections::HashMap;
 
@@ -20,15 +20,18 @@ impl ModulePass for LocalForwardPass {
 }
 
 fn forward_function(func: &mut Function) {
+    // 局部转发可能形成链式替换，循环到本轮没有任何使用点被改写。
     loop {
         let mut replacements = ValueReplacements::new();
 
         for block in &func.blocks {
+            // 只在单个基本块内追踪内存状态，跨块交给更强的 SSA/phi 逻辑处理。
             let mut known_memory = HashMap::<ValueId, ValueId>::new();
             for inst in &block.insts {
                 match &inst.kind {
                     InstKind::Nop | InstKind::Alloca { .. } => {}
                     InstKind::Store { ptr, value } => {
+                        // 记录“这个指针当前存着哪个值”；如果指针不可安全追踪，就清空已知内存。
                         let ptr = resolve(*ptr, &replacements);
                         let value = resolve(*value, &replacements);
                         if tracked_pointer(func, ptr) {
@@ -38,6 +41,7 @@ fn forward_function(func: &mut Function) {
                         }
                     }
                     InstKind::Load { ptr } => {
+                        // 如果前面已知 ptr 里就是某个 value，就把这次 load 直接替换成 value。
                         let Some(result) = inst.result else {
                             continue;
                         };
@@ -49,6 +53,7 @@ fn forward_function(func: &mut Function) {
                         }
                     }
                     InstKind::Call { .. } | InstKind::MemZero { .. } => {
+                        // 调用和批量清零都可能改写内存，保守地丢弃本块内已知信息。
                         known_memory.clear();
                     }
                     InstKind::Gep { .. } => {}
@@ -64,6 +69,7 @@ fn forward_function(func: &mut Function) {
 }
 
 fn tracked_pointer(func: &Function, value: ValueId) -> bool {
+    // 目前只跟踪非数组 alloca，避免数组/复杂别名导致错误转发。
     let Type::Ptr(inner) = &func.value(value).ty else {
         return false;
     };

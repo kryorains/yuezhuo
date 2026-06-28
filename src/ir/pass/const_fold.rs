@@ -1,5 +1,5 @@
+use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
-use super::util::{ValueReplacements, rewrite_function_uses};
 use crate::ir::{
     BinaryOp, CastOp, CmpOp, Const, Function, InstKind, Module, Type, UnaryOp, ValueId, ValueKind,
 };
@@ -21,6 +21,7 @@ impl ModulePass for ConstFoldPass {
 }
 
 fn fold_function(func: &mut Function) {
+    // 反复扫描直到收敛：一次改写使用点后，可能让更多指令变成可折叠常量。
     loop {
         let mut replacements = ValueReplacements::new();
         let mut changed = false;
@@ -34,6 +35,7 @@ fn fold_function(func: &mut Function) {
                 };
 
                 if let Some(value) = fold_inst(func, &inst.kind) {
+                    // 真正的常量折叠：结果值变成 Const，原指令本体改成 Nop。
                     func.values[result.0].kind = ValueKind::Const(value);
                     func.blocks[block_idx].insts[inst_idx].result = None;
                     func.blocks[block_idx].insts[inst_idx].kind = InstKind::Nop;
@@ -42,6 +44,7 @@ fn fold_function(func: &mut Function) {
                 }
 
                 if let Some(replacement) = simplify_inst(func, &inst.kind) {
+                    // 代数化简不一定产生新常量，先记录替换，最后统一改写所有使用点。
                     replacements.insert(result, replacement);
                 }
             }
@@ -55,6 +58,7 @@ fn fold_function(func: &mut Function) {
 }
 
 fn fold_inst(func: &Function, kind: &InstKind) -> Option<Const> {
+    // 只有所有输入都能读成 Const 时，才会在编译期直接求值。
     match kind {
         InstKind::Unary { op, value } => fold_unary(*op, const_value(func, *value)?),
         InstKind::Binary { op, lhs, rhs } => {
@@ -72,6 +76,7 @@ fn fold_inst(func: &Function, kind: &InstKind) -> Option<Const> {
 }
 
 fn simplify_inst(func: &mut Function, kind: &InstKind) -> Option<ValueId> {
+    // 这里处理 x + 0、x * 1、无意义 cast、退化 phi 等不需要完整求值的规则。
     match kind {
         InstKind::Unary {
             op: UnaryOp::Not,
@@ -267,6 +272,7 @@ fn const_value(func: &Function, value: ValueId) -> Option<&Const> {
 }
 
 fn get_or_add_const(func: &mut Function, value: Const) -> ValueId {
+    // 复用函数里已有的同值常量，避免因为化简制造一堆重复 Const。
     if let Some(value) = func
         .values
         .iter()

@@ -19,6 +19,7 @@ impl ModulePass for DcePass {
 }
 
 fn eliminate_dead_code(func: &mut Function) {
+    // 删除一批死指令后，依赖它们的值也可能继续变死，所以循环到没有变化。
     loop {
         let used = collect_used_values(func);
         let mut changed = false;
@@ -32,6 +33,7 @@ fn eliminate_dead_code(func: &mut Function) {
                     continue;
                 }
 
+                // 只移除无副作用指令：清掉结果并保留一个 Nop 占位，避免立刻重排索引。
                 inst.result = None;
                 inst.kind = InstKind::Nop;
                 changed = true;
@@ -45,6 +47,7 @@ fn eliminate_dead_code(func: &mut Function) {
 }
 
 fn collect_used_values(func: &Function) -> HashSet<ValueId> {
+    // 从所有指令操作数和 terminator 操作数里收集“还活着”的 ValueId。
     let mut used = HashSet::new();
 
     for block in &func.blocks {
@@ -111,6 +114,7 @@ fn collect_terminator_operands(terminator: &Terminator, used: &mut HashSet<Value
 }
 
 fn is_removable(inst: &Inst) -> bool {
+    // store/call/memzero 这类可能有副作用的指令不能因为结果没被用就删掉。
     matches!(
         inst.kind,
         InstKind::Nop

@@ -20,12 +20,12 @@ pub enum OptLevel {
 }
 
 pub fn run_pipeline(module: &mut Module, opt_level: OptLevel) {
+    // 所有优化 pass 都在这里排队，方便统一调整执行顺序。
     let mut pipeline = PassPipeline::new();
     match opt_level {
         OptLevel::O0 => {}
         OptLevel::O1 => {
-            // Keep this centralized so passes can be repeated or reordered without
-            // hiding pipeline policy inside codegen.
+            // 先折叠常量和死分支，再做标量提升/局部转发，最后再清一次新产生的机会。
             pipeline.add(ConstFoldPass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(ScalarPromotePass::new());
@@ -52,6 +52,7 @@ impl PassPipeline {
     }
 
     fn run(&mut self, module: &mut Module) {
+        // pass 之间直接共享同一个可变 Module，前一个 pass 的结果会喂给后一个 pass。
         for pass in &mut self.passes {
             pass.run(module);
         }

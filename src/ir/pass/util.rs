@@ -4,6 +4,7 @@ use std::collections::HashMap;
 pub(super) type ValueReplacements = HashMap<ValueId, ValueId>;
 
 pub(super) fn rewrite_function_uses(func: &mut Function, replacements: &ValueReplacements) -> bool {
+    // 统一改写整个函数的操作数；pass 只需要准备 replacement 表即可。
     if replacements.is_empty() {
         return false;
     }
@@ -21,6 +22,7 @@ pub(super) fn rewrite_function_uses(func: &mut Function, replacements: &ValueRep
 }
 
 pub(super) fn resolve_replacement(mut value: ValueId, replacements: &ValueReplacements) -> ValueId {
+    // 处理链式替换，例如 a -> b、b -> c，最终应该把 a 解析成 c。
     while let Some(next) = replacements.get(&value).copied() {
         if next == value {
             break;
@@ -40,6 +42,7 @@ fn rewrite_value(value: &mut ValueId, replacements: &ValueReplacements) -> bool 
 }
 
 fn rewrite_inst_uses(inst: &mut Inst, replacements: &ValueReplacements) -> bool {
+    // 只改写“使用到的值”，不会改写指令自己的 result。
     match &mut inst.kind {
         InstKind::Nop | InstKind::Alloca { .. } => false,
         InstKind::Phi { incomings } => incomings.iter_mut().fold(false, |changed, (_, value)| {
