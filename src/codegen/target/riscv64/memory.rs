@@ -1,5 +1,5 @@
 use super::Riscv64IrFuncEmitter;
-use crate::codegen::common::ir_size;
+use crate::codegen::common::{gep_elem_type, ir_size, pointee};
 use crate::ir::{Const, Type, ValueId, ValueKind};
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
@@ -287,19 +287,4 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
 fn fits_i12(value: i32) -> bool {
     (-2048..=2047).contains(&value)
-}
-
-fn gep_elem_type(ty: &Type) -> Type {
-    match ty {
-        Type::Ptr(inner) => (**inner).clone(),
-        Type::Array { elem, .. } => (**elem).clone(),
-        _ => Type::I32,
-    }
-}
-
-fn pointee(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Ptr(inner) => Some((**inner).clone()),
-        _ => None,
-    }
 }

@@ -1,43 +1,11 @@
 use super::AArch64IrFuncEmitter;
-use super::abi::{IrArgLocation, assign_locations};
-use crate::codegen::common::{IrFuncSig, IrParamSig};
+use crate::codegen::common::{assign_arg_locations, resolve_call_sig, IrArgLocation};
 use crate::ir::{Type, ValueId};
 
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     pub(super) fn emit_call(&mut self, name: &str, args: &[ValueId]) -> Type {
-        let sig = self
-            .parent
-            .ctx
-            .funcs
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| IrFuncSig {
-                ret: Type::I32,
-                params: args
-                    .iter()
-                    .map(|arg| {
-                        let ty = self.func.value(*arg).ty.clone();
-                        IrParamSig {
-                            is_pointer: matches!(ty, Type::Ptr(_)),
-                            ty,
-                        }
-                    })
-                    .collect(),
-            });
-        let arg_sigs = args
-            .iter()
-            .enumerate()
-            .map(|(idx, arg)| {
-                sig.params.get(idx).cloned().unwrap_or_else(|| {
-                    let ty = self.func.value(*arg).ty.clone();
-                    IrParamSig {
-                        is_pointer: matches!(ty, Type::Ptr(_)),
-                        ty,
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let locations = assign_locations(&arg_sigs, 8, 8);
+        let (sig, arg_sigs) = resolve_call_sig(&self.parent.ctx, self.func, name, args);
+        let locations = assign_arg_locations(&arg_sigs, 8, 8);
         let stack_count = locations
             .iter()
             .filter(|location| matches!(location, IrArgLocation::Stack))

@@ -1,6 +1,11 @@
 use crate::ir::{Function, InstKind, Type, ValueId, ValueKind};
 use std::collections::HashMap;
 
+/// 函数内所有“需要落栈的 IR 值”到栈帧偏移的映射。
+///
+/// 约定：offset 是相对目标平台 frame pointer 的负偏移；`alloca` 结果本身保存的是
+/// 被分配对象的地址，所以会额外预留一个 8 字节槽位来存这个地址，真实对象从
+/// `object_offset = value_offset + 8` 开始。
 pub(crate) struct IrFuncLayout {
     offsets: HashMap<ValueId, i32>,
     pub(crate) stack_size: i32,
@@ -40,6 +45,7 @@ impl IrFuncLayout {
     }
 
     fn alloc(&mut self, value: ValueId, size: i32) {
+        // 当前后端统一按 8 字节对齐分配栈槽，方便同时容纳 i32/f32 和指针。
         self.stack_size += ir_align_to(size, 8);
         self.offsets.insert(value, -self.stack_size);
     }
@@ -58,6 +64,10 @@ pub(crate) fn ir_align_to(value: i32, align: i32) -> i32 {
     (value + align - 1) / align * align
 }
 
+/// IR 值存回栈帧时需要的槽位大小。
+///
+/// 数组类型表示“对象本体”，按完整大小预留；指针是地址，固定 8 字节；
+/// i1/i32/f32 当前都按 4 字节保存。
 fn ir_slot_size(ty: &Type) -> i32 {
     match ty {
         Type::Void => 0,

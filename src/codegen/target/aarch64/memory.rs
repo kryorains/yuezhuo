@@ -1,6 +1,6 @@
-use super::AArch64IrFuncEmitter;
 use super::imm::{mov_w_imm, mov_x_imm};
-use crate::codegen::common::ir_size;
+use super::AArch64IrFuncEmitter;
+use crate::codegen::common::{gep_elem_type, ir_size, pointee};
 use crate::ir::{Const, Type, ValueId, ValueKind};
 
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
@@ -213,8 +213,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     fn load_base_x(&mut self, dst: &str, base: &str, offset: i32) {
         if let Some(op) = direct_mem_op(offset, 8) {
-            self.body
-                .push_str(&format!("  {} {}, {}\n", op, dst, mem_operand(base, offset)));
+            self.body.push_str(&format!(
+                "  {} {}, {}\n",
+                op,
+                dst,
+                mem_operand(base, offset)
+            ));
         } else {
             self.base_addr("x17", base, offset);
             self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
@@ -223,8 +227,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     fn load_base_w(&mut self, dst: &str, base: &str, offset: i32) {
         if let Some(op) = direct_mem_op(offset, 4) {
-            self.body
-                .push_str(&format!("  {} {}, {}\n", op, dst, mem_operand(base, offset)));
+            self.body.push_str(&format!(
+                "  {} {}, {}\n",
+                op,
+                dst,
+                mem_operand(base, offset)
+            ));
         } else {
             self.base_addr("x17", base, offset);
             self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
@@ -233,8 +241,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     fn load_base_s(&mut self, dst: &str, base: &str, offset: i32) {
         if let Some(op) = direct_mem_op(offset, 4) {
-            self.body
-                .push_str(&format!("  {} {}, {}\n", op, dst, mem_operand(base, offset)));
+            self.body.push_str(&format!(
+                "  {} {}, {}\n",
+                op,
+                dst,
+                mem_operand(base, offset)
+            ));
         } else {
             self.base_addr("x17", base, offset);
             self.body.push_str(&format!("  ldr {}, [x17]\n", dst));
@@ -243,8 +255,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     fn store_base_x(&mut self, src: &str, base: &str, offset: i32) {
         if let Some(op) = direct_store_op(offset, 8) {
-            self.body
-                .push_str(&format!("  {} {}, {}\n", op, src, mem_operand(base, offset)));
+            self.body.push_str(&format!(
+                "  {} {}, {}\n",
+                op,
+                src,
+                mem_operand(base, offset)
+            ));
         } else {
             self.base_addr("x17", base, offset);
             self.body.push_str(&format!("  str {}, [x17]\n", src));
@@ -253,8 +269,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     fn store_base_w(&mut self, src: &str, base: &str, offset: i32) {
         if let Some(op) = direct_store_op(offset, 4) {
-            self.body
-                .push_str(&format!("  {} {}, {}\n", op, src, mem_operand(base, offset)));
+            self.body.push_str(&format!(
+                "  {} {}, {}\n",
+                op,
+                src,
+                mem_operand(base, offset)
+            ));
         } else {
             self.base_addr("x17", base, offset);
             self.body.push_str(&format!("  str {}, [x17]\n", src));
@@ -263,8 +283,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     fn store_base_s(&mut self, src: &str, base: &str, offset: i32) {
         if let Some(op) = direct_store_op(offset, 4) {
-            self.body
-                .push_str(&format!("  {} {}, {}\n", op, src, mem_operand(base, offset)));
+            self.body.push_str(&format!(
+                "  {} {}, {}\n",
+                op,
+                src,
+                mem_operand(base, offset)
+            ));
         } else {
             self.base_addr("x17", base, offset);
             self.body.push_str(&format!("  str {}, [x17]\n", src));
@@ -299,20 +323,5 @@ fn mem_operand(base: &str, offset: i32) -> String {
         format!("[{}]", base)
     } else {
         format!("[{}, #{}]", base, offset)
-    }
-}
-
-fn gep_elem_type(ty: &Type) -> Type {
-    match ty {
-        Type::Ptr(inner) => (**inner).clone(),
-        Type::Array { elem, .. } => (**elem).clone(),
-        _ => Type::I32,
-    }
-}
-
-fn pointee(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Ptr(inner) => Some((**inner).clone()),
-        _ => None,
     }
 }
