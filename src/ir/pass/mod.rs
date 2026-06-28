@@ -1,6 +1,8 @@
 mod const_fold;
+mod cse;
 mod dce;
 mod dominators;
+mod licm;
 mod local_forward;
 mod scalar_promote;
 mod simplify_cfg;
@@ -8,7 +10,9 @@ mod util;
 
 use super::Module;
 use const_fold::ConstFoldPass;
+use cse::CsePass;
 use dce::DcePass;
+use licm::LicmPass;
 use local_forward::LocalForwardPass;
 use scalar_promote::ScalarPromotePass;
 use simplify_cfg::SimplifyCfgPass;
@@ -30,6 +34,8 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel) {
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(LocalForwardPass::new());
+            pipeline.add(CsePass::new());
+            pipeline.add(LicmPass::new());
             pipeline.add(ConstFoldPass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());

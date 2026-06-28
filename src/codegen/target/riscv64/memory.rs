@@ -49,6 +49,11 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_value(&mut self, value: ValueId) {
+        if let Some(reg) = self.regalloc.reg(value) {
+            self.body.push_str(&format!("  mv a0, {}\n", reg));
+            return;
+        }
+
         match &self.func.value(value).kind {
             ValueKind::Const(value) => self.load_const(value),
             ValueKind::Global(name) => self.body.push_str(&format!("  la a0, {}\n", name)),
@@ -105,6 +110,11 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn store_result(&mut self, value: ValueId) {
+        if let Some(reg) = self.regalloc.reg(value) {
+            self.body.push_str(&format!("  mv {}, a0\n", reg));
+            return;
+        }
+
         let offset = self.layout.offset(value);
         match self.func.value(value).ty {
             Type::Ptr(_) => self.store_frame_x("a0", offset),
@@ -142,7 +152,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn frame_addr(&mut self, dst: &str, offset: i32) {
-        self.base_addr(dst, "s0", offset);
+        self.base_addr(dst, "s0", self.frame_slot_offset(offset));
     }
 
     fn base_addr(&mut self, dst: &str, base: &str, offset: i32) {
@@ -159,27 +169,35 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_frame_x(&mut self, dst: &str, offset: i32) {
-        self.load_base_x(dst, "s0", offset);
+        self.load_base_x(dst, "s0", self.frame_slot_offset(offset));
     }
 
     pub(super) fn load_frame_w(&mut self, dst: &str, offset: i32) {
+        self.load_base_w(dst, "s0", self.frame_slot_offset(offset));
+    }
+
+    pub(super) fn load_raw_frame_x(&mut self, dst: &str, offset: i32) {
+        self.load_base_x(dst, "s0", offset);
+    }
+
+    pub(super) fn load_raw_frame_w(&mut self, dst: &str, offset: i32) {
         self.load_base_w(dst, "s0", offset);
     }
 
-    pub(super) fn load_frame_s(&mut self, dst: &str, offset: i32) {
+    pub(super) fn load_raw_frame_s(&mut self, dst: &str, offset: i32) {
         self.load_base_s(dst, "s0", offset);
     }
 
     pub(super) fn store_frame_x(&mut self, src: &str, offset: i32) {
-        self.store_base_x(src, "s0", offset);
+        self.store_base_x(src, "s0", self.frame_slot_offset(offset));
     }
 
     pub(super) fn store_frame_w(&mut self, src: &str, offset: i32) {
-        self.store_base_w(src, "s0", offset);
+        self.store_base_w(src, "s0", self.frame_slot_offset(offset));
     }
 
     pub(super) fn store_frame_s(&mut self, src: &str, offset: i32) {
-        self.store_base_s(src, "s0", offset);
+        self.store_base_s(src, "s0", self.frame_slot_offset(offset));
     }
 
     pub(super) fn load_sp_x(&mut self, dst: &str, offset: i32) {
@@ -260,6 +278,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
     pub(super) fn object_offset(&self, value: ValueId, _ty: &Type) -> i32 {
         self.layout.offset(value) + 8
+    }
+
+    fn frame_slot_offset(&self, offset: i32) -> i32 {
+        offset - self.regalloc.saved_area_size()
     }
 }
 
