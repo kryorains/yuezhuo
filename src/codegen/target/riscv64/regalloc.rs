@@ -19,6 +19,13 @@ pub(super) struct Riscv64RegAlloc {
 
 impl Riscv64RegAlloc {
     pub(super) fn new(func: &Function) -> Self {
+        if has_phi(func) {
+            return Self {
+                regs: HashMap::new(),
+                used_regs: Vec::new(),
+            };
+        }
+
         let intervals = collect_intervals(func);
         let mut active = Vec::<ActiveInterval>::new();
         let mut free_regs = INT_REGS.to_vec();
@@ -74,6 +81,15 @@ struct LiveInterval {
 struct ActiveInterval {
     end: usize,
     reg: &'static str,
+}
+
+fn has_phi(func: &Function) -> bool {
+    func.blocks.iter().any(|block| {
+        block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::Phi { .. }))
+    })
 }
 
 fn collect_intervals(func: &Function) -> Vec<LiveInterval> {
