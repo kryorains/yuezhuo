@@ -11,6 +11,28 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             .filter(|location| matches!(location, IrArgLocation::Stack))
             .count();
 
+        let all_integer_register_args = stack_count == 0
+            && arg_sigs
+                .iter()
+                .all(|arg| arg.is_pointer || arg.ty != Type::F32);
+        if all_integer_register_args {
+            for idx in (0..args.len()).rev() {
+                let IrArgLocation::IntReg(reg_idx) = locations[idx] else {
+                    unreachable!();
+                };
+                self.load_value(args[idx]);
+                if reg_idx != 0 {
+                    if arg_sigs[idx].is_pointer {
+                        self.body.push_str(&format!("  mov x{}, x0\n", reg_idx));
+                    } else {
+                        self.body.push_str(&format!("  mov w{}, w0\n", reg_idx));
+                    }
+                }
+            }
+            self.body.push_str(&format!("  bl {}\n", name));
+            return sig.ret;
+        }
+
         for (arg, sig) in args.iter().zip(arg_sigs.iter()) {
             if sig.ty == Type::F32 && !sig.is_pointer {
                 self.load_float_value(*arg, "s0");

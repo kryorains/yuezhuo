@@ -48,8 +48,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Icmp { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
-                self.emit_icmp(*op, *lhs, *rhs);
-                self.store_result(result);
+                if self.direct_branch_icmp(result).is_none() {
+                    self.emit_icmp(*op, *lhs, *rhs);
+                    self.store_result(result);
+                }
             }
             InstKind::Fcmp { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
@@ -101,9 +103,15 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 else_target,
             } => {
                 let else_edge = self.parent.ctx.fresh_label("else_edge");
-                self.load_value(*cond);
-                self.body
-                    .push_str(&format!("  cmp w0, #0\n  beq {}\n", else_edge));
+                if let Some((op, lhs, rhs)) = self.direct_branch_icmp(*cond) {
+                    self.emit_int_compare(lhs, rhs);
+                    self.body
+                        .push_str(&format!("  b.{} {}\n", inverse_cmp_cc(op), else_edge));
+                } else {
+                    self.load_value(*cond);
+                    self.body
+                        .push_str(&format!("  cmp w0, #0\n  beq {}\n", else_edge));
+                }
                 self.emit_phi_copies(block_idx, then_target.0);
                 self.body.push_str(&format!(
                     "  b {}\n{}:\n",
@@ -237,14 +245,20 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 }
             }
             BinaryOp::Imul => {
-                if let Some(shift) = pow2_shift(self.func, rhs) {
-                    self.load_value(lhs);
-                    self.body.push_str(&format!("  lsl w0, w0, #{}\n", shift));
-                    return true;
+                if let Some(imm) = const_i32(self.func, rhs) {
+                    if self.emit_mul_imm(lhs, imm) {
+                        return true;
+                    }
                 }
-                if let Some(shift) = pow2_shift(self.func, lhs) {
-                    self.load_value(rhs);
-                    self.body.push_str(&format!("  lsl w0, w0, #{}\n", shift));
+                if let Some(imm) = const_i32(self.func, lhs) {
+                    if self.emit_mul_imm(rhs, imm) {
+                        return true;
+                    }
+                }
+            }
+            BinaryOp::Idiv | BinaryOp::Imod => {
+                if let Some(shift) = pow2_shift(self.func, rhs) {
+                    self.emit_signed_divmod_pow2(lhs, shift, op == BinaryOp::Imod);
                     return true;
                 }
             }
@@ -253,12 +267,88 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         false
     }
 
-    fn emit_icmp(&mut self, op: CmpOp, lhs: ValueId, rhs: ValueId) {
+    fn emit_mul_imm(&mut self, value: ValueId, imm: i32) -> bool {
+        if let Some(shift) = positive_pow2_shift(imm) {
+            self.load_value(value);
+            self.body.push_str(&format!("  lsl w0, w0, #{}\n", shift));
+            return true;
+        }
+
+        if let Some(shift) = imm.checked_sub(1).and_then(positive_pow2_shift) {
+            self.load_value(value);
+            self.body
+                .push_str(&format!("  add w0, w0, w0, lsl #{}\n", shift));
+            return true;
+        }
+
+        if let Some(shift) = imm.checked_add(1).and_then(positive_pow2_shift) {
+            self.load_value(value);
+            self.body
+                .push_str(&format!("  lsl w1, w0, #{}\n  sub w0, w1, w0\n", shift));
+            return true;
+        }
+
+        false
+    }
+
+    fn emit_signed_divmod_pow2(&mut self, value: ValueId, shift: u32, remainder: bool) {
+        self.load_value(value);
+        if shift == 0 {
+            if remainder {
+                self.body.push_str("  mov w0, wzr\n");
+            }
+            return;
+        }
+
+        if remainder {
+            self.body.push_str("  mov w2, w0\n");
+        }
+        let mask = (1u32 << shift) - 1;
+        self.body.push_str(&format!(
+            "  asr w1, w0, #31\n  and w1, w1, #{}\n  add w0, w0, w1\n  asr w0, w0, #{}\n",
+            mask, shift
+        ));
+        if remainder {
+            self.body
+                .push_str(&format!("  sub w0, w2, w0, lsl #{}\n", shift));
+        }
+    }
+
+    fn direct_branch_icmp(&self, value: ValueId) -> Option<(CmpOp, ValueId, ValueId)> {
+        if value_use_count(self.func, value) != 1 {
+            return None;
+        }
+        let ValueKind::Inst(block, inst_idx) = self.func.value(value).kind else {
+            return None;
+        };
+        let Terminator::Branch { cond, .. } = self.func.block(block).terminator.as_ref()? else {
+            return None;
+        };
+        if *cond != value {
+            return None;
+        }
+        match self.func.block(block).insts.get(inst_idx)?.kind {
+            InstKind::Icmp { op, lhs, rhs } => Some((op, lhs, rhs)),
+            _ => None,
+        }
+    }
+
+    fn emit_int_compare(&mut self, lhs: ValueId, rhs: ValueId) {
+        if let Some(imm) = const_i32(self.func, rhs).filter(|imm| fits_addsub_imm(*imm)) {
+            self.load_value(lhs);
+            self.body.push_str(&format!("  cmp w0, #{}\n", imm));
+            return;
+        }
+
         self.load_value(lhs);
         self.push_x0();
         self.load_value(rhs);
         self.pop_x1();
         self.body.push_str("  cmp w1, w0\n");
+    }
+
+    fn emit_icmp(&mut self, op: CmpOp, lhs: ValueId, rhs: ValueId) {
+        self.emit_int_compare(lhs, rhs);
         let cc = match op {
             CmpOp::Lt => "lt",
             CmpOp::Gt => "gt",
@@ -319,10 +409,69 @@ fn const_i32(func: &crate::ir::Function, value: ValueId) -> Option<i32> {
 }
 
 fn pow2_shift(func: &crate::ir::Function, value: ValueId) -> Option<u32> {
-    let imm = const_i32(func, value)?;
-    (imm > 0 && (imm & (imm - 1)) == 0).then_some(imm.trailing_zeros())
+    positive_pow2_shift(const_i32(func, value)?)
+}
+
+fn positive_pow2_shift(value: i32) -> Option<u32> {
+    (value > 0 && (value & (value - 1)) == 0).then_some(value.trailing_zeros())
 }
 
 fn fits_addsub_imm(value: i32) -> bool {
     (0..=4095).contains(&value)
+}
+
+fn inverse_cmp_cc(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Lt => "ge",
+        CmpOp::Gt => "le",
+        CmpOp::Le => "gt",
+        CmpOp::Ge => "lt",
+        CmpOp::Eq => "ne",
+        CmpOp::Ne => "eq",
+    }
+}
+
+fn value_use_count(func: &crate::ir::Function, value: ValueId) -> usize {
+    let mut count = 0;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            count += inst_use_count(&inst.kind, value);
+        }
+        if let Some(terminator) = &block.terminator {
+            count += terminator_use_count(terminator, value);
+        }
+    }
+    count
+}
+
+fn inst_use_count(kind: &InstKind, value: ValueId) -> usize {
+    match kind {
+        InstKind::Nop | InstKind::Alloca { .. } => 0,
+        InstKind::Phi { incomings } => incomings
+            .iter()
+            .filter(|(_, incoming)| *incoming == value)
+            .count(),
+        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => (*ptr == value) as usize,
+        InstKind::Store { ptr, value: stored } => {
+            (*ptr == value) as usize + (*stored == value) as usize
+        }
+        InstKind::Unary { value: operand, .. } | InstKind::Cast { value: operand, .. } => {
+            (*operand == value) as usize
+        }
+        InstKind::Binary { lhs, rhs, .. }
+        | InstKind::Icmp { lhs, rhs, .. }
+        | InstKind::Fcmp { lhs, rhs, .. } => (*lhs == value) as usize + (*rhs == value) as usize,
+        InstKind::Gep { base, indices } => {
+            (*base == value) as usize + indices.iter().filter(|index| **index == value).count()
+        }
+        InstKind::Call { args, .. } => args.iter().filter(|arg| **arg == value).count(),
+    }
+}
+
+fn terminator_use_count(terminator: &Terminator, value: ValueId) -> usize {
+    match terminator {
+        Terminator::Return(Some(returned)) => (*returned == value) as usize,
+        Terminator::Branch { cond, .. } => (*cond == value) as usize,
+        Terminator::Return(None) | Terminator::Jump(_) => 0,
+    }
 }

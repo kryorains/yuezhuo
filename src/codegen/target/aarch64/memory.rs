@@ -51,6 +51,14 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_value(&mut self, value: ValueId) {
+        if let Some(reg) = self.phi_regs.reg(value) {
+            match self.func.value(value).ty {
+                Type::Ptr(_) => self.body.push_str(&format!("  mov x0, {}\n", reg)),
+                _ => self.body.push_str(&format!("  mov w0, {}\n", w_reg(reg))),
+            }
+            return;
+        }
+
         match &self.func.value(value).kind {
             ValueKind::Const(value) => self.load_const(value),
             ValueKind::Global(name) => self.body.push_str(&format!(
@@ -112,6 +120,14 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn store_result(&mut self, value: ValueId) {
+        if let Some(reg) = self.phi_regs.reg(value) {
+            match self.func.value(value).ty {
+                Type::Ptr(_) => self.body.push_str(&format!("  mov {}, x0\n", reg)),
+                _ => self.body.push_str(&format!("  mov {}, w0\n", w_reg(reg))),
+            }
+            return;
+        }
+
         let offset = self.layout.offset(value);
         match self.func.value(value).ty {
             Type::Ptr(_) => self.store_frame_x("x0", offset),
@@ -302,6 +318,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     pub(super) fn object_offset(&self, value: ValueId, _ty: &Type) -> i32 {
         self.layout.offset(value) + 8
     }
+}
+
+fn w_reg(x_reg: &str) -> String {
+    x_reg.replacen('x', "w", 1)
 }
 
 fn direct_mem_op(offset: i32, size: i32) -> Option<&'static str> {
