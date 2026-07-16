@@ -1,6 +1,7 @@
 use super::AArch64IrFuncEmitter;
 use crate::ir::{
-    BinaryOp, BlockId, CastOp, CmpOp, Inst, InstKind, Terminator, Type, UnaryOp, ValueId,
+    BinaryOp, BlockId, CastOp, CmpOp, Const, Inst, InstKind, Terminator, Type, UnaryOp, ValueId,
+    ValueKind,
 };
 
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
@@ -159,6 +160,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_binary(&mut self, op: BinaryOp, lhs: ValueId, rhs: ValueId) {
+        if self.emit_binary_imm(op, lhs, rhs) {
+            return;
+        }
+
         match op {
             BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => {
                 self.load_float_value(lhs, "s0");
@@ -208,6 +213,44 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 }
             }
         }
+    }
+
+    fn emit_binary_imm(&mut self, op: BinaryOp, lhs: ValueId, rhs: ValueId) -> bool {
+        match op {
+            BinaryOp::Iadd => {
+                if let Some(imm) = const_i32(self.func, rhs).filter(|imm| fits_addsub_imm(*imm)) {
+                    self.load_value(lhs);
+                    self.body.push_str(&format!("  add w0, w0, #{}\n", imm));
+                    return true;
+                }
+                if let Some(imm) = const_i32(self.func, lhs).filter(|imm| fits_addsub_imm(*imm)) {
+                    self.load_value(rhs);
+                    self.body.push_str(&format!("  add w0, w0, #{}\n", imm));
+                    return true;
+                }
+            }
+            BinaryOp::Isub => {
+                if let Some(imm) = const_i32(self.func, rhs).filter(|imm| fits_addsub_imm(*imm)) {
+                    self.load_value(lhs);
+                    self.body.push_str(&format!("  sub w0, w0, #{}\n", imm));
+                    return true;
+                }
+            }
+            BinaryOp::Imul => {
+                if let Some(shift) = pow2_shift(self.func, rhs) {
+                    self.load_value(lhs);
+                    self.body.push_str(&format!("  lsl w0, w0, #{}\n", shift));
+                    return true;
+                }
+                if let Some(shift) = pow2_shift(self.func, lhs) {
+                    self.load_value(rhs);
+                    self.body.push_str(&format!("  lsl w0, w0, #{}\n", shift));
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     fn emit_icmp(&mut self, op: CmpOp, lhs: ValueId, rhs: ValueId) {
@@ -265,4 +308,21 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
         }
     }
+}
+
+fn const_i32(func: &crate::ir::Function, value: ValueId) -> Option<i32> {
+    match &func.value(value).kind {
+        ValueKind::Const(Const::Int(value)) => Some(*value),
+        ValueKind::Const(Const::Bool(value)) => Some(*value as i32),
+        _ => None,
+    }
+}
+
+fn pow2_shift(func: &crate::ir::Function, value: ValueId) -> Option<u32> {
+    let imm = const_i32(func, value)?;
+    (imm > 0 && (imm & (imm - 1)) == 0).then_some(imm.trailing_zeros())
+}
+
+fn fits_addsub_imm(value: i32) -> bool {
+    (0..=4095).contains(&value)
 }

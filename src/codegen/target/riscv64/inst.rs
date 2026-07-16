@@ -1,6 +1,7 @@
 use super::Riscv64IrFuncEmitter;
 use crate::ir::{
-    BinaryOp, BlockId, CastOp, CmpOp, Inst, InstKind, Terminator, Type, UnaryOp, ValueId,
+    BinaryOp, BlockId, CastOp, CmpOp, Const, Inst, InstKind, Terminator, Type, UnaryOp, ValueId,
+    ValueKind,
 };
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
@@ -158,6 +159,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_binary(&mut self, op: BinaryOp, lhs: ValueId, rhs: ValueId) {
+        if self.emit_binary_imm(op, lhs, rhs) {
+            return;
+        }
+
         match op {
             BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => {
                 self.load_float_value(lhs, "fa0");
@@ -201,6 +206,47 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 }
             }
         }
+    }
+
+    fn emit_binary_imm(&mut self, op: BinaryOp, lhs: ValueId, rhs: ValueId) -> bool {
+        match op {
+            BinaryOp::Iadd => {
+                if let Some(imm) = const_i32(self.func, rhs).filter(|imm| fits_i12(*imm)) {
+                    self.load_value(lhs);
+                    self.body.push_str(&format!("  addiw a0, a0, {}\n", imm));
+                    return true;
+                }
+                if let Some(imm) = const_i32(self.func, lhs).filter(|imm| fits_i12(*imm)) {
+                    self.load_value(rhs);
+                    self.body.push_str(&format!("  addiw a0, a0, {}\n", imm));
+                    return true;
+                }
+            }
+            BinaryOp::Isub => {
+                if let Some(imm) = const_i32(self.func, rhs)
+                    .and_then(|imm| imm.checked_neg())
+                    .filter(|imm| fits_i12(*imm))
+                {
+                    self.load_value(lhs);
+                    self.body.push_str(&format!("  addiw a0, a0, {}\n", imm));
+                    return true;
+                }
+            }
+            BinaryOp::Imul => {
+                if let Some(shift) = pow2_shift(self.func, rhs) {
+                    self.load_value(lhs);
+                    self.body.push_str(&format!("  slliw a0, a0, {}\n", shift));
+                    return true;
+                }
+                if let Some(shift) = pow2_shift(self.func, lhs) {
+                    self.load_value(rhs);
+                    self.body.push_str(&format!("  slliw a0, a0, {}\n", shift));
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     fn emit_icmp(&mut self, op: CmpOp, lhs: ValueId, rhs: ValueId) {
@@ -257,4 +303,21 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             }
         }
     }
+}
+
+fn const_i32(func: &crate::ir::Function, value: ValueId) -> Option<i32> {
+    match &func.value(value).kind {
+        ValueKind::Const(Const::Int(value)) => Some(*value),
+        ValueKind::Const(Const::Bool(value)) => Some(*value as i32),
+        _ => None,
+    }
+}
+
+fn pow2_shift(func: &crate::ir::Function, value: ValueId) -> Option<u32> {
+    let imm = const_i32(func, value)?;
+    (imm > 0 && (imm & (imm - 1)) == 0).then_some(imm.trailing_zeros())
+}
+
+fn fits_i12(value: i32) -> bool {
+    (-2048..=2047).contains(&value)
 }
