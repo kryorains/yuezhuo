@@ -1,0 +1,69 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Cross-architecture (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: riscv64
+            toolchain: gcc-riscv64-linux-gnu
+            test-directory: perf-riscv64
+          - target: aarch64
+            toolchain: gcc-aarch64-linux-gnu
+            test-directory: perf-aarch64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-user "${{ matrix.toolchain }}"
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Build compiler
+        run: cargo build --locked
+
+      - name: Run regression tests
+        env:
+          TARGET: ${{ matrix.target }}
+          WORK_DIR: ${{ github.workspace }}/target/test-work/functional-tests
+        run: tools/run_functional_tests.sh
+
+      - name: Check out test set
+        uses: actions/checkout@v4
+        with:
+          ref: pref/test-set
+          path: .test-set
+          lfs: true
+
+      - name: Run performance tests
+        env:
+          TARGET: ${{ matrix.target }}
+          FAIL_ON_CASE_ERROR: 0
+        run: >-
+          tools/run_perf_tests.sh
+          "$GITHUB_WORKSPACE/.test-set/examples/${{ matrix.test-directory }}"

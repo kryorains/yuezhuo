@@ -17,6 +17,7 @@ BASELINE_OPT=${BASELINE_OPT:-"-O2"}
 BASELINE_CFLAGS=${BASELINE_CFLAGS:-"-x c -std=gnu99 -Wno-implicit-function-declaration"}
 BASELINE_NORMALIZE=${BASELINE_NORMALIZE:-1}
 LINK_CFLAGS=${LINK_CFLAGS:-"-O2"}
+FAIL_ON_CASE_ERROR=${FAIL_ON_CASE_ERROR:-1}
 
 case "$TARGET" in
   x86_64|x86-64|amd64)
@@ -49,20 +50,15 @@ fi
 
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
-report="$WORK_DIR/report.tsv"
-printf 'test\topt\tstatus\tcompile_ms\tlink_ms\trun_ms\tasm_lines\tinput_bytes\tbaseline_ms\tscore\n' >"$report"
-{
-  printf 'target=%s\n' "$TARGET"
-  printf 'cc=%s\n' "$CC"
-  "$CC" --version | head -1
-  printf 'baseline=%s\n' "$BASELINE"
-  printf 'baseline_opt=%s\n' "$BASELINE_OPT"
-  printf 'baseline_normalize=%s\n' "$BASELINE_NORMALIZE"
-  printf 'link_cflags=%s\n' "$LINK_CFLAGS"
-  printf 'test_limit=%s\n' "$TEST_LIMIT"
-  printf 'run_timeout=%s\n' "$RUN_TIMEOUT"
-  printf 'max_input_bytes=%s\n' "$MAX_INPUT_BYTES"
-} >"$WORK_DIR/config.txt"
+printf 'TARGET=%s\n' "$TARGET"
+printf 'CC=%s\n' "$CC"
+"$CC" --version | head -1
+printf 'BASELINE=%s\n' "$BASELINE"
+printf 'OPT_LEVELS=%s\n' "$OPT_LEVELS"
+printf 'TEST_LIMIT=%s\n' "$TEST_LIMIT"
+printf 'RUN_TIMEOUT=%s\n' "$RUN_TIMEOUT"
+printf 'MAX_INPUT_BYTES=%s\n' "$MAX_INPUT_BYTES"
+printf 'FAIL_ON_CASE_ERROR=%s\n' "$FAIL_ON_CASE_ERROR"
 
 total=0
 passed=0
@@ -78,6 +74,24 @@ elapsed_ms() {
   local start=$1
   local end=$2
   printf '%s' "$((end - start))"
+}
+
+print_result() {
+  local status=$1
+  local opt=$2
+  local test=$3
+  local compile_ms=$4
+  local link_ms=$5
+  local run_ms=$6
+  local asm_lines=$7
+  local input_bytes=$8
+  local baseline_ms=$9
+  local score=${10}
+  local total_ms=$((compile_ms + link_ms + run_ms))
+
+  printf '%-18s %-3s %10d %10d %10d %10d %9d %11d %11s %7s  %s\n' \
+    "$status" "$opt" "$compile_ms" "$link_ms" "$run_ms" "$total_ms" \
+    "$asm_lines" "$input_bytes" "$baseline_ms" "$score" "$test"
 }
 
 input_size() {
@@ -144,6 +158,10 @@ normalize_sysy_for_gcc() {
   local dst=$2
   perl -pe 's{^(\s*)const\s+int\s+([A-Za-z_]\w*)\s*=\s*([-+]?(?:0[xX][0-9A-Fa-f]+|\d+))\s*;\s*(//.*)?$}{$1 . "enum { $2 = $3 };" . (defined($4) ? " $4" : "")}e' "$src" >"$dst"
 }
+
+printf '\n%-18s %-3s %10s %10s %10s %10s %9s %11s %11s %7s  %s\n' \
+  STATUS OPT COMPILE_MS LINK_MS RUN_MS TOTAL_MS ASM_LINES INPUT_BYTES BASELINE_MS SCORE TEST
+suite_start_ms=$(now_ms)
 
 while IFS= read -r sy; do
   out=${sy%.sy}.out
@@ -221,9 +239,8 @@ while IFS= read -r sy; do
 
     start=$(now_ms)
     if ! "$COMPILER" "$sy" -S -o "$asm" --target "$TARGET" "${compiler_flags[@]}" >"$log" 2>&1; then
-      end=$(now_ms)
-      printf '%s\t%s\tCOMPILE_FAIL\t%s\t0\t0\t0\t%s\t%s\tNA\n' "$rel" "$opt" "$(elapsed_ms "$start" "$end")" "$bytes" "$baseline_ms" >>"$report"
-      printf 'COMPILE_FAIL %s %s\n' "$opt" "$rel"
+      compile_ms=$(elapsed_ms "$start" "$(now_ms)")
+      print_result COMPILE_FAIL "$opt" "$rel" "$compile_ms" 0 0 0 "$bytes" "$baseline_ms" NA
       failed=$((failed + 1))
       continue
     fi
@@ -232,9 +249,9 @@ while IFS= read -r sy; do
 
     start=$(now_ms)
     if ! "$CC" "${link_cflag_args[@]}" "$asm" "$RUNTIME" -o "$exe" -lm >>"$log" 2>&1; then
-      end=$(now_ms)
-      printf '%s\t%s\tLINK_FAIL\t%s\t%s\t0\t%s\t%s\t%s\tNA\n' "$rel" "$opt" "$compile_ms" "$(elapsed_ms "$start" "$end")" "$asm_lines" "$bytes" "$baseline_ms" >>"$report"
-      printf 'LINK_FAIL    %s %s\n' "$opt" "$rel"
+      link_ms=$(elapsed_ms "$start" "$(now_ms)")
+      print_result LINK_FAIL "$opt" "$rel" "$compile_ms" "$link_ms" 0 \
+        "$asm_lines" "$bytes" "$baseline_ms" NA
       failed=$((failed + 1))
       continue
     fi
@@ -246,36 +263,36 @@ while IFS= read -r sy; do
     run_ms=$(elapsed_ms "$start" "$(now_ms)")
 
     if (( run_status == 124 )); then
-      printf '%s\t%s\tTIMEOUT\t%s\t%s\t%s\t%s\t%s\t%s\tNA\n' "$rel" "$opt" "$compile_ms" "$link_ms" "$run_ms" "$asm_lines" "$bytes" "$baseline_ms" >>"$report"
-      printf 'TIMEOUT      %s %s\n' "$opt" "$rel"
+      print_result TIMEOUT "$opt" "$rel" "$compile_ms" "$link_ms" "$run_ms" \
+        "$asm_lines" "$bytes" "$baseline_ms" NA
       failed=$((failed + 1))
       continue
     fi
 
     score=$(score_ratio "$baseline_ms" "$run_ms")
     if append_status_and_compare "$actual" "$expected" "$out" "$run_status" "$WORK_DIR/$stem.$opt.diff"; then
-      printf '%s\t%s\tPASS\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$opt" "$compile_ms" "$link_ms" "$run_ms" "$asm_lines" "$bytes" "$baseline_ms" "$score" >>"$report"
+      status=PASS
       passed=$((passed + 1))
     else
       status=DIFF_FAIL
       if [[ "$BASELINE" == "1" && "$baseline_ok" == "0" ]]; then
         status=EXPECTED_MISMATCH
       fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$opt" "$status" "$compile_ms" "$link_ms" "$run_ms" "$asm_lines" "$bytes" "$baseline_ms" "$score" >>"$report"
-      printf '%-17s %s %s\n' "$status" "$opt" "$rel"
       if [[ "$status" == "EXPECTED_MISMATCH" ]]; then
         skipped=$((skipped + 1))
       else
         failed=$((failed + 1))
       fi
     fi
+    print_result "$status" "$opt" "$rel" "$compile_ms" "$link_ms" "$run_ms" \
+      "$asm_lines" "$bytes" "$baseline_ms" "$score"
   done
 done < <(find "$TEST_ROOT" -name '*.sy' | sort)
 
-printf '\nFILES=%s TOTAL=%s PASS=%s FAIL=%s SKIPPED_BY_SIZE=%s\n' "$processed" "$total" "$passed" "$failed" "$skipped"
-printf 'REPORT=%s\n' "$report"
-printf 'ARTIFACTS=%s\n' "$WORK_DIR"
+suite_ms=$(elapsed_ms "$suite_start_ms" "$(now_ms)")
+printf '\nFILES=%s CASES=%s PASS=%s NON_PASS=%s SKIPPED=%s TOTAL_MS=%s\n' \
+  "$processed" "$total" "$passed" "$failed" "$skipped" "$suite_ms"
 
-if (( failed != 0 )); then
+if (( failed != 0 )) && [[ "$FAIL_ON_CASE_ERROR" == "1" ]]; then
   exit 1
 fi
