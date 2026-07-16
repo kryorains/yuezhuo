@@ -1,5 +1,5 @@
-use super::LowerError;
 use super::const_eval::const_expr_usize;
+use super::LowerError;
 use crate::ast::{self, Expr};
 use crate::ir::{Const, Type};
 use std::collections::HashMap;

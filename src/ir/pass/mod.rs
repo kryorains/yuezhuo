@@ -6,6 +6,7 @@ mod licm;
 mod local_forward;
 mod scalar_promote;
 mod simplify_cfg;
+mod tail_recursion;
 mod util;
 
 use super::Module;
@@ -16,6 +17,7 @@ use licm::LicmPass;
 use local_forward::LocalForwardPass;
 use scalar_promote::ScalarPromotePass;
 use simplify_cfg::SimplifyCfgPass;
+use tail_recursion::TailRecursionPass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptLevel {
@@ -32,6 +34,7 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel) {
             // 先折叠常量和死分支，再做标量提升/局部转发，最后再清一次新产生的机会。
             pipeline.add(ConstFoldPass::new());
             pipeline.add(SimplifyCfgPass::new());
+            pipeline.add(TailRecursionPass::new());
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(LocalForwardPass::new());
             pipeline.add(CsePass::new());

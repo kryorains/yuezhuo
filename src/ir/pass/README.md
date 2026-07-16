@@ -10,11 +10,14 @@
 - `OptLevel::O1`：按下面顺序执行：
   1. `ConstFoldPass`
   2. `SimplifyCfgPass`
-  3. `ScalarPromotePass`
-  4. `LocalForwardPass`
-  5. `ConstFoldPass`
-  6. `SimplifyCfgPass`
-  7. `DcePass`
+  3. `TailRecursionPass`
+  4. `ScalarPromotePass`
+  5. `LocalForwardPass`
+  6. `CsePass`
+  7. `LicmPass`
+  8. `ConstFoldPass`
+  9. `SimplifyCfgPass`
+  10. `DcePass`
 
 这里会重复跑常量折叠和 CFG 简化，因为前面的 pass 可能制造新的常量、死分支或无用指令，后面的 pass 再把这些机会吃掉。
 
@@ -46,6 +49,24 @@
 - 如果 `branch` 的 then/else 目标相同，改成无条件 `jump`。
 - 如果 `branch` 条件是常量，直接选定唯一可达的目标块。
 - 当删掉某条 CFG 边时，同步删除目标块里 `phi` 对应的 incoming。
+
+### `TailRecursionPass` (`tail_recursion.rs`)
+
+尾递归消除。
+
+它只处理保守的自递归尾调用：
+
+- 非 `void` 函数中形如 `return self(args...)` 的 IR 形态；
+- `void` 函数中尾部的 `self(args...); return;` 形态；
+- 调用结果除了对应 `return` 之外没有其它使用；
+- 尾调用参数不能包含由当前栈帧局部 `alloca` 派生的指针，否则保留递归调用，避免循环复用局部数组时改变语义。
+
+变换时会把函数入口拆成一次性执行的初始化块和可回跳的函数体入口块，然后把尾自调用改写为：
+
+1. 按原调用求值顺序得到的参数值依次存回形参槽位；
+2. 跳回函数体入口。
+
+后续 `ScalarPromotePass` 会把这些形参槽位提升成 loop phi，使最终 IR 更接近普通循环。
 
 ### `ScalarPromotePass` (`scalar_promote.rs`)
 

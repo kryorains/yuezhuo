@@ -1,4 +1,4 @@
-use super::verify::{VerifyError, verify_function};
+use super::verify::{verify_function, VerifyError};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

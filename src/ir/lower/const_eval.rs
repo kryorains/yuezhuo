@@ -1,5 +1,5 @@
-use super::LowerError;
 use super::types::array_elem_type;
+use super::LowerError;
 use crate::ast::{BinaryOp as AstBinaryOp, Expr, Init, UnaryOp as AstUnaryOp};
 use crate::ir::{Const, Type};
 use std::collections::HashMap;

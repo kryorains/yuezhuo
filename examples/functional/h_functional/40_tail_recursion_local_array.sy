@@ -1,0 +1,15 @@
+int tail_with_local_array(int n, int values[]) {
+  int local[1];
+  local[0] = n;
+  if (n == 0) {
+    return values[0];
+  }
+  return tail_with_local_array(n - 1, local);
+}
+
+int main() {
+  int initial[1] = {99};
+  putint(tail_with_local_array(2, initial));
+  putch(10);
+  return 0;
+}
