@@ -47,10 +47,18 @@ jobs:
       - name: Build compiler
         run: cargo build --locked
 
-      - name: Run regression tests
+      - name: Run O0 regression tests
         env:
           TARGET: ${{ matrix.target }}
-          WORK_DIR: ${{ github.workspace }}/target/test-work/functional-tests
+          COMPILER_FLAGS: -O0
+          WORK_DIR: ${{ github.workspace }}/target/test-work/functional-tests-O0
+        run: tools/run_functional_tests.sh
+
+      - name: Run O1 regression tests
+        env:
+          TARGET: ${{ matrix.target }}
+          COMPILER_FLAGS: -O1
+          WORK_DIR: ${{ github.workspace }}/target/test-work/functional-tests-O1
         run: tools/run_functional_tests.sh
 
       - name: Check out test set
