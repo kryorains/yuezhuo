@@ -1485,6 +1485,245 @@ mod tests {
         result as i32
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InterpretedValue {
+        I1(bool),
+        I32(i32),
+    }
+
+    impl InterpretedValue {
+        fn i1(self) -> bool {
+            let Self::I1(value) = self else {
+                panic!("expected i1, got {self:?}");
+            };
+            value
+        }
+
+        fn i32(self) -> i32 {
+            let Self::I32(value) = self else {
+                panic!("expected i32, got {self:?}");
+            };
+            value
+        }
+    }
+
+    struct Execution {
+        result: i32,
+        visited_fast_block: bool,
+    }
+
+    fn interpret_i32(func: &Function, args: &[i32]) -> Execution {
+        const MAX_CFG_STEPS: usize = 4096;
+
+        assert_eq!(func.ret, Type::I32);
+        assert_eq!(func.params.len(), args.len());
+        let mut values = vec![None; func.values.len()];
+        for (index, value) in func.values.iter().enumerate() {
+            values[index] = match &value.kind {
+                ValueKind::Const(Const::Int(value)) => Some(InterpretedValue::I32(*value)),
+                ValueKind::Const(Const::Bool(value)) => Some(InterpretedValue::I1(*value)),
+                ValueKind::Const(Const::Zero(Type::I32)) => Some(InterpretedValue::I32(0)),
+                ValueKind::Const(Const::Zero(Type::I1)) => Some(InterpretedValue::I1(false)),
+                _ => None,
+            };
+        }
+        for (&param, &arg) in func.params.iter().zip(args) {
+            values[param.0] = Some(InterpretedValue::I32(arg));
+        }
+
+        let get = |values: &[Option<InterpretedValue>], value: ValueId| {
+            values[value.0].unwrap_or_else(|| panic!("value {value} is not available"))
+        };
+        let mut predecessor = None;
+        let mut current = func.entry;
+        let mut visited_fast_block = false;
+
+        for _ in 0..MAX_CFG_STEPS {
+            let block = &func.blocks[current.0];
+            visited_fast_block |= block.name.starts_with("loop.idiom.fast.");
+
+            // Resolve every phi from the predecessor's value state before
+            // publishing any result. This also handles loop-carried phi swaps.
+            let phi_values = block
+                .insts
+                .iter()
+                .filter_map(|inst| {
+                    let InstKind::Phi { incomings } = &inst.kind else {
+                        return None;
+                    };
+                    let predecessor = predecessor.expect("entry block cannot contain a phi");
+                    let incoming = incomings
+                        .iter()
+                        .find(|(block, _)| *block == predecessor)
+                        .unwrap_or_else(|| panic!("phi has no incoming from {predecessor}"));
+                    Some((
+                        inst.result.expect("phi must have a result"),
+                        get(&values, incoming.1),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for (result, value) in phi_values {
+                values[result.0] = Some(value);
+            }
+
+            for inst in &block.insts {
+                if matches!(inst.kind, InstKind::Nop | InstKind::Phi { .. }) {
+                    continue;
+                }
+                let result = inst
+                    .result
+                    .expect("interpreted instruction must return a value");
+                let value = match inst.kind {
+                    InstKind::Unary { op, value } => match op {
+                        UnaryOp::Ineg => {
+                            InterpretedValue::I32(get(&values, value).i32().wrapping_neg())
+                        }
+                        UnaryOp::Not => InterpretedValue::I1(!get(&values, value).i1()),
+                        UnaryOp::Fneg => panic!("float instruction is outside this interpreter"),
+                    },
+                    InstKind::Binary { op, lhs, rhs } => {
+                        let lhs = get(&values, lhs);
+                        let rhs = get(&values, rhs);
+                        match op {
+                            BinaryOp::Iadd => {
+                                InterpretedValue::I32(lhs.i32().wrapping_add(rhs.i32()))
+                            }
+                            BinaryOp::Isub => {
+                                InterpretedValue::I32(lhs.i32().wrapping_sub(rhs.i32()))
+                            }
+                            BinaryOp::Imul => {
+                                InterpretedValue::I32(lhs.i32().wrapping_mul(rhs.i32()))
+                            }
+                            BinaryOp::Idiv => {
+                                InterpretedValue::I32(lhs.i32().wrapping_div(rhs.i32()))
+                            }
+                            BinaryOp::Imod => {
+                                InterpretedValue::I32(lhs.i32().wrapping_rem(rhs.i32()))
+                            }
+                            BinaryOp::Iand => InterpretedValue::I32(lhs.i32() & rhs.i32()),
+                            BinaryOp::Ior => InterpretedValue::I32(lhs.i32() | rhs.i32()),
+                            BinaryOp::Ixor => InterpretedValue::I32(lhs.i32() ^ rhs.i32()),
+                            BinaryOp::Ishl => InterpretedValue::I32(
+                                lhs.i32().wrapping_shl((rhs.i32() as u32) & 31),
+                            ),
+                            BinaryOp::Iashr => InterpretedValue::I32(
+                                lhs.i32().wrapping_shr((rhs.i32() as u32) & 31),
+                            ),
+                            BinaryOp::And => InterpretedValue::I1(lhs.i1() && rhs.i1()),
+                            BinaryOp::Or => InterpretedValue::I1(lhs.i1() || rhs.i1()),
+                            BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => {
+                                panic!("float instruction is outside this interpreter")
+                            }
+                        }
+                    }
+                    InstKind::Icmp { op, lhs, rhs } => {
+                        let lhs = get(&values, lhs).i32();
+                        let rhs = get(&values, rhs).i32();
+                        InterpretedValue::I1(match op {
+                            CmpOp::Eq => lhs == rhs,
+                            CmpOp::Ne => lhs != rhs,
+                            CmpOp::Lt => lhs < rhs,
+                            CmpOp::Le => lhs <= rhs,
+                            CmpOp::Gt => lhs > rhs,
+                            CmpOp::Ge => lhs >= rhs,
+                        })
+                    }
+                    InstKind::Cast { op, value } => match op {
+                        CastOp::BoolToI32 => InterpretedValue::I32(get(&values, value).i1() as i32),
+                        CastOp::I32ToBool => InterpretedValue::I1(get(&values, value).i32() != 0),
+                        _ => panic!("float cast is outside this interpreter"),
+                    },
+                    ref kind => {
+                        panic!("unsupported instruction in integer CFG interpreter: {kind:?}")
+                    }
+                };
+                values[result.0] = Some(value);
+            }
+
+            predecessor = Some(current);
+            match block.terminator.as_ref().expect("block must terminate") {
+                Terminator::Return(Some(value)) => {
+                    return Execution {
+                        result: get(&values, *value).i32(),
+                        visited_fast_block,
+                    };
+                }
+                Terminator::Return(None) => panic!("i32 function returned no value"),
+                Terminator::Jump(target) => current = *target,
+                Terminator::Branch {
+                    cond,
+                    then_target,
+                    else_target,
+                } => {
+                    current = if get(&values, *cond).i1() {
+                        *then_target
+                    } else {
+                        *else_target
+                    };
+                }
+            }
+        }
+        panic!("integer CFG interpreter exceeded {MAX_CFG_STEPS} steps");
+    }
+
+    #[test]
+    fn o0_and_o1_execute_equivalently_across_fast_and_fallback_paths() {
+        let source = r#"
+            int target(int offset, int first, int second, int delta, int factor, int tail) {
+                int before = offset + delta;
+                int left = first + offset;
+                int right = second - delta;
+                int output = 0;
+                int count = 17;
+                int weight = 1;
+                int left_bit;
+                int right_bit;
+                while (count > 0) {
+                    left_bit = left - (left / 2) * 2;
+                    right_bit = right - (right / 2) * 2;
+                    left = left / 2;
+                    right = right / 2;
+                    if (left_bit == 1 && right_bit == 1) output = output + weight;
+                    count = count - 1;
+                    weight = weight + weight;
+                }
+                int after = output + before;
+                return after * factor + tail;
+            }
+        "#;
+        let o0 = optimize(source, OptLevel::O0);
+        let o1 = optimize(source, OptLevel::O1);
+        let o0_target = function(&o0, "target");
+        let o1_target = function(&o1, "target");
+        assert!(o0_target.verify().is_ok());
+        assert!(o1_target.verify().is_ok());
+        assert_eq!(fast_block_count(o0_target), 0);
+        assert_eq!(fast_block_count(o1_target), 1);
+
+        let cases = [
+            ([3, 0x1_2345, 0x1_ffff, 4, 3, 11], true, "positive"),
+            ([0, -1, 0x1_2345, 0, 7, -9], false, "left negative"),
+            ([0, 0x1_2345, -1, 0, -5, i32::MAX], false, "right negative"),
+            ([0, -17, -31, 0, i32::MAX, i32::MIN], false, "both negative"),
+            ([0, i32::MAX, i32::MAX, 0, 2, i32::MIN], true, "maximums"),
+            ([0, i32::MIN, i32::MIN, 0, -1, i32::MAX], false, "minimums"),
+            (
+                [1, i32::MAX, 42, 0, i32::MIN, -1],
+                false,
+                "computed overflow",
+            ),
+        ];
+        for (args, expect_fast, description) in cases {
+            let baseline = interpret_i32(o0_target, &args);
+            let optimized = interpret_i32(o1_target, &args);
+            assert_eq!(baseline.result, optimized.result, "{description}: {args:?}");
+            assert_eq!(
+                optimized.visited_fast_block, expect_fast,
+                "{description}: {args:?}"
+            );
+        }
+    }
+
     #[test]
     fn is_o1_only_idempotent_and_verifier_clean() {
         let source = default_source(false);
