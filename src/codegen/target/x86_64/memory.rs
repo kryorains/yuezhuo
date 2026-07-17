@@ -124,6 +124,10 @@ impl<'a, 'b> X86IrFuncEmitter<'a, 'b> {
         self.body.push_str("  popq %rcx\n");
     }
 
+    pub(super) fn pop_rax(&mut self) {
+        self.body.push_str("  popq %rax\n");
+    }
+
     pub(super) fn block_label(&self, block_idx: usize) -> String {
         format!(".L_{}_bb{}", self.func.name, block_idx)
     }

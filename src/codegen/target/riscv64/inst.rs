@@ -307,6 +307,25 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 self.body
                     .push_str(&format!("  {} {}, a1, a0\n", instruction, destination));
             }
+            BinaryOp::Iand => self.body.push_str(&format!(
+                "  and {}, {}, {}\n",
+                destination, lhs_reg, rhs_reg
+            )),
+            BinaryOp::Ior => self
+                .body
+                .push_str(&format!("  or {}, {}, {}\n", destination, lhs_reg, rhs_reg)),
+            BinaryOp::Ixor => self.body.push_str(&format!(
+                "  xor {}, {}, {}\n",
+                destination, lhs_reg, rhs_reg
+            )),
+            BinaryOp::Ishl => self.body.push_str(&format!(
+                "  sllw {}, {}, {}\n",
+                destination, lhs_reg, rhs_reg
+            )),
+            BinaryOp::Iashr => self.body.push_str(&format!(
+                "  sraw {}, {}, {}\n",
+                destination, lhs_reg, rhs_reg
+            )),
             BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => return false,
         }
         true
@@ -359,6 +378,11 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     BinaryOp::Imul => self.body.push_str("  mulw a0, a1, a0\n"),
                     BinaryOp::Idiv => self.body.push_str("  divw a0, a1, a0\n"),
                     BinaryOp::Imod => self.body.push_str("  remw a0, a1, a0\n"),
+                    BinaryOp::Iand => self.body.push_str("  and a0, a1, a0\n"),
+                    BinaryOp::Ior => self.body.push_str("  or a0, a1, a0\n"),
+                    BinaryOp::Ixor => self.body.push_str("  xor a0, a1, a0\n"),
+                    BinaryOp::Ishl => self.body.push_str("  sllw a0, a1, a0\n"),
+                    BinaryOp::Iashr => self.body.push_str("  sraw a0, a1, a0\n"),
                     _ => unreachable!(),
                 }
             }

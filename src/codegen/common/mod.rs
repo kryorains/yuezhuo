@@ -1,23 +1,19 @@
 mod abi;
-mod bitwise;
 mod call;
 mod data;
 mod layout;
 mod local_regs;
 mod loop_depths;
-mod shift;
 mod sig;
 mod types;
 mod value_uses;
 
 pub(crate) use abi::{assign_arg_locations, IrArgLocation};
-pub(crate) use bitwise::{emulated_bitwise_op, EmulatedBitwiseOp};
 pub(crate) use call::resolve_call_sig;
 pub(crate) use data::emit_ir_data_section;
 pub(crate) use layout::{ir_align_to, ir_size, IrFuncLayout};
 pub(crate) use local_regs::IrLocalRegs;
 pub(crate) use loop_depths::natural_loop_depths;
-pub(crate) use shift::{emulated_shift_op, EmulatedShiftOp};
 pub(crate) use sig::{IrFuncSig, IrModuleCtx, IrParamSig};
 pub(crate) use types::{gep_elem_type, pointee};
 pub(crate) use value_uses::ir_value_use_counts;

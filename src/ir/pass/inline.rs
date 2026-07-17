@@ -192,7 +192,12 @@ fn inline_inst_types_match(func: &Function, inst: &Inst) -> bool {
                 | BinaryOp::Isub
                 | BinaryOp::Imul
                 | BinaryOp::Idiv
-                | BinaryOp::Imod => Type::I32,
+                | BinaryOp::Imod
+                | BinaryOp::Iand
+                | BinaryOp::Ior
+                | BinaryOp::Ixor
+                | BinaryOp::Ishl
+                | BinaryOp::Iashr => Type::I32,
                 BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => Type::F32,
                 BinaryOp::And | BinaryOp::Or => Type::I1,
             };

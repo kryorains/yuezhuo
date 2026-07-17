@@ -390,6 +390,11 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                             self.body.push_str("  mov w0, w2\n");
                         }
                     }
+                    BinaryOp::Iand => self.body.push_str("  and w0, w1, w0\n"),
+                    BinaryOp::Ior => self.body.push_str("  orr w0, w1, w0\n"),
+                    BinaryOp::Ixor => self.body.push_str("  eor w0, w1, w0\n"),
+                    BinaryOp::Ishl => self.body.push_str("  lsl w0, w1, w0\n"),
+                    BinaryOp::Iashr => self.body.push_str("  asr w0, w1, w0\n"),
                     _ => unreachable!(),
                 }
             }
