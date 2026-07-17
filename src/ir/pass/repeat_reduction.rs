@@ -1,4 +1,5 @@
 use super::dominators::{ControlFlowGraph, Dominators};
+use super::loop_analysis::{analyze_i32_induction, LoopInfo, NaturalLoop};
 use super::ModulePass;
 use crate::ir::{
     BinaryOp, BlockId, CmpOp, Const, Function, InstKind, Module, Terminator, Type, ValueId,
@@ -31,7 +32,8 @@ fn collapse_repeated_reductions(func: &mut Function) {
 
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
-    let mut loops = find_natural_loops(&cfg, &dom);
+    let loop_info = LoopInfo::new(&cfg, &dom);
+    let mut loops = loop_info.loops().to_vec();
     // Applying a reduction only changes values, not CFG edges, so one analysis
     // can serve every candidate in the function.
     loops.sort_by_key(|natural_loop| std::cmp::Reverse(natural_loop.blocks.len()));
@@ -55,14 +57,6 @@ fn collapse_repeated_reductions(func: &mut Function) {
     }
 }
 
-#[derive(Clone)]
-struct NaturalLoop {
-    header: BlockId,
-    preheader: BlockId,
-    latch: BlockId,
-    blocks: HashSet<BlockId>,
-}
-
 #[derive(Clone, Copy)]
 struct Reduction {
     header: BlockId,
@@ -74,59 +68,16 @@ struct Reduction {
     bound: ValueId,
 }
 
-fn find_natural_loops(cfg: &ControlFlowGraph, dom: &Dominators) -> Vec<NaturalLoop> {
-    let mut loops = Vec::new();
-    for latch_idx in 0..cfg.succs.len() {
-        let latch = BlockId(latch_idx);
-        for header in &cfg.succs[latch_idx] {
-            if !dom.dominates(*header, latch) {
-                continue;
-            }
-            let blocks = collect_loop_blocks(cfg, *header, latch);
-            let outside_preds = cfg.preds[header.0]
-                .iter()
-                .copied()
-                .filter(|pred| !blocks.contains(pred))
-                .collect::<Vec<_>>();
-            let [preheader] = outside_preds.as_slice() else {
-                continue;
-            };
-            if cfg.preds[header.0].len() != 2 {
-                continue;
-            }
-            loops.push(NaturalLoop {
-                header: *header,
-                preheader: *preheader,
-                latch,
-                blocks,
-            });
-        }
-    }
-    loops
-}
-
-fn collect_loop_blocks(
-    cfg: &ControlFlowGraph,
-    header: BlockId,
-    latch: BlockId,
-) -> HashSet<BlockId> {
-    let mut blocks = HashSet::from([header, latch]);
-    let mut stack = vec![latch];
-    while let Some(block) = stack.pop() {
-        for pred in &cfg.preds[block.0] {
-            if blocks.insert(*pred) {
-                stack.push(*pred);
-            }
-        }
-    }
-    blocks
-}
-
 fn match_reduction(
     func: &Function,
     cfg: &ControlFlowGraph,
     natural_loop: &NaturalLoop,
 ) -> Option<Reduction> {
+    let preheader = natural_loop.preheader?;
+    let latch = natural_loop.unique_latch()?;
+    if cfg.preds[natural_loop.header.0].len() != 2 {
+        return None;
+    }
     let header = &func.blocks[natural_loop.header.0];
     let Terminator::Branch {
         cond,
@@ -181,32 +132,31 @@ fn match_reduction(
         return None;
     }
 
-    let counter_initial = phi_incoming(func, *counter, natural_loop.preheader)?;
-    let counter_next = phi_incoming(func, *counter, natural_loop.latch)?;
-    if !is_const_int(func, counter_initial, 0)
-        || !is_add_one(func, counter_next, *counter)
-        || !value_defined_in_block(func, counter_next, natural_loop.latch)
-        || value_use_count(func, counter_next) != 1
+    let counter_induction = analyze_i32_induction(func, natural_loop, *counter)?;
+    if !is_const_int(func, counter_induction.initial, 0)
+        || counter_induction.step != 1
+        || !value_defined_in_block(func, counter_induction.next, latch)
+        || value_use_count(func, counter_induction.next) != 1
     {
         return None;
     }
 
-    let accumulator_initial = phi_incoming(func, accumulator, natural_loop.preheader)?;
-    let accumulator_next = phi_incoming(func, accumulator, natural_loop.latch)?;
+    let accumulator_initial = phi_incoming(func, accumulator, preheader)?;
+    let accumulator_next = phi_incoming(func, accumulator, latch)?;
     if !value_defined_in_blocks(func, accumulator_next, &natural_loop.blocks)
         || !accumulator_is_affine(func, natural_loop, accumulator, accumulator_next)
-        || cfg.succs[natural_loop.latch.0] != [natural_loop.header]
+        || cfg.succs[latch.0] != [natural_loop.header]
     {
         return None;
     }
 
     Some(Reduction {
         header: natural_loop.header,
-        latch: natural_loop.latch,
+        latch,
         accumulator,
         accumulator_next,
         accumulator_initial,
-        counter: *counter,
+        counter: counter_induction.phi,
         bound: *bound,
     })
 }
@@ -368,15 +318,6 @@ fn phi_incoming(func: &Function, phi: ValueId, pred: BlockId) -> Option<ValueId>
     incomings
         .iter()
         .find_map(|(incoming_pred, value)| (*incoming_pred == pred).then_some(*value))
-}
-
-fn is_add_one(func: &Function, value: ValueId, counter: ValueId) -> bool {
-    matches!(
-        defining_inst(func, value),
-        Some(InstKind::Binary { op: BinaryOp::Iadd, lhs, rhs })
-            if (*lhs == counter && is_const_int(func, *rhs, 1))
-                || (*rhs == counter && is_const_int(func, *lhs, 1))
-    )
 }
 
 fn is_const_int(func: &Function, value: ValueId, expected: i32) -> bool {

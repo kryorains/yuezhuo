@@ -146,7 +146,7 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 
 无副作用重复归约折叠。
 
-它识别从 0 开始、每轮加 1 的计数循环；当循环体没有 `store`、`call`、`memzero` 等副作用，并且唯一可观察的循环状态满足 `acc' = acc + delta` 时，把重复执行改写为：
+它通过共享的 `LoopInfo` 与 i32 归纳变量分析识别从 0 开始、每轮加 1 的计数循环；当循环体没有 `store`、`call`、`memzero` 等副作用，并且唯一可观察的循环状态满足 `acc' = acc + delta` 时，把重复执行改写为：
 
 1. 执行一次原循环体，得到单轮增量 `delta`；
 2. 计算 `initial + delta * count`；
@@ -158,7 +158,7 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 
 对严格规范化的单基本块计数循环做二倍展开。
 
-候选循环必须从 0 开始、每轮加 1、以动态上界做有符号小于比较，并且只有一个活跃 loop phi；含调用、`memzero`、侧出口或额外循环状态时不会展开。pass 在原标量循环前插入两路快速循环，原循环继续处理负数、小于 2 的次数和奇数尾项。两份循环体严格按迭代顺序克隆，因此即使相邻迭代的内存访问互相别名，也不会改变可观察顺序。代码增长受单循环和单函数预算限制。当前 AArch64 后端会让展开后的中间值产生额外栈流量，因此目标收益门控暂时只在 x86-64 和 RISC-V64 启用该 pass。
+候选循环通过共享的 `LoopInfo` 与 i32 归纳变量分析取得结构和计数器信息，但仍严格要求从 0 开始、每轮加 1、以动态上界做有符号小于比较，并且只有一个活跃 loop phi；含调用、`memzero`、侧出口或额外循环状态时不会展开。pass 在原标量循环前插入两路快速循环，原循环继续处理负数、小于 2 的次数和奇数尾项。两份循环体严格按迭代顺序克隆，因此即使相邻迭代的内存访问互相别名，也不会改变可观察顺序。代码增长受单循环和单函数预算限制。当前 AArch64 后端会让展开后的中间值产生额外栈流量，因此目标收益门控暂时只在 x86-64 和 RISC-V64 启用该 pass。
 
 ### `DcePass` (`dce.rs`)
 
@@ -184,11 +184,21 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 
 - `ControlFlowGraph`：每个基本块的前驱和后继。
 - `Dominators`：
-  - 每个块的支配集合；
-  - 支配树 children；
+  - 在入口可达 CFG 的 reverse postorder 上用 Cooper-Harvey-Kennedy 算法求 immediate dominator；
+  - 支配树 children 和 DFS 区间，`dominates` 查询为 O(1)；
   - dominance frontier。
 
-`ScalarPromotePass` 用它来判断定义是否支配使用，以及在哪里需要插入 `phi`。
+不可达块不加入入口支配树，只保守地认为块支配自身。`ScalarPromotePass` 用支配信息判断定义是否支配使用，以及在哪里需要插入 `phi`；`LoopInfo`、LICM 及 IR 验证器也复用同一套可达性和支配关系，不依赖基本块在 `Function.blocks` 中的存储顺序。
+
+### `loop_analysis.rs`
+
+共享的自然循环与 i32 归纳变量分析，不是独立 pass，也不读取函数名、块名或固定块编号。
+
+- `LoopInfo` 从 CFG 中收集“循环头支配回边源”的 backedge，并按 header 合并成 `NaturalLoop`。
+- `NaturalLoop` 提供 header、所有 latch/backedge、loop blocks、唯一专用 preheader（若存在）、全部退出边和唯一 exit（若存在）；多 latch、多入口或多 exit 会显式保留，而不是猜测某个固定布局。
+- `analyze_i32_induction` 从 header phi 的 preheader/latch incoming 识别 `next = phi + constant` 形式，统一处理 `add` 两种操作数顺序及 `sub phi, constant`，支持任意非零 i32 环绕步长，并返回 phi、initial、next、step。
+
+LICM 使用 `LoopInfo` 选择有唯一 preheader 的自然循环；`RepeatReductionPass` 和 `SimpleLoopUnrollPass` 同时复用循环结构和归纳变量描述，但各自继续施加原有的 `initial == 0`、`step == 1` 等严格变换门控。因此该模块是普通循环优化的公共基础设施，不是某个整数 idiom 的私有 matcher。
 
 ### `util.rs`
 

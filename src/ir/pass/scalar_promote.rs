@@ -2,7 +2,7 @@ use super::dominators::{ControlFlowGraph, Dominators};
 use super::util::{resolve_replacement, rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
 use crate::ir::{
-    BlockId, Function, Inst, InstKind, Module, Terminator, Type, Value, ValueId, ValueKind,
+    BlockId, Const, Function, Inst, InstKind, Module, Terminator, Type, Value, ValueId, ValueKind,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -45,11 +45,18 @@ fn promote_function(func: &mut Function) {
         .iter()
         .map(|((block, alloca), phi)| (*phi, (*block, *alloca)))
         .collect::<HashMap<_, _>>();
-    let mut stacks = candidates
-        .iter()
-        .copied()
-        .map(|alloca| (alloca, Vec::<ValueId>::new()))
-        .collect::<HashMap<_, _>>();
+    // The unpruned phi placement can create a dead phi before the first real
+    // store. Seed every stack so those phis still receive a type-correct value
+    // on every predecessor edge. `loads_are_defined` guarantees the seed can
+    // never replace an observable load.
+    let mut stacks = HashMap::new();
+    for alloca in &candidates {
+        let Some(ty) = promoted_type(func, *alloca) else {
+            continue;
+        };
+        let seed = func.add_const(Const::Zero(ty));
+        stacks.insert(*alloca, vec![seed]);
+    }
     let mut replacements = ValueReplacements::new();
 
     rename_block(
@@ -63,6 +70,7 @@ fn promote_function(func: &mut Function) {
         &mut stacks,
         &mut replacements,
     );
+    fill_unreachable_phi_incomings(func, &cfg, &dom, &phi_values, &stacks);
 
     rewrite_function_uses(func, &replacements);
     if let Err(errors) = func.verify() {
@@ -407,6 +415,41 @@ fn rename_block(
     }
 }
 
+fn fill_unreachable_phi_incomings(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dom: &Dominators,
+    phi_values: &HashMap<(BlockId, ValueId), ValueId>,
+    stacks: &HashMap<ValueId, Vec<ValueId>>,
+) {
+    // rename_block only visits the entry-reachable dominator tree. Dead CFG
+    // predecessors still need a structurally complete phi, but their value can
+    // never be observed, so use the type-correct seed for those edges.
+    for ((block, alloca), phi) in phi_values {
+        let Some(seed) = stacks.get(alloca).and_then(|stack| stack.first()).copied() else {
+            continue;
+        };
+        let ValueKind::Inst(owner, inst_idx) = func.value(*phi).kind else {
+            continue;
+        };
+        let InstKind::Phi { incomings } = &func.blocks[owner.0].insts[inst_idx].kind else {
+            continue;
+        };
+        let present = incomings
+            .iter()
+            .map(|(pred, _)| *pred)
+            .collect::<HashSet<_>>();
+        let missing = cfg.preds[block.0]
+            .iter()
+            .copied()
+            .filter(|pred| !dom.is_reachable(*pred) && !present.contains(pred))
+            .collect::<Vec<_>>();
+        for pred in missing {
+            add_phi_incoming(func, *phi, pred, seed);
+        }
+    }
+}
+
 fn add_phi_incoming(func: &mut Function, phi: ValueId, pred: BlockId, value: ValueId) {
     let ValueKind::Inst(block, inst_idx) = func.value(phi).kind else {
         panic!("phi value must be an instruction");
@@ -425,4 +468,82 @@ fn promoted_type(func: &Function, alloca: ValueId) -> Option<Type> {
         return None;
     };
     Some(ty.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completes_promoted_phis_for_unreachable_predecessors() {
+        let mut func = Function::new("dead_phi_pred", Type::I32);
+        let left = func.add_block("left");
+        let right = func.add_block("right");
+        let merge = func.add_block("merge");
+        let dead = func.add_block("dead");
+        let condition = func.add_const(Const::Bool(true));
+        let zero = func.add_const(Const::Int(0));
+        let one = func.add_const(Const::Int(1));
+        let two = func.add_const(Const::Int(2));
+        let slot = func
+            .append_inst(
+                func.entry,
+                InstKind::Alloca { ty: Type::I32 },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        func.append_inst(
+            func.entry,
+            InstKind::Store {
+                ptr: slot,
+                value: zero,
+            },
+            None,
+        );
+        func.set_terminator(
+            func.entry,
+            Terminator::Branch {
+                cond: condition,
+                then_target: left,
+                else_target: right,
+            },
+        );
+        func.append_inst(
+            left,
+            InstKind::Store {
+                ptr: slot,
+                value: one,
+            },
+            None,
+        );
+        func.set_terminator(left, Terminator::Jump(merge));
+        func.append_inst(
+            right,
+            InstKind::Store {
+                ptr: slot,
+                value: two,
+            },
+            None,
+        );
+        func.set_terminator(right, Terminator::Jump(merge));
+        func.set_terminator(dead, Terminator::Jump(merge));
+        let loaded = func
+            .append_inst(merge, InstKind::Load { ptr: slot }, Some(Type::I32))
+            .unwrap();
+        func.set_terminator(merge, Terminator::Return(Some(loaded)));
+        assert!(func.verify().is_ok());
+
+        promote_function(&mut func);
+
+        assert!(func.verify().is_ok());
+        let phi_incomings = func.blocks[merge.0]
+            .insts
+            .iter()
+            .find_map(|inst| match &inst.kind {
+                InstKind::Phi { incomings } => Some(incomings),
+                _ => None,
+            })
+            .expect("promotion should insert a merge phi");
+        assert!(phi_incomings.iter().any(|(pred, _)| *pred == dead));
+    }
 }

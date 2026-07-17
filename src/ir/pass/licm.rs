@@ -1,4 +1,5 @@
 use super::dominators::{ControlFlowGraph, Dominators};
+use super::loop_analysis::{LoopInfo, NaturalLoop};
 use super::ModulePass;
 use crate::ir::{BinaryOp, BlockId, Function, Inst, InstKind, Module, ValueId, ValueKind};
 use std::collections::HashSet;
@@ -26,7 +27,8 @@ fn licm_function(func: &mut Function) {
 
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
-    let loops = find_natural_loops(func, &cfg, &dom);
+    let loop_info = LoopInfo::new(&cfg, &dom);
+    let loops = loop_info.loops().to_vec();
     if loops.is_empty() {
         return;
     }
@@ -43,63 +45,11 @@ fn licm_function(func: &mut Function) {
     }
 }
 
-#[derive(Debug, Clone)]
-struct NaturalLoop {
-    header: BlockId,
-    preheader: BlockId,
-    blocks: HashSet<BlockId>,
-}
-
-fn find_natural_loops(
-    func: &Function,
-    cfg: &ControlFlowGraph,
-    dom: &Dominators,
-) -> Vec<NaturalLoop> {
-    let mut loops = Vec::new();
-
-    for tail_idx in 0..func.blocks.len() {
-        let tail = BlockId(tail_idx);
-        for header in &cfg.succs[tail_idx] {
-            if !dom.dominates(*header, tail) {
-                continue;
-            }
-            let blocks = collect_loop_blocks(cfg, *header, tail);
-            let outside_preds = cfg.preds[header.0]
-                .iter()
-                .copied()
-                .filter(|pred| !blocks.contains(pred))
-                .collect::<Vec<_>>();
-            // 先只处理有唯一 preheader 的循环；没有 preheader 时需要改 CFG，留给后续 pass。
-            let [preheader] = outside_preds.as_slice() else {
-                continue;
-            };
-            loops.push(NaturalLoop {
-                header: *header,
-                preheader: *preheader,
-                blocks,
-            });
-        }
-    }
-
-    loops
-}
-
-fn collect_loop_blocks(cfg: &ControlFlowGraph, header: BlockId, tail: BlockId) -> HashSet<BlockId> {
-    let mut blocks = HashSet::from([header, tail]);
-    let mut stack = vec![tail];
-
-    while let Some(block) = stack.pop() {
-        for pred in &cfg.preds[block.0] {
-            if blocks.insert(*pred) {
-                stack.push(*pred);
-            }
-        }
-    }
-
-    blocks
-}
-
 fn hoist_loop(func: &mut Function, dom: &Dominators, natural_loop: &NaturalLoop) -> bool {
+    let Some(preheader) = natural_loop.preheader else {
+        // Creating a dedicated preheader requires a separate CFG transformation.
+        return false;
+    };
     let mut changed = false;
 
     loop {
@@ -109,10 +59,23 @@ fn hoist_loop(func: &mut Function, dom: &Dominators, natural_loop: &NaturalLoop)
             break;
         }
 
+        // Block storage order need not be dominance order. Move only values
+        // whose dependencies are already available in the preheader, then
+        // iterate so dependent invariants are appended after their definitions.
+        let mut moved = false;
+        let no_pending_invariants = HashSet::new();
         for (block, inst_idx) in candidates {
             let inst = func.blocks[block.0].insts[inst_idx].clone();
-            move_inst_to_preheader(func, block, inst_idx, natural_loop.preheader, inst);
+            if !operands_are_invariant(func, dom, natural_loop, &inst.kind, &no_pending_invariants)
+            {
+                continue;
+            }
+            move_inst_to_preheader(func, block, inst_idx, preheader, inst);
+            moved = true;
             changed = true;
+        }
+        if !moved {
+            break;
         }
     }
 
@@ -228,7 +191,10 @@ fn value_available_in_preheader(
             invariant.contains(&value)
         }
         ValueKind::Inst(block, _) => {
-            *block == natural_loop.preheader || dom.dominates(*block, natural_loop.preheader)
+            let Some(preheader) = natural_loop.preheader else {
+                return false;
+            };
+            *block == preheader || dom.dominates(*block, preheader)
         }
     }
 }
@@ -279,4 +245,68 @@ fn sorted_loop_blocks(natural_loop: &NaturalLoop) -> Vec<BlockId> {
     let mut blocks = natural_loop.blocks.iter().copied().collect::<Vec<_>>();
     blocks.sort_by_key(|block| (*block != natural_loop.header, block.0));
     blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Const, Terminator, Type};
+
+    #[test]
+    fn hoists_dependencies_before_uses_when_block_storage_order_differs() {
+        let mut func = Function::new("licm_order", Type::Void);
+        let header = func.add_block("header");
+        let use_block = func.add_block("use");
+        let def_block = func.add_block("def");
+        let latch = func.add_block("latch");
+        let exit = func.add_block("exit");
+        let condition = func.add_const(Const::Bool(true));
+        let one = func.add_const(Const::Int(1));
+
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: def_block,
+                else_target: exit,
+            },
+        );
+        let definition = func
+            .append_inst(
+                def_block,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: one,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(def_block, Terminator::Jump(use_block));
+        let usage = func
+            .append_inst(
+                use_block,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: definition,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(use_block, Terminator::Jump(latch));
+        func.set_terminator(latch, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+        assert!(func.verify().is_ok());
+
+        licm_function(&mut func);
+
+        assert!(func.verify().is_ok());
+        assert_eq!(
+            func.values[definition.0].kind,
+            ValueKind::Inst(func.entry, 0)
+        );
+        assert_eq!(func.values[usage.0].kind, ValueKind::Inst(func.entry, 1));
+    }
 }
