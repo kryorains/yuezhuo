@@ -105,6 +105,19 @@ fn thread_boolean_phi_branches(func: &mut Function) {
         .collect::<Vec<_>>();
 
     for (block, condition, then_target, else_target, incomings) in candidates {
+        if !matches!(
+            func.blocks[block.0].terminator.as_ref(),
+            Some(Terminator::Branch {
+                cond,
+                then_target: current_then,
+                else_target: current_else,
+            }) if *cond == condition
+                && *current_then == then_target
+                && *current_else == else_target
+        ) {
+            continue;
+        }
+
         let cfg_predecessors = predecessor_sets[block.0].clone();
         let incoming_predecessors = incomings
             .iter()

@@ -347,9 +347,9 @@ fn call_crossing_candidates(
             };
             let next_call = calls.partition_point(|call_idx| *call_idx <= def_idx);
             if owner.0 != block_idx
-                || !calls
+                || calls
                     .get(next_call)
-                    .is_some_and(|call_idx| *call_idx < last_use)
+                    .is_none_or(|call_idx| *call_idx >= last_use)
             {
                 continue;
             }
