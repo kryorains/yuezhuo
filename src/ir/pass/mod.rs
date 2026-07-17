@@ -3,10 +3,12 @@ mod cse;
 mod dce;
 mod dominators;
 mod inline;
+mod invariant_load;
 mod licm;
 mod local_forward;
 mod repeat_reduction;
 mod scalar_promote;
+mod simple_loop_unroll;
 mod simplify_cfg;
 mod tail_recursion;
 mod util;
@@ -16,10 +18,12 @@ use const_fold::ConstFoldPass;
 use cse::CsePass;
 use dce::DcePass;
 use inline::InlineSmallExprPass;
+use invariant_load::InvariantLoadForwardPass;
 use licm::LicmPass;
 use local_forward::LocalForwardPass;
 use repeat_reduction::RepeatReductionPass;
 use scalar_promote::ScalarPromotePass;
+use simple_loop_unroll::SimpleLoopUnrollPass;
 use simplify_cfg::SimplifyCfgPass;
 use tail_recursion::TailRecursionPass;
 
@@ -29,7 +33,12 @@ pub enum OptLevel {
     O1,
 }
 
-pub fn run_pipeline(module: &mut Module, opt_level: OptLevel) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassOptions {
+    pub enable_simple_loop_unroll: bool,
+}
+
+pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptions) {
     // 所有优化 pass 都在这里排队，方便统一调整执行顺序。
     let mut pipeline = PassPipeline::new();
     match opt_level {
@@ -50,8 +59,12 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel) {
             pipeline.add(LocalForwardPass::new());
             pipeline.add(CsePass::new());
             pipeline.add(LicmPass::new());
+            pipeline.add(InvariantLoadForwardPass::new());
             pipeline.add(DcePass::new());
             pipeline.add(RepeatReductionPass::new());
+            if options.enable_simple_loop_unroll {
+                pipeline.add(SimpleLoopUnrollPass::new());
+            }
             pipeline.add(ConstFoldPass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());
