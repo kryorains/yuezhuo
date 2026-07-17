@@ -8,6 +8,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(super) struct ScalarPromotePass;
 
+pub(super) const MAX_PROMOTION_BLOCKS: usize = 512;
+pub(super) const MAX_PROMOTION_VALUES: usize = 4096;
+
 impl ScalarPromotePass {
     pub(super) fn new() -> Self {
         Self
@@ -24,7 +27,7 @@ impl ModulePass for ScalarPromotePass {
 
 fn promote_function(func: &mut Function) {
     // 当前实现使用较朴素的数据结构；大函数先跳过，避免编译时间爆炸。
-    if func.blocks.len() > 512 || func.values.len() > 4096 {
+    if func.blocks.len() > MAX_PROMOTION_BLOCKS || func.values.len() > MAX_PROMOTION_VALUES {
         return;
     }
 
@@ -250,9 +253,9 @@ fn insert_phis(
         let Some(ty) = promoted_type(func, *alloca) else {
             continue;
         };
-        let mut worklist = store_blocks(func, *alloca)
-            .into_iter()
-            .collect::<VecDeque<_>>();
+        let mut store_blocks = store_blocks(func, *alloca).into_iter().collect::<Vec<_>>();
+        store_blocks.sort_by_key(|block| block.0);
+        let mut worklist = store_blocks.into_iter().collect::<VecDeque<_>>();
         let mut placed = HashSet::<BlockId>::new();
 
         while let Some(block) = worklist.pop_front() {

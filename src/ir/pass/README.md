@@ -16,20 +16,21 @@
   1. `ConstFoldPass`
   2. `SimplifyCfgPass`
   3. `TailRecursionPass`
-  4. `ScalarPromotePass`
-  5. `InlineSmallExprPass`
-  6. `LocalForwardPass`
-  7. `CsePass`
-  8. `LicmPass`
-  9. `InvariantLoadForwardPass`
-  10. `DcePass`
-  11. `BitwiseIdiomPass`
-  12. `PiecewiseExprPass`
-  13. `RepeatReductionPass`
-  14. `SimpleLoopUnrollPass`
-  15. `ConstFoldPass`
-  16. `SimplifyCfgPass`
-  17. `DcePass`
+  4. `GlobalScalarLocalizePass`
+  5. `ScalarPromotePass`
+  6. `InlineSmallExprPass`
+  7. `LocalForwardPass`
+  8. `CsePass`
+  9. `LicmPass`
+  10. `InvariantLoadForwardPass`
+  11. `DcePass`
+  12. `BitwiseIdiomPass`
+  13. `PiecewiseExprPass`
+  14. `RepeatReductionPass`
+  15. `SimpleLoopUnrollPass`
+  16. `ConstFoldPass`
+  17. `SimplifyCfgPass`
+  18. `DcePass`
 
 O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行常量折叠、CSE、LICM 等主动改写表达式的优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi，末尾 DCE 再清理归约折叠后失效的循环记账指令。
 
@@ -61,6 +62,7 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 - 如果 `branch` 的 then/else 目标相同，改成无条件 `jump`。
 - 如果 `branch` 条件是常量，直接选定唯一可达的目标块。
 - 当删掉某条 CFG 边时，同步删除目标块里 `phi` 对应的 incoming。
+- 对仅合并布尔值并立即分支的 `phi` 块，如果所有动态 incoming 都能证明等于分支条件，则把前驱边直接穿透到分支目标；目前要求至少一个目标块直接返回，并拒绝会改变后继 `phi` 的情况。
 
 ### `TailRecursionPass` (`tail_recursion.rs`)
 
@@ -79,6 +81,10 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 2. 跳回函数体入口。
 
 后续 `ScalarPromotePass` 会把这些形参槽位提升成 loop phi，使最终 IR 更接近普通循环。
+
+### `GlobalScalarLocalizePass` (`global_scalar_localize.rs`)
+
+把叶函数中反复访问的标量全局变量暂存为局部标量：入口加载一次，每个正常返回点写回一次，再由后续 `ScalarPromotePass` 提升为 SSA。候选全局必须只被直接 `load`/`store` 使用，函数内不能有调用，且候选地址不能参与 `memzero`，从而避免指针逃逸、调用可见性及别名问题。处理顺序按全局名排序并受固定数量和下游标量提升规模预算约束，保证代码生成稳定且避免大函数编译时间膨胀。
 
 ### `ScalarPromotePass` (`scalar_promote.rs`)
 

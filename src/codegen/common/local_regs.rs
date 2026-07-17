@@ -11,7 +11,11 @@ pub(crate) struct IrLocalRegs {
 }
 
 impl IrLocalRegs {
-    pub(crate) fn new(func: &Function, available_regs: &'static [&'static str]) -> Self {
+    pub(crate) fn new(
+        func: &Function,
+        available_regs: &'static [&'static str],
+        allow_call_uses: bool,
+    ) -> Self {
         if available_regs.is_empty() || func.values.len() > 16_384 {
             return Self {
                 regs: HashMap::new(),
@@ -36,11 +40,9 @@ impl IrLocalRegs {
             if inst.result != Some(ValueId(value_idx))
                 || matches!(
                     inst.kind,
-                    InstKind::Nop
-                        | InstKind::Phi { .. }
-                        | InstKind::Alloca { .. }
-                        | InstKind::Call { .. }
+                    InstKind::Nop | InstKind::Phi { .. } | InstKind::Alloca { .. }
                 )
+                || (!allow_call_uses && matches!(inst.kind, InstKind::Call { .. }))
             {
                 continue;
             }
@@ -60,8 +62,8 @@ impl IrLocalRegs {
         for (block_idx, block) in func.blocks.iter().enumerate() {
             let owner = BlockId(block_idx);
             for (inst_idx, inst) in block.insts.iter().enumerate() {
-                let unsupported_use =
-                    matches!(inst.kind, InstKind::Phi { .. } | InstKind::Call { .. });
+                let unsupported_use = matches!(inst.kind, InstKind::Phi { .. })
+                    || (!allow_call_uses && matches!(inst.kind, InstKind::Call { .. }));
                 for operand in inst_operands(&inst.kind) {
                     record_use(&mut candidates, operand, owner, inst_idx, unsupported_use);
                 }
@@ -95,10 +97,11 @@ impl IrLocalRegs {
             if !candidate.valid || candidate.uses == 0 {
                 continue;
             }
-            if calls[candidate.block.0]
-                .iter()
-                .any(|call| candidate.start < *call && *call <= candidate.end)
-            {
+            let block_calls = &calls[candidate.block.0];
+            let next_call = block_calls.partition_point(|call| *call <= candidate.start);
+            if block_calls.get(next_call).is_some_and(|call| {
+                *call < candidate.end || (!allow_call_uses && *call <= candidate.end)
+            }) {
                 continue;
             }
             by_block[candidate.block.0].push(candidate);
