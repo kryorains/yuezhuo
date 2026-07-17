@@ -1,6 +1,8 @@
 use super::regalloc::Riscv64RegAlloc;
 use super::{Riscv64IrEmitter, Riscv64IrFuncEmitter};
-use crate::codegen::common::{emit_ir_data_section, ir_align_to, IrFuncLayout, IrModuleCtx};
+use crate::codegen::common::{
+    emit_ir_data_section, entry_early_return, ir_align_to, IrFuncLayout, IrModuleCtx,
+};
 use crate::ir::{Function, Module};
 
 pub(super) fn emit_asm(module: &Module) -> String {
@@ -45,8 +47,18 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit(mut self) {
+        let early_return = entry_early_return(self.func).and_then(|plan| {
+            self.pre_prologue_early_return(&plan)
+                .map(|prelude| (plan, prelude))
+        });
         self.emit_params();
+        let params_end = self.body.len();
         for (block_idx, block) in self.func.blocks.iter().enumerate() {
+            if early_return.as_ref().is_some_and(|(plan, _)| {
+                block_idx == self.func.entry.0 || block_idx == plan.fast_block.0
+            }) {
+                continue;
+            }
             self.body
                 .push_str(&format!("{}:\n", self.block_label(block_idx)));
             for inst in &block.insts {
@@ -57,6 +69,8 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             }
         }
 
+        let params = self.body[..params_end].to_string();
+        let blocks = self.body[params_end..].to_string();
         let saved_regs = self.regalloc.used_regs().to_vec();
         let stack_size = ir_align_to(self.layout.stack_size + self.regalloc.saved_area_size(), 16);
         let recursive = self.func.blocks.iter().any(|block| {
@@ -75,6 +89,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             ".p2align {1}\n.globl {0}\n.type {0}, @function\n{0}:\n",
             self.func.name, function_alignment
         ));
+        if let Some((_, prelude)) = &early_return {
+            self.parent.out.push_str(prelude);
+        }
         self.parent
             .out
             .push_str("  addi sp, sp, -16\n  sd ra, 8(sp)\n  sd s0, 0(sp)\n  mv s0, sp\n");
@@ -88,7 +105,13 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 .out
                 .push_str(&format!("  sd {}, -{}(s0)\n", reg, (idx + 1) * 8));
         }
-        self.parent.out.push_str(&self.body);
+        self.parent.out.push_str(&params);
+        if let Some((plan, _)) = &early_return {
+            self.parent
+                .out
+                .push_str(&format!("  j {}\n", self.block_label(plan.slow_block.0)));
+        }
+        self.parent.out.push_str(&blocks);
         self.parent
             .out
             .push_str(&format!("{}:\n", self.return_label));

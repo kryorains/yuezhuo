@@ -1,5 +1,6 @@
 mod abi;
 mod call;
+mod early_return;
 mod emitter;
 mod inst;
 mod memory;
