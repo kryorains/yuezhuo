@@ -244,9 +244,83 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     return true;
                 }
             }
+            BinaryOp::Idiv | BinaryOp::Imod => {
+                if let Some(divisor) = const_i32(self.func, rhs) {
+                    self.emit_signed_divmod_const(lhs, divisor, op == BinaryOp::Imod);
+                    return true;
+                }
+            }
             _ => {}
         }
         false
+    }
+
+    fn emit_signed_divmod_const(&mut self, value: ValueId, divisor: i32, remainder: bool) {
+        if divisor == 0 {
+            if remainder {
+                self.load_value(value);
+            } else {
+                self.body.push_str("  li a0, -1\n");
+            }
+            return;
+        }
+
+        if divisor == 1 || divisor == -1 {
+            if remainder {
+                self.body.push_str("  li a0, 0\n");
+            } else {
+                self.load_value(value);
+                if divisor < 0 {
+                    self.body.push_str("  negw a0, a0\n");
+                }
+            }
+            return;
+        }
+
+        self.load_value(value);
+        if remainder {
+            self.body.push_str("  mv t2, a0\n");
+        }
+
+        let abs_divisor = divisor.unsigned_abs();
+        // Bias negative dividends before shifting so the quotient truncates toward zero.
+        if abs_divisor.is_power_of_two() {
+            let shift = abs_divisor.trailing_zeros();
+            self.body.push_str(&format!(
+                "  sraiw t0, a0, 31\n  srliw t0, t0, {}\n  addw t0, a0, t0\n  sraiw t0, t0, {}\n",
+                32 - shift,
+                shift
+            ));
+        } else {
+            // Widen to 64 bits: RV64 mulh is a 64x64 high multiply, while this
+            // lowering needs the high half of a signed 32x32 product.
+            let magic = signed_magic_positive(abs_divisor);
+            self.body.push_str(&format!(
+                "  li t0, {}\n  mul t0, a0, t0\n  srai t0, t0, 32\n",
+                magic.multiplier
+            ));
+            if magic.add_dividend {
+                self.body.push_str("  addw t0, t0, a0\n");
+            }
+            if magic.shift != 0 {
+                self.body
+                    .push_str(&format!("  sraiw t0, t0, {}\n", magic.shift));
+            }
+            self.body
+                .push_str("  srliw t1, t0, 31\n  addw t0, t0, t1\n");
+        }
+
+        if divisor < 0 {
+            self.body.push_str("  negw t0, t0\n");
+        }
+        if remainder {
+            self.body.push_str(&format!(
+                "  li t1, {}\n  mulw t0, t0, t1\n  subw a0, t2, t0\n",
+                divisor
+            ));
+        } else {
+            self.body.push_str("  mv a0, t0\n");
+        }
     }
 
     fn emit_icmp(&mut self, op: CmpOp, lhs: ValueId, rhs: ValueId) {
@@ -320,4 +394,53 @@ fn pow2_shift(func: &crate::ir::Function, value: ValueId) -> Option<u32> {
 
 fn fits_i12(value: i32) -> bool {
     (-2048..=2047).contains(&value)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SignedMagic {
+    multiplier: i32,
+    shift: u32,
+    add_dividend: bool,
+}
+
+// Hacker's Delight, chapter 10: magic multiplier for signed division by a
+// positive, non-power-of-two 32-bit constant.
+fn signed_magic_positive(divisor: u32) -> SignedMagic {
+    debug_assert!((2..=i32::MAX as u32).contains(&divisor));
+    debug_assert!(!divisor.is_power_of_two());
+
+    let divisor = u64::from(divisor);
+    let two31 = 1u64 << 31;
+    let anc = two31 - 1 - two31 % divisor;
+    let mut p = 31u32;
+    let (mut q1, mut r1) = (two31 / anc, two31 % anc);
+    let (mut q2, mut r2) = (two31 / divisor, two31 % divisor);
+
+    loop {
+        p += 1;
+        q1 <<= 1;
+        r1 <<= 1;
+        if r1 >= anc {
+            q1 += 1;
+            r1 -= anc;
+        }
+        q2 <<= 1;
+        r2 <<= 1;
+        if r2 >= divisor {
+            q2 += 1;
+            r2 -= divisor;
+        }
+
+        let delta = divisor - r2;
+        if q1 > delta || (q1 == delta && r1 != 0) {
+            break;
+        }
+    }
+
+    let multiplier = (q2 + 1) as u32 as i32;
+    SignedMagic {
+        multiplier,
+        shift: p - 32,
+        add_dividend: multiplier < 0,
+    }
 }

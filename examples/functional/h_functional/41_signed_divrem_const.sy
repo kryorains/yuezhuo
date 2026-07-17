@@ -1,0 +1,65 @@
+int dneg2147483648 = -2147483647 - 1;
+int dneg65535 = -65535;
+int dneg2048 = -2048;
+int dneg97 = -97;
+int dneg3 = -3;
+int dneg2 = -2;
+int dneg1 = -1;
+int d1 = 1;
+int d2 = 2;
+int d3 = 3;
+int d97 = 97;
+int d2048 = 2048;
+int d65535 = 65535;
+int d2147483647 = 2147483647;
+
+int check(int x) {
+    if (x / (-2147483647 - 1) != x / dneg2147483648) return 1;
+    if (x % (-2147483647 - 1) != x % dneg2147483648) return 2;
+    if (x / -65535 != x / dneg65535) return 3;
+    if (x % -65535 != x % dneg65535) return 4;
+    if (x / -2048 != x / dneg2048) return 5;
+    if (x % -2048 != x % dneg2048) return 6;
+    if (x / -97 != x / dneg97) return 7;
+    if (x % -97 != x % dneg97) return 8;
+    if (x / -3 != x / dneg3) return 9;
+    if (x % -3 != x % dneg3) return 10;
+    if (x / -2 != x / dneg2) return 11;
+    if (x % -2 != x % dneg2) return 12;
+    if (x != (-2147483647 - 1)) {
+        if (x / -1 != x / dneg1) return 13;
+        if (x % -1 != x % dneg1) return 14;
+    }
+    if (x / 1 != x / d1) return 15;
+    if (x % 1 != x % d1) return 16;
+    if (x / 2 != x / d2) return 17;
+    if (x % 2 != x % d2) return 18;
+    if (x / 3 != x / d3) return 19;
+    if (x % 3 != x % d3) return 20;
+    if (x / 97 != x / d97) return 21;
+    if (x % 97 != x % d97) return 22;
+    if (x / 2048 != x / d2048) return 23;
+    if (x % 2048 != x % d2048) return 24;
+    if (x / 65535 != x / d65535) return 25;
+    if (x % 65535 != x % d65535) return 26;
+    if (x / 2147483647 != x / d2147483647) return 27;
+    if (x % 2147483647 != x % d2147483647) return 28;
+    return 0;
+}
+
+int main() {
+    int count = getint();
+    int i = 0;
+    while (i < count) {
+        int error = check(getint());
+        if (error != 0) {
+            putint(error);
+            putch(10);
+            return error;
+        }
+        i = i + 1;
+    }
+    putint(0);
+    putch(10);
+    return 0;
+}
