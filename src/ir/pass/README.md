@@ -17,14 +17,15 @@
   2. `SimplifyCfgPass`
   3. `TailRecursionPass`
   4. `ScalarPromotePass`
-  5. `LocalForwardPass`
-  6. `CsePass`
-  7. `LicmPass`
-  8. `DcePass`
-  9. `RepeatReductionPass`
-  10. `ConstFoldPass`
-  11. `SimplifyCfgPass`
-  12. `DcePass`
+  5. `InlineSmallExprPass`
+  6. `LocalForwardPass`
+  7. `CsePass`
+  8. `LicmPass`
+  9. `DcePass`
+  10. `RepeatReductionPass`
+  11. `ConstFoldPass`
+  12. `SimplifyCfgPass`
+  13. `DcePass`
 
 O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行常量折叠、CSE、LICM 等主动改写表达式的优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi，末尾 DCE 再清理归约折叠后失效的循环记账指令。
 
@@ -89,6 +90,12 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
   - 被提升掉的 `alloca`/`load`/`store` 改成 `Nop`。
 
 这个 pass 会跳过过大的函数，避免朴素算法在大 IR 上耗时过高。
+
+### `InlineSmallExprPass` (`inline.rs`)
+
+内联小型、单基本块的纯标量表达式函数。
+
+候选函数不能包含调用、控制流、phi 或可观察的内存操作；允许忽略没有读取或逃逸的局部只写槽位，其余只保留少量一元/二元运算、比较和类型转换。调用点会克隆这些纯指令并改写返回值的使用点，让后续 CSE、LICM 和 DCE 继续优化展开后的表达式。每个候选和调用方都有固定的代码增长预算，避免病态膨胀。
 
 ### `LocalForwardPass` (`local_forward.rs`)
 

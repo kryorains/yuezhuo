@@ -1,0 +1,59 @@
+int counter;
+
+int next() {
+    counter = counter + 1;
+    return counter;
+}
+
+int linear3(int r, int c, int n) {
+    return r * n + c;
+}
+
+int twice(int x) {
+    return x + x;
+}
+
+int return_param(int x) {
+    return x;
+}
+
+int return_const() {
+    return 42;
+}
+
+int first(int a, int b) {
+    return a;
+}
+
+int main() {
+    counter = 0;
+    int ordered = linear3(next(), next(), next());
+    putint(ordered);
+    putch(10);
+    putint(counter);
+    putch(10);
+
+    int x = getint();
+    putint(linear3(x, 2, 3));
+    putch(10);
+
+    int nested = linear3(twice(x), return_const(), return_param(3));
+    putint(nested);
+    putch(10);
+
+    putint(next());
+    putch(10);
+
+    int duplicated = twice(next());
+    putint(duplicated);
+    putch(10);
+    putint(counter);
+    putch(10);
+
+    int kept = first(next(), next());
+    putint(kept);
+    putch(10);
+    putint(counter);
+    putch(10);
+    return 0;
+}
