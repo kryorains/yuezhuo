@@ -6,7 +6,7 @@ mod inst;
 mod memory;
 mod phi_regs;
 
-use crate::codegen::common::IrFuncLayout;
+use crate::codegen::common::{IrFuncLayout, IrLocalRegs};
 use crate::ir::{Function, Module};
 use phi_regs::AArch64PhiRegs;
 
@@ -20,6 +20,8 @@ struct AArch64IrFuncEmitter<'a, 'b> {
     func: &'b Function,
     layout: IrFuncLayout,
     phi_regs: AArch64PhiRegs,
+    local_regs: IrLocalRegs,
+    value_use_counts: Vec<usize>,
     body: String,
     return_label: String,
 }

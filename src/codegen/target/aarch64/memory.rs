@@ -18,8 +18,67 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         ));
     }
 
-    pub(super) fn emit_gep(&mut self, result: ValueId, base: ValueId, indices: &[ValueId]) {
-        self.load_value(base);
+    pub(super) fn assigned_x_reg(&self, value: ValueId) -> Option<&'static str> {
+        self.phi_regs
+            .reg(value)
+            .or_else(|| self.local_regs.reg(value))
+    }
+
+    pub(super) fn assigned_w_reg(&self, value: ValueId) -> Option<String> {
+        self.assigned_x_reg(value).map(w_reg)
+    }
+
+    pub(super) fn emit_assigned_load(&mut self, result: ValueId, ptr: ValueId) -> bool {
+        let (Some(destination), Some(pointer)) =
+            (self.assigned_x_reg(result), self.assigned_x_reg(ptr))
+        else {
+            return false;
+        };
+        match self.func.value(result).ty {
+            Type::Ptr(_) => self
+                .body
+                .push_str(&format!("  ldr {}, [{}]\n", destination, pointer)),
+            _ => self
+                .body
+                .push_str(&format!("  ldr {}, [{}]\n", w_reg(destination), pointer)),
+        }
+        true
+    }
+
+    pub(super) fn emit_assigned_store(&mut self, ptr: ValueId, value: ValueId) -> bool {
+        let (Some(pointer), Some(source)) = (self.assigned_x_reg(ptr), self.assigned_x_reg(value))
+        else {
+            return false;
+        };
+        match self.func.value(value).ty {
+            Type::Ptr(_) => self
+                .body
+                .push_str(&format!("  str {}, [{}]\n", source, pointer)),
+            _ => self
+                .body
+                .push_str(&format!("  str {}, [{}]\n", w_reg(source), pointer)),
+        }
+        true
+    }
+
+    pub(super) fn emit_assigned_gep(
+        &mut self,
+        result: ValueId,
+        base: ValueId,
+        indices: &[ValueId],
+    ) -> bool {
+        let Some(destination) = self.assigned_x_reg(result) else {
+            return false;
+        };
+        if indices.len() != 1 {
+            return false;
+        }
+        let mut current_base = if let Some(base_reg) = self.assigned_x_reg(base) {
+            base_reg.to_string()
+        } else {
+            self.load_value_into(base, "x1");
+            "x1".to_string()
+        };
         let mut ty = self.func.value(base).ty.clone();
         for (idx, index) in indices.iter().enumerate() {
             let elem_ty = if indices.len() == 1 {
@@ -28,7 +87,49 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 gep_elem_type(&ty)
             };
             let stride = ir_size(&elem_ty).max(1);
-            self.push_x0();
+            let index_reg = if let Some(index_reg) = self.assigned_w_reg(*index) {
+                index_reg
+            } else {
+                self.load_value(*index);
+                "w0".to_string()
+            };
+            if (stride & (stride - 1)) == 0 && stride.trailing_zeros() <= 4 {
+                self.body.push_str(&format!(
+                    "  add {}, {}, {}, sxtw #{}\n",
+                    destination,
+                    current_base,
+                    index_reg,
+                    stride.trailing_zeros()
+                ));
+            } else {
+                self.body.push_str(&format!("  sxtw x0, {}\n", index_reg));
+                if stride != 1 {
+                    self.body.push_str(&mov_x_imm("x16", stride as i64));
+                    self.body.push_str("  mul x0, x0, x16\n");
+                }
+                self.body
+                    .push_str(&format!("  add {}, {}, x0\n", destination, current_base));
+            }
+            current_base = destination.to_string();
+            ty = if idx + 1 == indices.len() {
+                self.func.value(result).ty.clone()
+            } else {
+                elem_ty
+            };
+        }
+        true
+    }
+
+    pub(super) fn emit_gep(&mut self, result: ValueId, base: ValueId, indices: &[ValueId]) {
+        self.load_value_into(base, "x1");
+        let mut ty = self.func.value(base).ty.clone();
+        for (idx, index) in indices.iter().enumerate() {
+            let elem_ty = if indices.len() == 1 {
+                pointee(&self.func.value(result).ty).unwrap_or_else(|| gep_elem_type(&ty))
+            } else {
+                gep_elem_type(&ty)
+            };
+            let stride = ir_size(&elem_ty).max(1);
             self.load_value(*index);
             self.body.push_str("  sxtw x0, w0\n");
             if stride != 1 {
@@ -40,36 +141,62 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     self.body.push_str("  mul x0, x0, x16\n");
                 }
             }
-            self.pop_x1();
-            self.body.push_str("  add x0, x1, x0\n");
+            self.body.push_str("  add x1, x1, x0\n");
             ty = if idx + 1 == indices.len() {
                 self.func.value(result).ty.clone()
             } else {
                 elem_ty
             };
         }
+        self.body.push_str("  mov x0, x1\n");
     }
 
     pub(super) fn load_value(&mut self, value: ValueId) {
-        if let Some(reg) = self.phi_regs.reg(value) {
-            match self.func.value(value).ty {
-                Type::Ptr(_) => self.body.push_str(&format!("  mov x0, {}\n", reg)),
-                _ => self.body.push_str(&format!("  mov w0, {}\n", w_reg(reg))),
-            }
+        self.load_value_into(value, "x0");
+    }
+
+    pub(super) fn load_value_into(&mut self, value: ValueId, x_reg: &str) {
+        assert!(matches!(x_reg, "x0" | "x1" | "x2"));
+        let is_pointer = matches!(self.func.value(value).ty, Type::Ptr(_));
+        let value_reg = if is_pointer {
+            x_reg.to_string()
+        } else {
+            w_reg(x_reg)
+        };
+
+        if let Some(phi_reg) = self.phi_regs.reg(value) {
+            let phi_reg = if is_pointer {
+                phi_reg.to_string()
+            } else {
+                w_reg(phi_reg)
+            };
+            self.body
+                .push_str(&format!("  mov {}, {}\n", value_reg, phi_reg));
+            return;
+        }
+        if let Some(local_reg) = self.local_regs.reg(value) {
+            let local_reg = if is_pointer {
+                local_reg.to_string()
+            } else {
+                w_reg(local_reg)
+            };
+            self.body
+                .push_str(&format!("  mov {}, {}\n", value_reg, local_reg));
             return;
         }
 
         match &self.func.value(value).kind {
-            ValueKind::Const(value) => self.load_const(value),
+            ValueKind::Const(value) => self.load_const(value, &value_reg),
             ValueKind::Global(name) => self.body.push_str(&format!(
-                "  adrp x0, {}\n  add x0, x0, :lo12:{}\n",
-                name, name
+                "  adrp {0}, {1}\n  add {0}, {0}, :lo12:{1}\n",
+                x_reg, name
             )),
             _ => {
                 let offset = self.layout.offset(value);
-                match self.func.value(value).ty {
-                    Type::Ptr(_) => self.load_frame_x("x0", offset),
-                    _ => self.load_frame_w("w0", offset),
+                if is_pointer {
+                    self.load_frame_x(x_reg, offset);
+                } else {
+                    self.load_frame_w(&value_reg, offset);
                 }
             }
         }
@@ -95,13 +222,16 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         }
     }
 
-    fn load_const(&mut self, value: &Const) {
+    fn load_const(&mut self, value: &Const, reg: &str) {
         match value {
-            Const::Int(value) => self.body.push_str(&mov_w_imm("w0", *value)),
-            Const::Bool(value) => self.body.push_str(&mov_w_imm("w0", *value as i32)),
-            Const::Float(bits) => self.body.push_str(&mov_w_imm("w0", *bits as i32)),
-            Const::Zero(_) => self.body.push_str("  mov w0, wzr\n"),
-            Const::String(_) | Const::Array(_) => self.body.push_str("  mov w0, wzr\n"),
+            Const::Int(value) => self.body.push_str(&mov_w_imm(reg, *value)),
+            Const::Bool(value) => self.body.push_str(&mov_w_imm(reg, *value as i32)),
+            Const::Float(bits) => self.body.push_str(&mov_w_imm(reg, *bits as i32)),
+            Const::Zero(_) | Const::String(_) | Const::Array(_) => {
+                let zero_reg = if reg.starts_with('x') { "xzr" } else { "wzr" };
+                self.body
+                    .push_str(&format!("  mov {}, {}\n", reg, zero_reg));
+            }
         }
     }
 
@@ -127,6 +257,13 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             return;
         }
+        if let Some(reg) = self.local_regs.reg(value) {
+            match self.func.value(value).ty {
+                Type::Ptr(_) => self.body.push_str(&format!("  mov {}, x0\n", reg)),
+                _ => self.body.push_str(&format!("  mov {}, w0\n", w_reg(reg))),
+            }
+            return;
+        }
 
         let offset = self.layout.offset(value);
         match self.func.value(value).ty {
@@ -146,10 +283,6 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     pub(super) fn push_s0(&mut self) {
         self.body
             .push_str("  sub sp, sp, #16\n  str xzr, [sp]\n  str s0, [sp]\n");
-    }
-
-    pub(super) fn pop_s1(&mut self) {
-        self.body.push_str("  ldr s1, [sp]\n  add sp, sp, #16\n");
     }
 
     pub(super) fn adjust_sp(&mut self, amount: i32) {

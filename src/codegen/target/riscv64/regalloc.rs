@@ -1,16 +1,20 @@
+use crate::codegen::common::ir_value_use_counts;
 use crate::ir::{Function, InstKind, Terminator, Type, ValueId, ValueKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const INT_REGS: [&str; 11] = [
     "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
 ];
+const LEAF_CROSS_REGS: [&str; 6] = ["a2", "a3", "a4", "a5", "a6", "a7"];
 
 /// RISC-V64 的简化整数寄存器分配。
 ///
 /// 这里先不引入机器 IR，而是直接给 IR value 分配 callee-saved `s` 寄存器：
 /// - `s1..s11` 跨 call 保持，所以 non-leaf function 也能安全使用；
 /// - 只分配 i1/i32/ptr，不碰 f32；
-/// - 用线性位置估算 live interval，不重叠的区间可以复用同一个寄存器；
+/// - 有 phi 时先给 phi 结果分配互不复用的寄存器，再把剩余寄存器用于跨块 load/GEP；
+/// - 叶函数还可把 `a2..a7` 用作无需保存的跨块寄存器；
+/// - 无 phi 时用线性位置估算 live interval，不重叠的区间可以复用寄存器；
 /// - 没有寄存器时回退到原来的栈槽路径。
 pub(super) struct Riscv64RegAlloc {
     regs: HashMap<ValueId, &'static str>,
@@ -20,10 +24,46 @@ pub(super) struct Riscv64RegAlloc {
 impl Riscv64RegAlloc {
     pub(super) fn new(func: &Function) -> Self {
         if has_phi(func) {
-            return Self {
-                regs: HashMap::new(),
-                used_regs: Vec::new(),
-            };
+            let mut regs = HashMap::new();
+            let mut used_regs = Vec::new();
+
+            'blocks: for block in &func.blocks {
+                for inst in &block.insts {
+                    if used_regs.len() == INT_REGS.len() {
+                        break 'blocks;
+                    }
+                    if !matches!(inst.kind, InstKind::Phi { .. }) {
+                        continue;
+                    }
+                    let Some(result) = inst.result else {
+                        continue;
+                    };
+                    if !matches!(func.value(result).ty, Type::I1 | Type::I32 | Type::Ptr(_)) {
+                        continue;
+                    }
+
+                    let reg = INT_REGS[used_regs.len()];
+                    regs.insert(result, reg);
+                    used_regs.push(reg);
+                }
+            }
+            let use_counts = ir_value_use_counts(func);
+            coalesce_phi_incomings(func, &mut regs, &use_counts);
+            let mut cross_regs = INT_REGS[used_regs.len()..].to_vec();
+            if is_leaf(func) {
+                cross_regs.extend(LEAF_CROSS_REGS);
+            }
+            for (value, reg) in cross_block_memory_candidates(func, &regs)
+                .into_iter()
+                .zip(cross_regs)
+            {
+                regs.insert(value, reg);
+                if INT_REGS.contains(&reg) {
+                    used_regs.push(reg);
+                }
+            }
+
+            return Self { regs, used_regs };
         }
 
         let intervals = collect_intervals(func);
@@ -83,6 +123,15 @@ struct ActiveInterval {
     reg: &'static str,
 }
 
+fn is_leaf(func: &Function) -> bool {
+    !func.blocks.iter().any(|block| {
+        block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::Call { .. }))
+    })
+}
+
 fn has_phi(func: &Function) -> bool {
     func.blocks.iter().any(|block| {
         block
@@ -93,12 +142,20 @@ fn has_phi(func: &Function) -> bool {
 }
 
 fn collect_intervals(func: &Function) -> Vec<LiveInterval> {
+    let block_stride = func
+        .blocks
+        .iter()
+        .map(|block| block.insts.len())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(2)
+        .saturating_mul(2);
     let mut starts = vec![0usize; func.values.len()];
     let mut ends = vec![0usize; func.values.len()];
     let mut use_counts = vec![0usize; func.values.len()];
 
     for (idx, value) in func.values.iter().enumerate() {
-        starts[idx] = value_def_pos(value);
+        starts[idx] = value_def_pos(value, block_stride);
         ends[idx] = starts[idx];
     }
 
@@ -110,19 +167,19 @@ fn collect_intervals(func: &Function) -> Vec<LiveInterval> {
                 // 否则循环回边上的定义会被误判成很短的 live range。
                 for (pred, value) in incomings {
                     use_counts[value.0] += 1;
-                    ends[value.0] = ends[value.0].max(term_pos(pred.0));
+                    ends[value.0] = ends[value.0].max(term_pos(pred.0, block_stride));
                 }
                 continue;
             }
 
-            let pos = inst_pos(block_idx, inst_idx);
+            let pos = inst_pos(block_idx, inst_idx, block_stride);
             for value in inst_uses(&inst.kind) {
                 use_counts[value.0] += 1;
                 ends[value.0] = ends[value.0].max(pos);
             }
         }
         if let Some(terminator) = &func.blocks[block_idx].terminator {
-            let pos = term_pos(block_idx);
+            let pos = term_pos(block_idx, block_stride);
             for value in terminator_uses(terminator) {
                 use_counts[value.0] += 1;
                 ends[value.0] = ends[value.0].max(pos);
@@ -191,19 +248,19 @@ fn is_int_reg_candidate(func: &Function, value_info: &crate::ir::Value, value: V
     }
 }
 
-fn value_def_pos(value: &crate::ir::Value) -> usize {
+fn value_def_pos(value: &crate::ir::Value, block_stride: usize) -> usize {
     match value.kind {
         ValueKind::Param | ValueKind::Const(_) | ValueKind::Global(_) => 0,
-        ValueKind::Inst(block, inst_idx) => inst_pos(block.0, inst_idx),
+        ValueKind::Inst(block, inst_idx) => inst_pos(block.0, inst_idx, block_stride),
     }
 }
 
-fn inst_pos(block_idx: usize, inst_idx: usize) -> usize {
-    block_idx * 10_000 + inst_idx * 2 + 1
+fn inst_pos(block_idx: usize, inst_idx: usize, block_stride: usize) -> usize {
+    block_idx * block_stride + inst_idx * 2 + 1
 }
 
-fn term_pos(block_idx: usize) -> usize {
-    block_idx * 10_000 + 9_999
+fn term_pos(block_idx: usize, block_stride: usize) -> usize {
+    (block_idx + 1) * block_stride - 1
 }
 
 fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
@@ -233,6 +290,159 @@ fn terminator_uses(terminator: &Terminator) -> Vec<ValueId> {
         Terminator::Branch { cond, .. } => vec![*cond],
         Terminator::Return(None) | Terminator::Jump(_) => Vec::new(),
     }
+}
+
+fn cross_block_memory_candidates(
+    func: &Function,
+    assigned: &HashMap<ValueId, &'static str>,
+) -> Vec<ValueId> {
+    let mut scores = vec![0usize; func.values.len()];
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.insts {
+            for operand in inst_uses(&inst.kind) {
+                if matches!(
+                    func.value(operand).kind,
+                    ValueKind::Inst(owner, _) if owner.0 != block_idx
+                ) {
+                    scores[operand.0] += 1;
+                }
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            for operand in terminator_uses(terminator) {
+                if matches!(
+                    func.value(operand).kind,
+                    ValueKind::Inst(owner, _) if owner.0 != block_idx
+                ) {
+                    scores[operand.0] += 1;
+                }
+            }
+        }
+    }
+
+    let mut candidates = func
+        .values
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, value)| {
+            let value_id = ValueId(idx);
+            if assigned.contains_key(&value_id)
+                || scores[idx] == 0
+                || !matches!(value.ty, Type::I1 | Type::I32 | Type::Ptr(_))
+            {
+                return None;
+            }
+            let ValueKind::Inst(block, inst_idx) = value.kind else {
+                return None;
+            };
+            matches!(
+                func.blocks.get(block.0)?.insts.get(inst_idx)?.kind,
+                InstKind::Load { .. } | InstKind::Gep { .. }
+            )
+            .then_some((value_id, scores[idx]))
+        })
+        .collect::<Vec<_>>();
+    candidates
+        .sort_by_key(|(value, score)| (std::cmp::Reverse(*score), std::cmp::Reverse(value.0)));
+    candidates.into_iter().map(|(value, _)| value).collect()
+}
+
+fn coalesce_phi_incomings(
+    func: &Function,
+    regs: &mut HashMap<ValueId, &'static str>,
+    use_counts: &[usize],
+) {
+    let local_last_uses = local_last_uses(func);
+    let edge_phi_uses = edge_phi_uses(func);
+    let phis = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter_map(|inst| {
+            let InstKind::Phi { incomings } = &inst.kind else {
+                return None;
+            };
+            let result = inst.result?;
+            let reg = regs.get(&result).copied()?;
+            Some((result, reg, incomings.clone()))
+        })
+        .collect::<Vec<_>>();
+
+    for (phi, reg, incomings) in phis {
+        for (pred, incoming) in incomings {
+            if regs.contains_key(&incoming)
+                || use_counts.get(incoming.0) != Some(&1)
+                || func.value(incoming).ty != func.value(phi).ty
+            {
+                continue;
+            }
+            let ValueKind::Inst(owner, inst_idx) = func.value(incoming).kind else {
+                continue;
+            };
+            if owner != pred
+                || !matches!(
+                    func.blocks.get(owner.0).and_then(|block| block.insts.get(inst_idx)),
+                    Some(crate::ir::Inst {
+                        result: Some(result),
+                        ..
+                    }) if *result == incoming
+                )
+                || phi_used_after(pred, inst_idx, phi, &local_last_uses, &edge_phi_uses)
+            {
+                continue;
+            }
+            regs.insert(incoming, reg);
+        }
+    }
+}
+
+fn local_last_uses(func: &Function) -> HashMap<(usize, usize), usize> {
+    let mut last_uses = HashMap::new();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.insts.iter().enumerate() {
+            if matches!(inst.kind, InstKind::Phi { .. }) {
+                continue;
+            }
+            for operand in inst_uses(&inst.kind) {
+                last_uses.insert((block_idx, operand.0), inst_idx);
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            for operand in terminator_uses(terminator) {
+                last_uses.insert((block_idx, operand.0), block.insts.len());
+            }
+        }
+    }
+    last_uses
+}
+
+fn edge_phi_uses(func: &Function) -> HashSet<(usize, usize)> {
+    func.blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter_map(|inst| match &inst.kind {
+            InstKind::Phi { incomings } => Some(incomings),
+            _ => None,
+        })
+        .flat_map(|incomings| {
+            incomings
+                .iter()
+                .map(|(pred, incoming)| (pred.0, incoming.0))
+        })
+        .collect()
+}
+
+fn phi_used_after(
+    block: crate::ir::BlockId,
+    inst_idx: usize,
+    phi: ValueId,
+    local_last_uses: &HashMap<(usize, usize), usize>,
+    edge_phi_uses: &HashSet<(usize, usize)>,
+) -> bool {
+    local_last_uses
+        .get(&(block.0, phi.0))
+        .is_some_and(|last_use| *last_use > inst_idx)
+        || edge_phi_uses.contains(&(block.0, phi.0))
 }
 
 fn align_to(value: i32, align: i32) -> i32 {

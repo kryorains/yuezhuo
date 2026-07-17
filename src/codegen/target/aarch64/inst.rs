@@ -22,18 +22,20 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Load { ptr } => {
                 let result = inst.result.unwrap();
-                self.load_value(*ptr);
-                let ty = self.func.value(result).ty.clone();
-                self.load_indirect(&ty);
-                self.store_result(result);
+                if !self.emit_assigned_load(result, *ptr) {
+                    self.load_value(*ptr);
+                    let ty = self.func.value(result).ty.clone();
+                    self.load_indirect(&ty);
+                    self.store_result(result);
+                }
             }
             InstKind::Store { ptr, value } => {
-                self.load_value(*ptr);
-                self.push_x0();
-                self.load_value(*value);
-                self.pop_x1();
-                let ty = self.func.value(*value).ty.clone();
-                self.store_indirect(&ty);
+                if !self.emit_assigned_store(*ptr, *value) {
+                    self.load_value_into(*ptr, "x1");
+                    self.load_value(*value);
+                    let ty = self.func.value(*value).ty.clone();
+                    self.store_indirect(&ty);
+                }
             }
             InstKind::MemZero { ptr, bytes } => self.emit_memzero(*ptr, *bytes),
             InstKind::Unary { op, value } => {
@@ -43,6 +45,36 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Binary { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
+                if *op == BinaryOp::Imul && self.fused_madd_user(result).is_some() {
+                    return;
+                }
+                if *op == BinaryOp::Iadd {
+                    if let Some((mul_lhs, mul_rhs, addend)) =
+                        self.fused_madd_operands(result, *lhs, *rhs)
+                    {
+                        if let (Some(destination), Some(mul_lhs), Some(mul_rhs), Some(addend)) = (
+                            self.assigned_w_reg(result),
+                            self.assigned_w_reg(mul_lhs),
+                            self.assigned_w_reg(mul_rhs),
+                            self.assigned_w_reg(addend),
+                        ) {
+                            self.body.push_str(&format!(
+                                "  madd {}, {}, {}, {}\n",
+                                destination, mul_lhs, mul_rhs, addend
+                            ));
+                        } else {
+                            self.load_value_into(mul_lhs, "x1");
+                            self.load_value(mul_rhs);
+                            self.load_value_into(addend, "x2");
+                            self.body.push_str("  madd w0, w1, w0, w2\n");
+                            self.store_result(result);
+                        }
+                        return;
+                    }
+                }
+                if self.emit_assigned_binary_imm(result, *op, *lhs, *rhs) {
+                    return;
+                }
                 self.emit_binary(*op, *lhs, *rhs);
                 self.store_result(result);
             }
@@ -65,8 +97,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Gep { base, indices } => {
                 let result = inst.result.unwrap();
-                self.emit_gep(result, *base, indices);
-                self.store_result(result);
+                if !self.emit_assigned_gep(result, *base, indices) {
+                    self.emit_gep(result, *base, indices);
+                    self.store_result(result);
+                }
             }
             InstKind::Call { name, args } => {
                 let ret = self.emit_call(name, args);
@@ -102,16 +136,19 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 then_target,
                 else_target,
             } => {
-                let else_edge = self.parent.ctx.fresh_label("else_edge");
-                if let Some((op, lhs, rhs)) = self.direct_branch_icmp(*cond) {
-                    self.emit_int_compare(lhs, rhs);
-                    self.body
-                        .push_str(&format!("  b.{} {}\n", inverse_cmp_cc(op), else_edge));
-                } else {
-                    self.load_value(*cond);
-                    self.body
-                        .push_str(&format!("  cmp w0, #0\n  beq {}\n", else_edge));
+                if !self.edge_has_phi_copy(block_idx, then_target.0)
+                    && !self.edge_has_phi_copy(block_idx, else_target.0)
+                {
+                    self.emit_branch_if_false(*cond, self.block_label(else_target.0));
+                    if then_target.0 != block_idx + 1 {
+                        self.body
+                            .push_str(&format!("  b {}\n", self.block_label(then_target.0)));
+                    }
+                    return;
                 }
+
+                let else_edge = self.parent.ctx.fresh_label("else_edge");
+                self.emit_branch_if_false(*cond, else_edge.clone());
                 self.emit_phi_copies(block_idx, then_target.0);
                 self.body.push_str(&format!(
                     "  b {}\n{}:\n",
@@ -142,8 +179,18 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     .iter()
                     .find(|(pred, _)| pred.0 == pred_idx)
                     .map(|(_, value)| (result, *value))
+                    .filter(|(result, value)| {
+                        self.phi_regs.reg(*result) != self.phi_regs.reg(*value)
+                            || self.phi_regs.reg(*result).is_none()
+                    })
             })
             .collect::<Vec<_>>();
+
+        if let [(result, value)] = copies.as_slice() {
+            self.load_value(*value);
+            self.store_result(*result);
+            return;
+        }
 
         for (_, value) in &copies {
             self.load_value(*value);
@@ -153,6 +200,78 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             self.pop_x1();
             self.body.push_str("  mov x0, x1\n");
             self.store_result(*result);
+        }
+    }
+
+    fn edge_has_phi_copy(&self, pred_idx: usize, target_idx: usize) -> bool {
+        self.func
+            .block(BlockId(target_idx))
+            .insts
+            .iter()
+            .any(|inst| {
+                matches!(
+                    &inst.kind,
+                    InstKind::Phi { incomings }
+                        if incomings.iter().any(|(pred, _)| pred.0 == pred_idx)
+                )
+            })
+    }
+
+    fn emit_branch_if_false(&mut self, cond: ValueId, target: String) {
+        if let Some((op, lhs, rhs)) = self.direct_branch_icmp(cond) {
+            self.emit_int_compare(lhs, rhs);
+            self.body
+                .push_str(&format!("  b.{} {}\n", inverse_cmp_cc(op), target));
+        } else {
+            self.load_value(cond);
+            self.body
+                .push_str(&format!("  cmp w0, #0\n  beq {}\n", target));
+        }
+    }
+
+    fn fused_madd_user(&self, multiply: ValueId) -> Option<ValueId> {
+        if self.value_use_counts[multiply.0] != 1 {
+            return None;
+        }
+        let ValueKind::Inst(block, inst_idx) = self.func.value(multiply).kind else {
+            return None;
+        };
+        let next = self.func.block(block).insts.get(inst_idx + 1)?;
+        let result = next.result?;
+        matches!(
+            next.kind,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs,
+                rhs,
+            } if lhs == multiply || rhs == multiply
+        )
+        .then_some(result)
+    }
+
+    fn fused_madd_operands(
+        &self,
+        add: ValueId,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Option<(ValueId, ValueId, ValueId)> {
+        let (multiply, addend) = if self.fused_madd_user(lhs) == Some(add) {
+            (lhs, rhs)
+        } else if self.fused_madd_user(rhs) == Some(add) {
+            (rhs, lhs)
+        } else {
+            return None;
+        };
+        let ValueKind::Inst(block, inst_idx) = self.func.value(multiply).kind else {
+            return None;
+        };
+        match self.func.block(block).insts.get(inst_idx)?.kind {
+            InstKind::Binary {
+                op: BinaryOp::Imul,
+                lhs,
+                rhs,
+            } => Some((lhs, rhs, addend)),
+            _ => None,
         }
     }
 
@@ -167,6 +286,66 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         }
     }
 
+    fn emit_assigned_binary_imm(
+        &mut self,
+        result: ValueId,
+        op: BinaryOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> bool {
+        let Some(destination) = self.assigned_w_reg(result) else {
+            return false;
+        };
+        match op {
+            BinaryOp::Iadd => {
+                if let (Some(source), Some(imm)) = (
+                    self.assigned_w_reg(lhs),
+                    const_i32(self.func, rhs).filter(|imm| fits_addsub_imm(*imm)),
+                ) {
+                    self.body
+                        .push_str(&format!("  add {}, {}, #{}\n", destination, source, imm));
+                    return true;
+                }
+                if let (Some(source), Some(imm)) = (
+                    self.assigned_w_reg(rhs),
+                    const_i32(self.func, lhs).filter(|imm| fits_addsub_imm(*imm)),
+                ) {
+                    self.body
+                        .push_str(&format!("  add {}, {}, #{}\n", destination, source, imm));
+                    return true;
+                }
+            }
+            BinaryOp::Isub => {
+                if let (Some(source), Some(imm)) = (
+                    self.assigned_w_reg(lhs),
+                    const_i32(self.func, rhs).filter(|imm| fits_addsub_imm(*imm)),
+                ) {
+                    self.body
+                        .push_str(&format!("  sub {}, {}, #{}\n", destination, source, imm));
+                    return true;
+                }
+            }
+            BinaryOp::Imul => {
+                if let (Some(source), Some(shift)) =
+                    (self.assigned_w_reg(lhs), pow2_shift(self.func, rhs))
+                {
+                    self.body
+                        .push_str(&format!("  lsl {}, {}, #{}\n", destination, source, shift));
+                    return true;
+                }
+                if let (Some(source), Some(shift)) =
+                    (self.assigned_w_reg(rhs), pow2_shift(self.func, lhs))
+                {
+                    self.body
+                        .push_str(&format!("  lsl {}, {}, #{}\n", destination, source, shift));
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn emit_binary(&mut self, op: BinaryOp, lhs: ValueId, rhs: ValueId) {
         if self.emit_binary_imm(op, lhs, rhs) {
             return;
@@ -174,10 +353,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
         match op {
             BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => {
-                self.load_float_value(lhs, "s0");
-                self.push_s0();
+                self.load_float_value(lhs, "s1");
                 self.load_float_value(rhs, "s0");
-                self.pop_s1();
                 match op {
                     BinaryOp::Fadd => self.body.push_str("  fadd s0, s1, s0\n"),
                     BinaryOp::Fsub => self.body.push_str("  fsub s0, s1, s0\n"),
@@ -188,12 +365,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 self.body.push_str("  fmov w0, s0\n");
             }
             BinaryOp::And | BinaryOp::Or => {
-                self.load_value(lhs);
-                self.body.push_str("  cmp w0, #0\n  cset w0, ne\n");
-                self.push_x0();
+                self.load_value_into(lhs, "x1");
+                self.body.push_str("  cmp w1, #0\n  cset w1, ne\n");
                 self.load_value(rhs);
                 self.body.push_str("  cmp w0, #0\n  cset w0, ne\n");
-                self.pop_x1();
                 if op == BinaryOp::And {
                     self.body.push_str("  and w0, w1, w0\n");
                 } else {
@@ -201,10 +376,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 }
             }
             _ => {
-                self.load_value(lhs);
-                self.push_x0();
+                self.load_value_into(lhs, "x1");
                 self.load_value(rhs);
-                self.pop_x1();
                 match op {
                     BinaryOp::Iadd => self.body.push_str("  add w0, w1, w0\n"),
                     BinaryOp::Isub => self.body.push_str("  sub w0, w1, w0\n"),
@@ -315,7 +488,7 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     fn direct_branch_icmp(&self, value: ValueId) -> Option<(CmpOp, ValueId, ValueId)> {
-        if value_use_count(self.func, value) != 1 {
+        if self.value_use_counts[value.0] != 1 {
             return None;
         }
         let ValueKind::Inst(block, inst_idx) = self.func.value(value).kind else {
@@ -340,11 +513,13 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             return;
         }
 
-        self.load_value(lhs);
-        self.push_x0();
+        self.load_value_into(lhs, "x1");
         self.load_value(rhs);
-        self.pop_x1();
-        self.body.push_str("  cmp w1, w0\n");
+        if matches!(self.func.value(lhs).ty, Type::Ptr(_)) {
+            self.body.push_str("  cmp x1, x0\n");
+        } else {
+            self.body.push_str("  cmp w1, w0\n");
+        }
     }
 
     fn emit_icmp(&mut self, op: CmpOp, lhs: ValueId, rhs: ValueId) {
@@ -361,10 +536,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_fcmp(&mut self, op: CmpOp, lhs: ValueId, rhs: ValueId) {
-        self.load_float_value(lhs, "s0");
-        self.push_s0();
+        self.load_float_value(lhs, "s1");
         self.load_float_value(rhs, "s0");
-        self.pop_s1();
         self.body.push_str("  fcmp s1, s0\n");
         let cc = match op {
             CmpOp::Lt => "lt",
@@ -428,50 +601,5 @@ fn inverse_cmp_cc(op: CmpOp) -> &'static str {
         CmpOp::Ge => "lt",
         CmpOp::Eq => "ne",
         CmpOp::Ne => "eq",
-    }
-}
-
-fn value_use_count(func: &crate::ir::Function, value: ValueId) -> usize {
-    let mut count = 0;
-    for block in &func.blocks {
-        for inst in &block.insts {
-            count += inst_use_count(&inst.kind, value);
-        }
-        if let Some(terminator) = &block.terminator {
-            count += terminator_use_count(terminator, value);
-        }
-    }
-    count
-}
-
-fn inst_use_count(kind: &InstKind, value: ValueId) -> usize {
-    match kind {
-        InstKind::Nop | InstKind::Alloca { .. } => 0,
-        InstKind::Phi { incomings } => incomings
-            .iter()
-            .filter(|(_, incoming)| *incoming == value)
-            .count(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => (*ptr == value) as usize,
-        InstKind::Store { ptr, value: stored } => {
-            (*ptr == value) as usize + (*stored == value) as usize
-        }
-        InstKind::Unary { value: operand, .. } | InstKind::Cast { value: operand, .. } => {
-            (*operand == value) as usize
-        }
-        InstKind::Binary { lhs, rhs, .. }
-        | InstKind::Icmp { lhs, rhs, .. }
-        | InstKind::Fcmp { lhs, rhs, .. } => (*lhs == value) as usize + (*rhs == value) as usize,
-        InstKind::Gep { base, indices } => {
-            (*base == value) as usize + indices.iter().filter(|index| **index == value).count()
-        }
-        InstKind::Call { args, .. } => args.iter().filter(|arg| **arg == value).count(),
-    }
-}
-
-fn terminator_use_count(terminator: &Terminator, value: ValueId) -> usize {
-    match terminator {
-        Terminator::Return(Some(returned)) => (*returned == value) as usize,
-        Terminator::Branch { cond, .. } => (*cond == value) as usize,
-        Terminator::Return(None) | Terminator::Jump(_) => 0,
     }
 }

@@ -17,8 +17,119 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         ));
     }
 
+    pub(super) fn assigned_reg(&self, value: ValueId) -> Option<&'static str> {
+        self.regalloc
+            .reg(value)
+            .or_else(|| self.local_regs.reg(value))
+    }
+
+    pub(super) fn emit_assigned_load(&mut self, result: ValueId, ptr: ValueId) -> bool {
+        let (Some(destination), Some(pointer)) =
+            (self.assigned_reg(result), self.assigned_reg(ptr))
+        else {
+            return false;
+        };
+        match self.func.value(result).ty {
+            Type::Ptr(_) => self
+                .body
+                .push_str(&format!("  ld {}, 0({})\n", destination, pointer)),
+            _ => self
+                .body
+                .push_str(&format!("  lw {}, 0({})\n", destination, pointer)),
+        }
+        true
+    }
+
+    pub(super) fn emit_assigned_store(&mut self, ptr: ValueId, value: ValueId) -> bool {
+        let (Some(pointer), Some(source)) = (self.assigned_reg(ptr), self.assigned_reg(value))
+        else {
+            return false;
+        };
+        match self.func.value(value).ty {
+            Type::Ptr(_) => self
+                .body
+                .push_str(&format!("  sd {}, 0({})\n", source, pointer)),
+            _ => self
+                .body
+                .push_str(&format!("  sw {}, 0({})\n", source, pointer)),
+        }
+        true
+    }
+
+    pub(super) fn emit_assigned_gep(
+        &mut self,
+        result: ValueId,
+        base: ValueId,
+        indices: &[ValueId],
+    ) -> bool {
+        let Some(destination) = self.assigned_reg(result) else {
+            return false;
+        };
+        if indices.len() != 1 {
+            return false;
+        }
+        let mut current_base = if let Some(base_reg) = self.assigned_reg(base) {
+            base_reg
+        } else {
+            self.load_value_into(base, "a1");
+            "a1"
+        };
+        let mut ty = self.func.value(base).ty.clone();
+        if indices.is_empty() {
+            self.body
+                .push_str(&format!("  mv {}, {}\n", destination, current_base));
+            return true;
+        }
+        for (idx, index) in indices.iter().enumerate() {
+            let elem_ty = if indices.len() == 1 {
+                pointee(&self.func.value(result).ty).unwrap_or_else(|| gep_elem_type(&ty))
+            } else {
+                gep_elem_type(&ty)
+            };
+            let stride = ir_size(&elem_ty).max(1);
+            let index_reg = if let Some(index_reg) = self.assigned_reg(*index) {
+                index_reg
+            } else {
+                self.load_value(*index);
+                "a0"
+            };
+            if current_base == destination && stride != 1 {
+                self.body.push_str(&format!("  mv a1, {}\n", current_base));
+                current_base = "a1";
+            }
+            if stride == 1 {
+                self.body.push_str(&format!(
+                    "  add {}, {}, {}\n",
+                    destination, current_base, index_reg
+                ));
+            } else if (stride & (stride - 1)) == 0 {
+                self.body.push_str(&format!(
+                    "  slli {}, {}, {}\n  add {}, {}, {}\n",
+                    destination,
+                    index_reg,
+                    stride.trailing_zeros(),
+                    destination,
+                    current_base,
+                    destination
+                ));
+            } else {
+                self.body.push_str(&format!(
+                    "  li t0, {}\n  mul {}, {}, t0\n  add {}, {}, {}\n",
+                    stride, destination, index_reg, destination, current_base, destination
+                ));
+            }
+            current_base = destination;
+            ty = if idx + 1 == indices.len() {
+                self.func.value(result).ty.clone()
+            } else {
+                elem_ty
+            };
+        }
+        true
+    }
+
     pub(super) fn emit_gep(&mut self, result: ValueId, base: ValueId, indices: &[ValueId]) {
-        self.load_value(base);
+        self.load_value_into(base, "a1");
         let mut ty = self.func.value(base).ty.clone();
         for (idx, index) in indices.iter().enumerate() {
             let elem_ty = if indices.len() == 1 {
@@ -27,7 +138,6 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 gep_elem_type(&ty)
             };
             let stride = ir_size(&elem_ty).max(1);
-            self.push_x0();
             self.load_value(*index);
             if stride != 1 {
                 if stride > 0 && (stride & (stride - 1)) == 0 {
@@ -38,30 +148,44 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                         .push_str(&format!("  li t0, {}\n  mul a0, a0, t0\n", stride));
                 }
             }
-            self.pop_x1();
-            self.body.push_str("  add a0, a1, a0\n");
+            self.body.push_str("  add a1, a1, a0\n");
             ty = if idx + 1 == indices.len() {
                 self.func.value(result).ty.clone()
             } else {
                 elem_ty
             };
         }
+        self.body.push_str("  mv a0, a1\n");
     }
 
     pub(super) fn load_value(&mut self, value: ValueId) {
+        self.load_value_into(value, "a0");
+    }
+
+    pub(super) fn load_value_into(&mut self, value: ValueId, destination: &str) {
+        debug_assert!(matches!(destination, "a0" | "a1"));
+
         if let Some(reg) = self.regalloc.reg(value) {
-            self.body.push_str(&format!("  mv a0, {}\n", reg));
+            self.body
+                .push_str(&format!("  mv {}, {}\n", destination, reg));
+            return;
+        }
+        if let Some(reg) = self.local_regs.reg(value) {
+            self.body
+                .push_str(&format!("  mv {}, {}\n", destination, reg));
             return;
         }
 
         match &self.func.value(value).kind {
-            ValueKind::Const(value) => self.load_const(value),
-            ValueKind::Global(name) => self.body.push_str(&format!("  la a0, {}\n", name)),
+            ValueKind::Const(value) => self.load_const_into(value, destination),
+            ValueKind::Global(name) => self
+                .body
+                .push_str(&format!("  la {}, {}\n", destination, name)),
             _ => {
                 let offset = self.layout.offset(value);
                 match self.func.value(value).ty {
-                    Type::Ptr(_) => self.load_frame_x("a0", offset),
-                    _ => self.load_frame_w("a0", offset),
+                    Type::Ptr(_) => self.load_frame_x(destination, offset),
+                    _ => self.load_frame_w(destination, offset),
                 }
             }
         }
@@ -85,14 +209,15 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         }
     }
 
-    fn load_const(&mut self, value: &Const) {
-        match value {
-            Const::Int(value) => self.body.push_str(&format!("  li a0, {}\n", value)),
-            Const::Bool(value) => self.body.push_str(&format!("  li a0, {}\n", *value as i32)),
-            Const::Float(bits) => self.body.push_str(&format!("  li a0, {}\n", *bits as i32)),
-            Const::Zero(_) => self.body.push_str("  li a0, 0\n"),
-            Const::String(_) | Const::Array(_) => self.body.push_str("  li a0, 0\n"),
-        }
+    fn load_const_into(&mut self, value: &Const, destination: &str) {
+        let value = match value {
+            Const::Int(value) => *value,
+            Const::Bool(value) => *value as i32,
+            Const::Float(bits) => *bits as i32,
+            Const::Zero(_) | Const::String(_) | Const::Array(_) => 0,
+        };
+        self.body
+            .push_str(&format!("  li {}, {}\n", destination, value));
     }
 
     pub(super) fn load_indirect(&mut self, ty: &Type) {
@@ -111,6 +236,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
     pub(super) fn store_result(&mut self, value: ValueId) {
         if let Some(reg) = self.regalloc.reg(value) {
+            self.body.push_str(&format!("  mv {}, a0\n", reg));
+            return;
+        }
+        if let Some(reg) = self.local_regs.reg(value) {
             self.body.push_str(&format!("  mv {}, a0\n", reg));
             return;
         }
@@ -133,10 +262,6 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     pub(super) fn push_s0(&mut self) {
         self.body
             .push_str("  addi sp, sp, -16\n  sd zero, 0(sp)\n  fsw fa0, 0(sp)\n");
-    }
-
-    pub(super) fn pop_s1(&mut self) {
-        self.body.push_str("  flw fa1, 0(sp)\n  addi sp, sp, 16\n");
     }
 
     pub(super) fn adjust_sp(&mut self, amount: i32) {
