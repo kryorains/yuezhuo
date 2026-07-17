@@ -127,6 +127,44 @@ impl Function {
         result
     }
 
+    /// Inserts an instruction at an arbitrary position and keeps every
+    /// instruction-backed value location consistent.
+    pub fn insert_inst(
+        &mut self,
+        block: BlockId,
+        inst_idx: usize,
+        kind: InstKind,
+        result_ty: Option<Type>,
+    ) -> Option<ValueId> {
+        let inst_len = self.block(block).insts.len();
+        assert!(
+            inst_idx <= inst_len,
+            "instruction insertion index out of bounds"
+        );
+        if inst_idx == inst_len {
+            return self.append_inst(block, kind, result_ty);
+        }
+        for value in &mut self.values {
+            if let ValueKind::Inst(owner, owner_idx) = &mut value.kind {
+                if *owner == block && *owner_idx >= inst_idx {
+                    *owner_idx += 1;
+                }
+            }
+        }
+
+        let result = result_ty.map(|ty| {
+            self.add_value(Value {
+                name: None,
+                ty,
+                kind: ValueKind::Inst(block, inst_idx),
+            })
+        });
+        self.block_mut(block)
+            .insts
+            .insert(inst_idx, Inst { result, kind });
+        result
+    }
+
     pub fn set_terminator(&mut self, block: BlockId, terminator: Terminator) {
         let slot = &mut self.block_mut(block).terminator;
         if slot.is_some() {
@@ -344,5 +382,56 @@ impl fmt::Display for BlockId {
 impl fmt::Display for ValueId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "%{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inserting_an_instruction_keeps_value_locations_consistent() {
+        let mut func = Function::new("insert", Type::I32);
+        let one = func.add_const(Const::Int(1));
+        let first = func
+            .append_inst(
+                func.entry,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: one,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let last = func
+            .append_inst(
+                func.entry,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: first,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let middle = func
+            .insert_inst(
+                func.entry,
+                1,
+                InstKind::Binary {
+                    op: BinaryOp::Imul,
+                    lhs: first,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(func.entry, Terminator::Return(Some(last)));
+
+        assert_eq!(func.value(first).kind, ValueKind::Inst(func.entry, 0));
+        assert_eq!(func.value(middle).kind, ValueKind::Inst(func.entry, 1));
+        assert_eq!(func.value(last).kind, ValueKind::Inst(func.entry, 2));
+        assert!(func.verify().is_ok());
     }
 }

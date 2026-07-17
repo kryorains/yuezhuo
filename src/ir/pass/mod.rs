@@ -18,6 +18,7 @@ mod tail_recursion;
 mod util;
 
 use super::Module;
+use bit_idiom::LoopIdiomPass;
 use const_fold::ConstFoldPass;
 use cse::CsePass;
 use dce::DcePass;
@@ -73,6 +74,8 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
                 pipeline.add(SimpleLoopUnrollPass::new());
             }
             pipeline.add(InstCombinePass::new());
+            pipeline.add(ConstFoldPass::new());
+            pipeline.add(LoopIdiomPass::new());
             pipeline.add(ConstFoldPass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());

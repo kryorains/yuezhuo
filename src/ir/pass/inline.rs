@@ -327,13 +327,14 @@ fn inline_call_at(
         }
         let result = inst.result.expect("validated inline instruction result");
         let kind = clone_inline_inst(func, callee, &inst.kind, &mut values);
-        let new_result = insert_inst(
-            func,
-            block,
-            inst_idx + inserted,
-            kind,
-            callee.value(result).ty.clone(),
-        );
+        let new_result = func
+            .insert_inst(
+                block,
+                inst_idx + inserted,
+                kind,
+                Some(callee.value(result).ty.clone()),
+            )
+            .unwrap();
         values.insert(result, new_result);
         inserted += 1;
     }
@@ -406,35 +407,4 @@ fn get_or_add_const(func: &mut Function, constant: crate::ir::Const) -> ValueId 
         })
         .map(ValueId)
         .unwrap_or_else(|| func.add_const(constant))
-}
-
-fn insert_inst(
-    func: &mut Function,
-    block: BlockId,
-    inst_idx: usize,
-    kind: InstKind,
-    result_ty: Type,
-) -> ValueId {
-    for value in &mut func.values {
-        if let ValueKind::Inst(owner, owner_idx) = &mut value.kind {
-            if *owner == block && *owner_idx >= inst_idx {
-                *owner_idx += 1;
-            }
-        }
-    }
-
-    let result = ValueId(func.values.len());
-    func.values.push(Value {
-        name: None,
-        ty: result_ty,
-        kind: ValueKind::Inst(block, inst_idx),
-    });
-    func.blocks[block.0].insts.insert(
-        inst_idx,
-        Inst {
-            result: Some(result),
-            kind,
-        },
-    );
-    result
 }

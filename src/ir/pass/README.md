@@ -28,10 +28,12 @@
   13. `SimpleLoopUnrollPass`（按目标收益门控）
   14. `InstCombinePass`
   15. `ConstFoldPass`
-  16. `SimplifyCfgPass`
-  17. `DcePass`
+  16. `LoopIdiomPass`
+  17. `ConstFoldPass`
+  18. `SimplifyCfgPass`
+  19. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `InstCombinePass`、常量折叠、CSE、LICM 等主动改写表达式的优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾的 InstCombine 只做局部整数改写，随后由 ConstFold 和 DCE 清理新暴露的常量及死指令。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `LoopIdiomPass`、`InstCombinePass`、常量折叠、CSE、LICM 等主动优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾先由 InstCombine 和 ConstFold 把局部整数算术规范化，再让 LoopIdiom 识别循环区域，最后由 ConstFold、SimplifyCfg 和 DCE 清理新暴露的常量、控制流及死指令。
 
 ## Pass 列表
 
@@ -136,11 +138,15 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 
 它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
 
-### `BitwiseIdiomPass`（暂停）
+### `LoopIdiomPass` (`bit_idiom.rs`)
 
-`bit_idiom.rs` 暂时保留，便于后续按新的证明边界重写和直接测试，但该 pass **没有接入任何生产优化流水线**，O0/O1 均不会运行它。
+循环区域级整数 idiom 变换，仅接入 O1。它通过共享的 `LoopInfo`、`NaturalLoop`、i32 归纳变量与精确常量 trip-count 分析，在任意函数中逐个识别两个输入每轮除以 2、位权每轮乘以 2、按输入低位更新 accumulator 的自然循环。单轮控制流会对四组输入位做符号求值，因此可以推导全部二输入布尔真值表；局部余数、倍增和乘法重关联只接受前置 InstCombine/ConstFold 产生的规范形式。
 
-旧 `PiecewiseExprPass` 已连同模块和专属测试移除，不再做 selector 决策树或整函数快速路径匹配。局部常量二次幂乘除保持普通 IR，由现有后端的局部指令选择处理。
+变换只 version 目标 loop region：preheader 新增两个输入非负的 guard，fast block 合成整数位运算和不足 32 位时的掩码，负数继续进入完整原循环；唯一 exit 新增 accumulator 合并 phi，循环后的原有计算继续使用合并结果。函数返回类型、参数数量、输入是否直接来自参数、循环数量和结果是否直接返回都不参与匹配。
+
+证明边界是保守的：必须有唯一专用 preheader、唯一 latch、唯一 exiting edge 和唯一 exit，不能有返回、内存访问、调用等 side exit/副作用；fast operands 必须在 preheader 可用；除 accumulator 外不能有 loop-defined live-out。exit 的已有 phi 只有在 fast edge 能复用其原 incoming 时才会补边，否则拒绝。变换后 preheader 不再是原循环的专用 preheader，因此重复运行幂等。
+
+旧 `PiecewiseExprPass` 已连同模块和专属测试移除，不再做 selector 决策树匹配。局部常量二次幂乘除保持普通 IR，由现有后端的局部指令选择处理。
 
 ### `RepeatReductionPass` (`repeat_reduction.rs`)
 
@@ -197,8 +203,9 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 - `LoopInfo` 从 CFG 中收集“循环头支配回边源”的 backedge，并按 header 合并成 `NaturalLoop`。
 - `NaturalLoop` 提供 header、所有 latch/backedge、只含入口可达且被 header 支配的 loop blocks、唯一 entering predecessor 与专用 preheader（若存在）、全部退出边和唯一 exit（若存在）；多 latch、多入口或多 exit 会显式保留，而不是猜测某个固定布局。
 - `analyze_i32_induction` 只需从 header phi 的唯一 entering predecessor/latch incoming 识别 `next = phi + constant` 形式，统一处理 `add` 两种操作数顺序及 `sub phi, constant`，支持任意非零 i32 环绕步长，并返回 phi、initial、next、step。
+- `analyze_const_i32_trip_count` 对常量初值、常量步长和 header 直接 signed `icmp` 计算精确迭代次数，统一比较操作数反转和 true/false continuation；依赖 i32 回绕才能终止、越界或不终止的情况会拒绝。
 
-LICM 和 `SimpleLoopUnrollPass` 的 CFG/区域改写要求 dedicated preheader；`RepeatReductionPass` 与归纳分析只要求 unique entering predecessor，并继续施加原有的 `initial == 0`、`step == 1` 等严格变换门控。LICM 按 invariant use-def 拓扑一次把定义先于使用移入 preheader，避免 BlockId 逆序依赖链上的反复全循环扫描。因此该模块是普通循环优化的公共基础设施，不是某个整数 idiom 的私有 matcher。
+LICM、`SimpleLoopUnrollPass` 和 `LoopIdiomPass` 的 CFG/区域改写要求 dedicated preheader；`RepeatReductionPass` 与归纳分析只要求 unique entering predecessor。各 pass 复用循环结构和归纳变量描述，再施加自身的严格变换门控。LICM 按 invariant use-def 拓扑一次把定义先于使用移入 preheader，避免 BlockId 逆序依赖链上的反复全循环扫描。因此该模块是普通循环优化的公共基础设施，不是某个整数 idiom 的私有 matcher。
 
 ### `util.rs`
 

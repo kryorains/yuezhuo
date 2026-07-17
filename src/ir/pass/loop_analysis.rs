@@ -1,5 +1,7 @@
 use super::dominators::{ControlFlowGraph, Dominators};
-use crate::ir::{BinaryOp, BlockId, Const, Function, InstKind, Type, ValueId, ValueKind};
+use crate::ir::{
+    BinaryOp, BlockId, CmpOp, Const, Function, InstKind, Terminator, Type, ValueId, ValueKind,
+};
 use std::collections::{BTreeMap, HashSet};
 
 /// Function-level natural-loop information derived only from CFG backedges and
@@ -212,6 +214,146 @@ pub(super) fn analyze_i32_induction(
     })
 }
 
+/// Returns the exact number of header-tested iterations for a constant i32
+/// induction and a direct signed `icmp` loop condition.
+///
+/// The result is available only when the first false comparison is reached
+/// without wrapping the induction value. A condition that would rely on i32
+/// wrapping to terminate is deliberately rejected.
+pub(super) fn analyze_const_i32_trip_count(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    induction: InductionVariable,
+) -> Option<u32> {
+    let initial = const_i32(func, induction.initial)? as i64;
+    let header = func.blocks.get(natural_loop.header.0)?;
+    let Terminator::Branch {
+        cond,
+        then_target,
+        else_target,
+    } = header.terminator.as_ref()?
+    else {
+        return None;
+    };
+    let then_inside = natural_loop.blocks.contains(then_target);
+    let else_inside = natural_loop.blocks.contains(else_target);
+    if then_inside == else_inside {
+        return None;
+    }
+
+    let InstKind::Icmp { op, lhs, rhs } = defining_inst(func, *cond)? else {
+        return None;
+    };
+    let mut op = *op;
+    let bound = if *lhs == induction.phi {
+        const_i32(func, *rhs)?
+    } else if *rhs == induction.phi {
+        op = reverse_cmp(op);
+        const_i32(func, *lhs)?
+    } else {
+        return None;
+    } as i64;
+    if !then_inside {
+        op = negate_cmp(op);
+    }
+
+    exact_i32_trip_count(initial, induction.step as i64, op, bound)
+}
+
+fn exact_i32_trip_count(initial: i64, step: i64, op: CmpOp, bound: i64) -> Option<u32> {
+    if !eval_cmp(op, initial, bound) {
+        return Some(0);
+    }
+
+    let iterations = match op {
+        CmpOp::Eq => 1,
+        CmpOp::Ne => {
+            let distance = bound - initial;
+            if distance % step != 0 || distance / step <= 0 {
+                return None;
+            }
+            distance / step
+        }
+        CmpOp::Lt => {
+            if step <= 0 {
+                return None;
+            }
+            ceil_div_positive(bound - initial, step)
+        }
+        CmpOp::Le => {
+            if step <= 0 {
+                return None;
+            }
+            (bound - initial) / step + 1
+        }
+        CmpOp::Gt => {
+            if step >= 0 {
+                return None;
+            }
+            ceil_div_positive(initial - bound, -step)
+        }
+        CmpOp::Ge => {
+            if step >= 0 {
+                return None;
+            }
+            (initial - bound) / -step + 1
+        }
+    };
+    let final_value = initial.checked_add(iterations.checked_mul(step)?)?;
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&final_value)
+        || eval_cmp(op, final_value, bound)
+    {
+        return None;
+    }
+    u32::try_from(iterations).ok()
+}
+
+fn ceil_div_positive(numerator: i64, denominator: i64) -> i64 {
+    debug_assert!(numerator > 0 && denominator > 0);
+    1 + (numerator - 1) / denominator
+}
+
+fn eval_cmp(op: CmpOp, lhs: i64, rhs: i64) -> bool {
+    match op {
+        CmpOp::Eq => lhs == rhs,
+        CmpOp::Ne => lhs != rhs,
+        CmpOp::Lt => lhs < rhs,
+        CmpOp::Le => lhs <= rhs,
+        CmpOp::Gt => lhs > rhs,
+        CmpOp::Ge => lhs >= rhs,
+    }
+}
+
+fn reverse_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
+    }
+}
+
+fn negate_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Ne,
+        CmpOp::Ne => CmpOp::Eq,
+        CmpOp::Lt => CmpOp::Ge,
+        CmpOp::Le => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::Le,
+        CmpOp::Ge => CmpOp::Lt,
+    }
+}
+
+fn defining_inst(func: &Function, value: ValueId) -> Option<&InstKind> {
+    let ValueKind::Inst(block, inst_idx) = func.values.get(value.0)?.kind else {
+        return None;
+    };
+    let inst = func.blocks.get(block.0)?.insts.get(inst_idx)?;
+    (inst.result == Some(value)).then_some(&inst.kind)
+}
+
 fn unique_incoming(incomings: &[(BlockId, ValueId)], pred: BlockId) -> Option<ValueId> {
     let mut values = incomings
         .iter()
@@ -244,7 +386,7 @@ fn const_i32(func: &Function, value: ValueId) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{CmpOp, Function, Terminator};
+    use crate::ir::{Function, Terminator};
 
     #[derive(Clone, Copy)]
     enum StepForm {
@@ -341,6 +483,69 @@ mod tests {
         loops.loops()[0].clone()
     }
 
+    fn trip_count_loop(
+        initial: i32,
+        step: i32,
+        op: CmpOp,
+        bound: i32,
+        reversed: bool,
+        body_on_true: bool,
+    ) -> (Function, ValueId) {
+        let mut func = Function::new("trip_count", Type::Void);
+        let entry = func.entry;
+        let header = func.add_block("header");
+        let latch = func.add_block("latch");
+        let exit = func.add_block("exit");
+        let initial = func.add_const(Const::Int(initial));
+        let bound = func.add_const(Const::Int(bound));
+        let step_value = func.add_const(Const::Int(step));
+        func.set_terminator(entry, Terminator::Jump(header));
+        let phi = func
+            .append_inst(
+                header,
+                InstKind::Phi {
+                    incomings: vec![(entry, initial)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let (lhs, rhs) = if reversed { (bound, phi) } else { (phi, bound) };
+        let condition = func
+            .append_inst(header, InstKind::Icmp { op, lhs, rhs }, Some(Type::I1))
+            .unwrap();
+        let (then_target, else_target) = if body_on_true {
+            (latch, exit)
+        } else {
+            (exit, latch)
+        };
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target,
+                else_target,
+            },
+        );
+        let next = func
+            .append_inst(
+                latch,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: phi,
+                    rhs: step_value,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(latch, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+        let InstKind::Phi { incomings } = &mut func.blocks[header.0].insts[0].kind else {
+            unreachable!();
+        };
+        incomings.push((latch, next));
+        (func, phi)
+    }
+
     #[test]
     fn recognizes_increment_decrement_and_general_i32_steps() {
         for (form, expected_step, computed_initial) in [
@@ -360,6 +565,44 @@ mod tests {
             assert!(natural_loop.unique_entering_pred.is_some());
             assert!(natural_loop.dedicated_preheader.is_some());
             assert!(natural_loop.unique_exit().is_some());
+        }
+    }
+
+    #[test]
+    fn computes_exact_trip_counts_for_both_directions_and_reversed_compares() {
+        for (initial, step, op, bound, reversed, body_on_true, expected) in [
+            (0, 1, CmpOp::Lt, 10, false, true, 10),
+            (0, 1, CmpOp::Gt, 10, true, true, 10),
+            (0, 1, CmpOp::Ge, 10, false, false, 10),
+            (10, -1, CmpOp::Gt, 0, false, true, 10),
+            (10, -1, CmpOp::Lt, 0, true, true, 10),
+        ] {
+            let (func, phi) = trip_count_loop(initial, step, op, bound, reversed, body_on_true);
+            assert!(func.verify().is_ok());
+            let natural_loop = only_loop(&func);
+            let induction = analyze_i32_induction(&func, &natural_loop, phi).unwrap();
+            assert_eq!(
+                analyze_const_i32_trip_count(&func, &natural_loop, induction),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_wrapping_or_nonterminating_i32_trip_counts() {
+        for (initial, step, op, bound) in [
+            (i32::MAX, 1, CmpOp::Le, i32::MAX),
+            (0, -1, CmpOp::Lt, 10),
+            (0, 2, CmpOp::Ne, 3),
+        ] {
+            let (func, phi) = trip_count_loop(initial, step, op, bound, false, true);
+            assert!(func.verify().is_ok());
+            let natural_loop = only_loop(&func);
+            let induction = analyze_i32_induction(&func, &natural_loop, phi).unwrap();
+            assert_eq!(
+                analyze_const_i32_trip_count(&func, &natural_loop, induction),
+                None
+            );
         }
     }
 

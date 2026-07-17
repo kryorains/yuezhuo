@@ -1,9 +1,7 @@
 use super::dominators::{ControlFlowGraph, Dominators};
 use super::util::{resolve_replacement, rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
-use crate::ir::{
-    BlockId, Const, Function, Inst, InstKind, Module, Terminator, Type, Value, ValueId, ValueKind,
-};
+use crate::ir::{BlockId, Const, Function, InstKind, Module, Terminator, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(super) struct ScalarPromotePass;
@@ -315,32 +313,15 @@ fn insert_phi(func: &mut Function, block: BlockId, ty: Type) -> ValueId {
         .iter()
         .take_while(|inst| matches!(inst.kind, InstKind::Nop | InstKind::Phi { .. }))
         .count();
-    let result = ValueId(func.values.len());
-    func.values.push(Value {
-        name: None,
-        ty,
-        kind: ValueKind::Inst(block, pos),
-    });
-    func.blocks[block.0].insts.insert(
+    func.insert_inst(
+        block,
         pos,
-        Inst {
-            result: Some(result),
-            kind: InstKind::Phi {
-                incomings: Vec::new(),
-            },
+        InstKind::Phi {
+            incomings: Vec::new(),
         },
-    );
-    reindex_block(func, block);
-    result
-}
-
-fn reindex_block(func: &mut Function, block: BlockId) {
-    for inst_idx in 0..func.blocks[block.0].insts.len() {
-        let Some(result) = func.blocks[block.0].insts[inst_idx].result else {
-            continue;
-        };
-        func.values[result.0].kind = ValueKind::Inst(block, inst_idx);
-    }
+        Some(ty),
+    )
+    .unwrap()
 }
 
 fn rename_block(
