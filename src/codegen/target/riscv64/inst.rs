@@ -22,18 +22,20 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Load { ptr } => {
                 let result = inst.result.unwrap();
-                self.load_value(*ptr);
-                let ty = self.func.value(result).ty.clone();
-                self.load_indirect(&ty);
-                self.store_result(result);
+                if !self.emit_assigned_load(result, *ptr) {
+                    self.load_value(*ptr);
+                    let ty = self.func.value(result).ty.clone();
+                    self.load_indirect(&ty);
+                    self.store_result(result);
+                }
             }
             InstKind::Store { ptr, value } => {
-                self.load_value(*ptr);
-                self.push_x0();
-                self.load_value(*value);
-                self.pop_x1();
-                let ty = self.func.value(*value).ty.clone();
-                self.store_indirect(&ty);
+                if !self.emit_assigned_store(*ptr, *value) {
+                    self.load_value_into(*ptr, "a1");
+                    self.load_value(*value);
+                    let ty = self.func.value(*value).ty.clone();
+                    self.store_indirect(&ty);
+                }
             }
             InstKind::MemZero { ptr, bytes } => self.emit_memzero(*ptr, *bytes),
             InstKind::Unary { op, value } => {
@@ -43,13 +45,17 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Binary { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
-                self.emit_binary(*op, *lhs, *rhs);
-                self.store_result(result);
+                if !self.emit_assigned_binary(result, *op, *lhs, *rhs) {
+                    self.emit_binary(*op, *lhs, *rhs);
+                    self.store_result(result);
+                }
             }
             InstKind::Icmp { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
-                self.emit_icmp(*op, *lhs, *rhs);
-                self.store_result(result);
+                if self.direct_branch_icmp(result).is_none() {
+                    self.emit_icmp(*op, *lhs, *rhs);
+                    self.store_result(result);
+                }
             }
             InstKind::Fcmp { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
@@ -63,8 +69,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Gep { base, indices } => {
                 let result = inst.result.unwrap();
-                self.emit_gep(result, *base, indices);
-                self.store_result(result);
+                if !self.emit_assigned_gep(result, *base, indices) {
+                    self.emit_gep(result, *base, indices);
+                    self.store_result(result);
+                }
             }
             InstKind::Call { name, args } => {
                 let ret = self.emit_call(name, args);
@@ -100,9 +108,19 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 then_target,
                 else_target,
             } => {
+                if !self.edge_has_phi_copy(block_idx, then_target.0)
+                    && !self.edge_has_phi_copy(block_idx, else_target.0)
+                {
+                    self.emit_branch_if_false(*cond, self.block_label(else_target.0));
+                    if then_target.0 != block_idx + 1 {
+                        self.body
+                            .push_str(&format!("  j {}\n", self.block_label(then_target.0)));
+                    }
+                    return;
+                }
+
                 let else_edge = self.parent.ctx.fresh_label("else_edge");
-                self.load_value(*cond);
-                self.body.push_str(&format!("  beqz a0, {}\n", else_edge));
+                self.emit_branch_if_false(*cond, else_edge.clone());
                 self.emit_phi_copies(block_idx, then_target.0);
                 self.body.push_str(&format!(
                     "  j {}\n{}:\n",
@@ -133,8 +151,18 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     .iter()
                     .find(|(pred, _)| pred.0 == pred_idx)
                     .map(|(_, value)| (result, *value))
+                    .filter(|(result, value)| {
+                        self.regalloc.reg(*result) != self.regalloc.reg(*value)
+                            || self.regalloc.reg(*result).is_none()
+                    })
             })
             .collect::<Vec<_>>();
+
+        if let [(result, value)] = copies.as_slice() {
+            self.load_value(*value);
+            self.store_result(*result);
+            return;
+        }
 
         for (_, value) in &copies {
             self.load_value(*value);
@@ -144,6 +172,39 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             self.pop_x1();
             self.body.push_str("  mv a0, a1\n");
             self.store_result(*result);
+        }
+    }
+
+    fn edge_has_phi_copy(&self, pred_idx: usize, target_idx: usize) -> bool {
+        self.func
+            .block(BlockId(target_idx))
+            .insts
+            .iter()
+            .any(|inst| {
+                matches!(
+                    &inst.kind,
+                    InstKind::Phi { incomings }
+                        if incomings.iter().any(|(pred, _)| pred.0 == pred_idx)
+                )
+            })
+    }
+
+    fn emit_branch_if_false(&mut self, cond: ValueId, target: String) {
+        if let Some((op, lhs, rhs)) = self.direct_branch_icmp(cond) {
+            self.load_value_into(lhs, "a1");
+            self.load_value(rhs);
+            let branch = match op {
+                CmpOp::Lt => "bge a1, a0",
+                CmpOp::Gt => "bge a0, a1",
+                CmpOp::Le => "blt a0, a1",
+                CmpOp::Ge => "blt a1, a0",
+                CmpOp::Eq => "bne a1, a0",
+                CmpOp::Ne => "beq a1, a0",
+            };
+            self.body.push_str(&format!("  {}, {}\n", branch, target));
+        } else {
+            self.load_value(cond);
+            self.body.push_str(&format!("  beqz a0, {}\n", target));
         }
     }
 
@@ -158,6 +219,108 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         }
     }
 
+    fn emit_assigned_binary(
+        &mut self,
+        result: ValueId,
+        op: BinaryOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> bool {
+        let Some(destination) = self.assigned_reg(result) else {
+            return false;
+        };
+
+        match op {
+            BinaryOp::Iadd => {
+                if let Some(imm) = const_i32(self.func, rhs).filter(|imm| fits_i12(*imm)) {
+                    let source = self.load_or_assigned(lhs, "a0");
+                    self.body
+                        .push_str(&format!("  addiw {}, {}, {}\n", destination, source, imm));
+                    return true;
+                }
+                if let Some(imm) = const_i32(self.func, lhs).filter(|imm| fits_i12(*imm)) {
+                    let source = self.load_or_assigned(rhs, "a0");
+                    self.body
+                        .push_str(&format!("  addiw {}, {}, {}\n", destination, source, imm));
+                    return true;
+                }
+            }
+            BinaryOp::Isub => {
+                if let Some(imm) = const_i32(self.func, rhs)
+                    .and_then(i32::checked_neg)
+                    .filter(|imm| fits_i12(*imm))
+                {
+                    let source = self.load_or_assigned(lhs, "a0");
+                    self.body
+                        .push_str(&format!("  addiw {}, {}, {}\n", destination, source, imm));
+                    return true;
+                }
+            }
+            BinaryOp::Imul => {
+                if let Some(shift) = pow2_shift(self.func, rhs) {
+                    let source = self.load_or_assigned(lhs, "a0");
+                    self.body
+                        .push_str(&format!("  slliw {}, {}, {}\n", destination, source, shift));
+                    return true;
+                }
+                if let Some(shift) = pow2_shift(self.func, lhs) {
+                    let source = self.load_or_assigned(rhs, "a0");
+                    self.body
+                        .push_str(&format!("  slliw {}, {}, {}\n", destination, source, shift));
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        if matches!(op, BinaryOp::Idiv | BinaryOp::Imod) && const_i32(self.func, rhs).is_some() {
+            return false;
+        }
+
+        let lhs_reg = self.load_or_assigned(lhs, "a1");
+        let rhs_reg = self.load_or_assigned(rhs, "a0");
+        match op {
+            BinaryOp::Iadd => self.body.push_str(&format!(
+                "  addw {}, {}, {}\n",
+                destination, lhs_reg, rhs_reg
+            )),
+            BinaryOp::Isub => self.body.push_str(&format!(
+                "  subw {}, {}, {}\n",
+                destination, lhs_reg, rhs_reg
+            )),
+            BinaryOp::Imul => self.body.push_str(&format!(
+                "  mulw {}, {}, {}\n",
+                destination, lhs_reg, rhs_reg
+            )),
+            BinaryOp::Idiv => self.body.push_str(&format!(
+                "  divw {}, {}, {}\n",
+                destination, lhs_reg, rhs_reg
+            )),
+            BinaryOp::Imod => self.body.push_str(&format!(
+                "  remw {}, {}, {}\n",
+                destination, lhs_reg, rhs_reg
+            )),
+            BinaryOp::And | BinaryOp::Or => {
+                self.body
+                    .push_str(&format!("  snez a1, {}\n  snez a0, {}\n", lhs_reg, rhs_reg));
+                let instruction = if op == BinaryOp::And { "and" } else { "or" };
+                self.body
+                    .push_str(&format!("  {} {}, a1, a0\n", instruction, destination));
+            }
+            BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => return false,
+        }
+        true
+    }
+
+    fn load_or_assigned(&mut self, value: ValueId, scratch: &'static str) -> &'static str {
+        if let Some(reg) = self.assigned_reg(value) {
+            reg
+        } else {
+            self.load_value_into(value, scratch);
+            scratch
+        }
+    }
+
     fn emit_binary(&mut self, op: BinaryOp, lhs: ValueId, rhs: ValueId) {
         if self.emit_binary_imm(op, lhs, rhs) {
             return;
@@ -165,10 +328,8 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
         match op {
             BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => {
-                self.load_float_value(lhs, "fa0");
-                self.push_s0();
+                self.load_float_value(lhs, "fa1");
                 self.load_float_value(rhs, "fa0");
-                self.pop_s1();
                 match op {
                     BinaryOp::Fadd => self.body.push_str("  fadd.s fa0, fa1, fa0\n"),
                     BinaryOp::Fsub => self.body.push_str("  fsub.s fa0, fa1, fa0\n"),
@@ -179,12 +340,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 self.body.push_str("  fmv.x.w a0, fa0\n");
             }
             BinaryOp::And | BinaryOp::Or => {
-                self.load_value(lhs);
-                self.body.push_str("  snez a0, a0\n");
-                self.push_x0();
+                self.load_value_into(lhs, "a1");
+                self.body.push_str("  snez a1, a1\n");
                 self.load_value(rhs);
                 self.body.push_str("  snez a0, a0\n");
-                self.pop_x1();
                 if op == BinaryOp::And {
                     self.body.push_str("  and a0, a1, a0\n");
                 } else {
@@ -192,10 +351,8 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 }
             }
             _ => {
-                self.load_value(lhs);
-                self.push_x0();
+                self.load_value_into(lhs, "a1");
                 self.load_value(rhs);
-                self.pop_x1();
                 match op {
                     BinaryOp::Iadd => self.body.push_str("  addw a0, a1, a0\n"),
                     BinaryOp::Isub => self.body.push_str("  subw a0, a1, a0\n"),
@@ -323,11 +480,28 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         }
     }
 
+    fn direct_branch_icmp(&self, value: ValueId) -> Option<(CmpOp, ValueId, ValueId)> {
+        if self.value_use_counts[value.0] != 1 {
+            return None;
+        }
+        let ValueKind::Inst(block, inst_idx) = self.func.value(value).kind else {
+            return None;
+        };
+        let Terminator::Branch { cond, .. } = self.func.block(block).terminator.as_ref()? else {
+            return None;
+        };
+        if *cond != value {
+            return None;
+        }
+        match self.func.block(block).insts.get(inst_idx)?.kind {
+            InstKind::Icmp { op, lhs, rhs } => Some((op, lhs, rhs)),
+            _ => None,
+        }
+    }
+
     fn emit_icmp(&mut self, op: CmpOp, lhs: ValueId, rhs: ValueId) {
-        self.load_value(lhs);
-        self.push_x0();
+        self.load_value_into(lhs, "a1");
         self.load_value(rhs);
-        self.pop_x1();
         match op {
             CmpOp::Lt => self.body.push_str("  slt a0, a1, a0\n"),
             CmpOp::Gt => self.body.push_str("  slt a0, a0, a1\n"),
@@ -339,10 +513,8 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_fcmp(&mut self, op: CmpOp, lhs: ValueId, rhs: ValueId) {
-        self.load_float_value(lhs, "fa0");
-        self.push_s0();
+        self.load_float_value(lhs, "fa1");
         self.load_float_value(rhs, "fa0");
-        self.pop_s1();
         match op {
             CmpOp::Lt => self.body.push_str("  flt.s a0, fa1, fa0\n"),
             CmpOp::Gt => self.body.push_str("  flt.s a0, fa0, fa1\n"),

@@ -21,11 +21,13 @@
   6. `LocalForwardPass`
   7. `CsePass`
   8. `LicmPass`
-  9. `DcePass`
-  10. `RepeatReductionPass`
-  11. `ConstFoldPass`
-  12. `SimplifyCfgPass`
-  13. `DcePass`
+  9. `InvariantLoadForwardPass`
+  10. `DcePass`
+  11. `RepeatReductionPass`
+  12. `SimpleLoopUnrollPass`
+  13. `ConstFoldPass`
+  14. `SimplifyCfgPass`
+  15. `DcePass`
 
 O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行常量折叠、CSE、LICM 等主动改写表达式的优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi，末尾 DCE 再清理归约折叠后失效的循环记账指令。
 
@@ -109,6 +111,12 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 
 目前只跟踪非数组的本地 `alloca` 指针，避免别名关系不清导致错误优化。
 
+### `InvariantLoadForwardPass` (`invariant_load.rs`)
+
+转发支配当前位置且来自只读对象的重复加载。
+
+它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
+
 ### `RepeatReductionPass` (`repeat_reduction.rs`)
 
 无副作用重复归约折叠。
@@ -120,6 +128,12 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 3. 把计数器直接推进到循环上界并退出。
 
 变换使用 i32 环绕算术，因此与逐轮累加在模 2^32 下等价。计数器参与循环体计算、非线性累加、额外活跃 loop phi、依赖累加器的分支、循环内存写入及侧出口都会让该 pass 保守退出。
+
+### `SimpleLoopUnrollPass` (`simple_loop_unroll.rs`)
+
+对严格规范化的单基本块计数循环做二倍展开。
+
+候选循环必须从 0 开始、每轮加 1、以动态上界做有符号小于比较，并且只有一个活跃 loop phi；含调用、`memzero`、侧出口或额外循环状态时不会展开。pass 在原标量循环前插入两路快速循环，原循环继续处理负数、小于 2 的次数和奇数尾项。两份循环体严格按迭代顺序克隆，因此即使相邻迭代的内存访问互相别名，也不会改变可观察顺序。代码增长受单循环和单函数预算限制。当前 AArch64 后端会让展开后的中间值产生额外栈流量，因此目标收益门控暂时只在 x86-64 和 RISC-V64 启用该 pass。
 
 ### `DcePass` (`dce.rs`)
 

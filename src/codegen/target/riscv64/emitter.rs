@@ -36,6 +36,8 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             func,
             layout: IrFuncLayout::new(func),
             regalloc: Riscv64RegAlloc::new(func),
+            local_regs: crate::codegen::common::IrLocalRegs::new(func, &["t3", "t4", "t5", "t6"]),
+            value_use_counts: crate::codegen::common::ir_value_use_counts(func),
             body: String::new(),
             return_label: format!(".L_return_{}", func.name),
         }

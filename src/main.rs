@@ -113,7 +113,12 @@ fn main() {
     } else {
         ir::pass::OptLevel::O0
     };
-    ir::pass::run_pipeline(&mut module, opt_level);
+    let pass_options = ir::pass::PassOptions {
+        // The current AArch64 stack-oriented lowering makes cloned scalar
+        // bodies slower; keep the transform behind a target profitability gate.
+        enable_simple_loop_unroll: target != codegen::Target::AArch64,
+    };
+    ir::pass::run_pipeline(&mut module, opt_level, pass_options);
 
     if emit_ir {
         fs::write(&output, format!("{:#?}", module))

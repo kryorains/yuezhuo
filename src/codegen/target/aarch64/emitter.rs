@@ -37,6 +37,11 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             func,
             layout: IrFuncLayout::new(func),
             phi_regs: AArch64PhiRegs::new(func),
+            local_regs: crate::codegen::common::IrLocalRegs::new(
+                func,
+                &["x3", "x4", "x5", "x6", "x7"],
+            ),
+            value_use_counts: crate::codegen::common::ir_value_use_counts(func),
             body: String::new(),
             return_label: format!(".L_return_{}", func.name),
         }

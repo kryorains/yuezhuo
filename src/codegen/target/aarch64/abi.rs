@@ -12,7 +12,18 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             let offset = self.layout.offset(*param);
             match locations[idx] {
                 IrArgLocation::IntReg(reg_idx) => {
-                    if param_sig.is_pointer {
+                    if let Some(target) = self.phi_regs.reg(*param) {
+                        if param_sig.is_pointer {
+                            self.body
+                                .push_str(&format!("  mov {}, x{}\n", target, reg_idx));
+                        } else {
+                            self.body.push_str(&format!(
+                                "  mov {}, w{}\n",
+                                target.replacen('x', "w", 1),
+                                reg_idx
+                            ));
+                        }
+                    } else if param_sig.is_pointer {
                         self.store_frame_x(&format!("x{}", reg_idx), offset);
                     } else {
                         self.store_frame_w(&format!("w{}", reg_idx), offset);
@@ -25,13 +36,21 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     let src = 16 + (stack_idx as i32) * 8;
                     if param_sig.is_pointer {
                         self.load_frame_x("x0", src);
-                        self.store_frame_x("x0", offset);
+                        if self.phi_regs.reg(*param).is_some() {
+                            self.store_result(*param);
+                        } else {
+                            self.store_frame_x("x0", offset);
+                        }
                     } else if param_sig.ty == Type::F32 {
                         self.load_frame_s("s0", src);
                         self.store_frame_s("s0", offset);
                     } else {
                         self.load_frame_w("w0", src);
-                        self.store_frame_w("w0", offset);
+                        if self.phi_regs.reg(*param).is_some() {
+                            self.store_result(*param);
+                        } else {
+                            self.store_frame_w("w0", offset);
+                        }
                     }
                     stack_idx += 1;
                 }

@@ -5,7 +5,7 @@ mod inst;
 mod memory;
 mod regalloc;
 
-use crate::codegen::common::IrFuncLayout;
+use crate::codegen::common::{IrFuncLayout, IrLocalRegs};
 use crate::ir::{Function, Module};
 use regalloc::Riscv64RegAlloc;
 
@@ -19,6 +19,8 @@ struct Riscv64IrFuncEmitter<'a, 'b> {
     func: &'b Function,
     layout: IrFuncLayout,
     regalloc: Riscv64RegAlloc,
+    local_regs: IrLocalRegs,
+    value_use_counts: Vec<usize>,
     body: String,
     return_label: String,
 }
