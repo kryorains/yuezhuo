@@ -73,7 +73,7 @@ fn match_reduction(
     cfg: &ControlFlowGraph,
     natural_loop: &NaturalLoop,
 ) -> Option<Reduction> {
-    let preheader = natural_loop.preheader?;
+    let entering_pred = natural_loop.unique_entering_pred?;
     let latch = natural_loop.unique_latch()?;
     if cfg.preds[natural_loop.header.0].len() != 2 {
         return None;
@@ -141,7 +141,7 @@ fn match_reduction(
         return None;
     }
 
-    let accumulator_initial = phi_incoming(func, accumulator, preheader)?;
+    let accumulator_initial = phi_incoming(func, accumulator, entering_pred)?;
     let accumulator_next = phi_incoming(func, accumulator, latch)?;
     if !value_defined_in_blocks(func, accumulator_next, &natural_loop.blocks)
         || !accumulator_is_affine(func, natural_loop, accumulator, accumulator_next)
@@ -402,5 +402,110 @@ fn terminator_operands(terminator: Option<&Terminator>) -> Vec<ValueId> {
         Some(Terminator::Return(Some(value))) => vec![*value],
         Some(Terminator::Branch { cond, .. }) => vec![*cond],
         Some(Terminator::Return(None) | Terminator::Jump(_)) | None => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_unique_conditional_entering_predecessor_without_preheader() {
+        let mut func = Function::new("conditional_reduction_entry", Type::Void);
+        let header = func.add_block("header");
+        let latch = func.add_block("latch");
+        let exit = func.add_block("exit");
+        let enter = func.add_const(Const::Bool(true));
+        let zero = func.add_const(Const::Int(0));
+        let one = func.add_const(Const::Int(1));
+        let bound = func.add_const(Const::Int(100));
+        func.set_terminator(
+            func.entry,
+            Terminator::Branch {
+                cond: enter,
+                then_target: header,
+                else_target: exit,
+            },
+        );
+        let counter = func
+            .append_inst(
+                header,
+                InstKind::Phi {
+                    incomings: vec![(func.entry, zero)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let accumulator = func
+            .append_inst(
+                header,
+                InstKind::Phi {
+                    incomings: vec![(func.entry, zero)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let condition = func
+            .append_inst(
+                header,
+                InstKind::Icmp {
+                    op: CmpOp::Lt,
+                    lhs: counter,
+                    rhs: bound,
+                },
+                Some(Type::I1),
+            )
+            .unwrap();
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: latch,
+                else_target: exit,
+            },
+        );
+        let accumulator_next = func
+            .append_inst(
+                latch,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: accumulator,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let counter_next = func
+            .append_inst(
+                latch,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: counter,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(latch, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+        for (inst_idx, incoming) in [(0, counter_next), (1, accumulator_next)] {
+            let InstKind::Phi { incomings } = &mut func.blocks[header.0].insts[inst_idx].kind
+            else {
+                unreachable!();
+            };
+            incomings.push((latch, incoming));
+        }
+        assert!(func.verify().is_ok());
+
+        let cfg = ControlFlowGraph::new(&func);
+        let dom = Dominators::new(&func, &cfg);
+        let loops = LoopInfo::new(&cfg, &dom);
+        let natural_loop = &loops.loops()[0];
+        assert_eq!(natural_loop.unique_entering_pred, Some(func.entry));
+        assert_eq!(natural_loop.dedicated_preheader, None);
+        assert!(match_reduction(&func, &cfg, natural_loop).is_some());
+
+        collapse_repeated_reductions(&mut func);
+        assert!(func.verify().is_ok());
     }
 }

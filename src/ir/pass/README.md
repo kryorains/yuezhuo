@@ -188,17 +188,17 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
   - 支配树 children 和 DFS 区间，`dominates` 查询为 O(1)；
   - dominance frontier。
 
-不可达块不加入入口支配树，只保守地认为块支配自身。`ScalarPromotePass` 用支配信息判断定义是否支配使用，以及在哪里需要插入 `phi`；`LoopInfo`、LICM 及 IR 验证器也复用同一套可达性和支配关系，不依赖基本块在 `Function.blocks` 中的存储顺序。
+不可达块不加入入口支配树；IR verifier 另把虚拟根视为位于 physical entry 指令之后，并连接不可达 CFG 各 source SCC 的全部成员，保守检查 dead region 的跨块定义及 phi-edge 可用性，既不放过 dead diamond 的错误 incoming，也允许 entry 定义及结构正确的 `dead.def -> dead.use`。`ScalarPromotePass` 用入口支配信息判断定义是否支配使用，以及在哪里需要插入 `phi`；`LoopInfo`、LICM 及 IR verifier 都不依赖基本块在 `Function.blocks` 中的存储顺序。
 
 ### `loop_analysis.rs`
 
 共享的自然循环与 i32 归纳变量分析，不是独立 pass，也不读取函数名、块名或固定块编号。
 
 - `LoopInfo` 从 CFG 中收集“循环头支配回边源”的 backedge，并按 header 合并成 `NaturalLoop`。
-- `NaturalLoop` 提供 header、所有 latch/backedge、loop blocks、唯一专用 preheader（若存在）、全部退出边和唯一 exit（若存在）；多 latch、多入口或多 exit 会显式保留，而不是猜测某个固定布局。
-- `analyze_i32_induction` 从 header phi 的 preheader/latch incoming 识别 `next = phi + constant` 形式，统一处理 `add` 两种操作数顺序及 `sub phi, constant`，支持任意非零 i32 环绕步长，并返回 phi、initial、next、step。
+- `NaturalLoop` 提供 header、所有 latch/backedge、只含入口可达且被 header 支配的 loop blocks、唯一 entering predecessor 与专用 preheader（若存在）、全部退出边和唯一 exit（若存在）；多 latch、多入口或多 exit 会显式保留，而不是猜测某个固定布局。
+- `analyze_i32_induction` 只需从 header phi 的唯一 entering predecessor/latch incoming 识别 `next = phi + constant` 形式，统一处理 `add` 两种操作数顺序及 `sub phi, constant`，支持任意非零 i32 环绕步长，并返回 phi、initial、next、step。
 
-LICM 使用 `LoopInfo` 选择有唯一 preheader 的自然循环；`RepeatReductionPass` 和 `SimpleLoopUnrollPass` 同时复用循环结构和归纳变量描述，但各自继续施加原有的 `initial == 0`、`step == 1` 等严格变换门控。因此该模块是普通循环优化的公共基础设施，不是某个整数 idiom 的私有 matcher。
+LICM 和 `SimpleLoopUnrollPass` 的 CFG/区域改写要求 dedicated preheader；`RepeatReductionPass` 与归纳分析只要求 unique entering predecessor，并继续施加原有的 `initial == 0`、`step == 1` 等严格变换门控。LICM 按 invariant use-def 拓扑一次把定义先于使用移入 preheader，避免 BlockId 逆序依赖链上的反复全循环扫描。因此该模块是普通循环优化的公共基础设施，不是某个整数 idiom 的私有 matcher。
 
 ### `util.rs`
 

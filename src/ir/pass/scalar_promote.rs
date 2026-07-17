@@ -45,17 +45,32 @@ fn promote_function(func: &mut Function) {
         .iter()
         .map(|((block, alloca), phi)| (*phi, (*block, *alloca)))
         .collect::<HashMap<_, _>>();
-    // The unpruned phi placement can create a dead phi before the first real
-    // store. Seed every stack so those phis still receive a type-correct value
-    // on every predecessor edge. `loads_are_defined` guarantees the seed can
-    // never replace an observable load.
+    // Unpruned phi placement can create a dead phi before the first real
+    // store. Only allocas that actually received a phi need a seed, and one
+    // type-correct zero can serve every such alloca of the same type.
+    // `loads_are_defined` guarantees a seed never replaces an observable load.
+    let phi_candidates = phi_values
+        .keys()
+        .map(|(_, alloca)| *alloca)
+        .collect::<HashSet<_>>();
+    let mut seeds_by_type = Vec::<(Type, ValueId)>::new();
     let mut stacks = HashMap::new();
     for alloca in &candidates {
-        let Some(ty) = promoted_type(func, *alloca) else {
-            continue;
+        let seed = if phi_candidates.contains(alloca) {
+            let Some(ty) = promoted_type(func, *alloca) else {
+                continue;
+            };
+            if let Some((_, seed)) = seeds_by_type.iter().find(|(seed_ty, _)| *seed_ty == ty) {
+                Some(*seed)
+            } else {
+                let seed = func.add_const(Const::Zero(ty.clone()));
+                seeds_by_type.push((ty, seed));
+                Some(seed)
+            }
+        } else {
+            None
         };
-        let seed = func.add_const(Const::Zero(ty));
-        stacks.insert(*alloca, vec![seed]);
+        stacks.insert(*alloca, seed.into_iter().collect());
     }
     let mut replacements = ValueReplacements::new();
 
@@ -473,6 +488,127 @@ fn promoted_type(func: &Function, alloca: ValueId) -> Option<Type> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avoids_seeds_for_allocas_without_phis() {
+        let mut func = Function::new("linear_promote", Type::I32);
+        let one = func.add_const(Const::Int(1));
+        let slot = func
+            .append_inst(
+                func.entry,
+                InstKind::Alloca { ty: Type::I32 },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        func.append_inst(
+            func.entry,
+            InstKind::Store {
+                ptr: slot,
+                value: one,
+            },
+            None,
+        );
+        let loaded = func
+            .append_inst(func.entry, InstKind::Load { ptr: slot }, Some(Type::I32))
+            .unwrap();
+        func.set_terminator(func.entry, Terminator::Return(Some(loaded)));
+
+        promote_function(&mut func);
+
+        assert!(func.verify().is_ok());
+        assert!(!func
+            .values
+            .iter()
+            .any(|value| matches!(value.kind, ValueKind::Const(Const::Zero(_)))));
+    }
+
+    #[test]
+    fn reuses_phi_seeds_by_type() {
+        let mut func = Function::new("shared_phi_seed", Type::I32);
+        let left = func.add_block("left");
+        let right = func.add_block("right");
+        let merge = func.add_block("merge");
+        let condition = func.add_const(Const::Bool(true));
+        let zero = func.add_const(Const::Int(0));
+        let one = func.add_const(Const::Int(1));
+        let two = func.add_const(Const::Int(2));
+        let mut slots = Vec::new();
+        for _ in 0..2 {
+            let slot = func
+                .append_inst(
+                    func.entry,
+                    InstKind::Alloca { ty: Type::I32 },
+                    Some(Type::Ptr(Box::new(Type::I32))),
+                )
+                .unwrap();
+            func.append_inst(
+                func.entry,
+                InstKind::Store {
+                    ptr: slot,
+                    value: zero,
+                },
+                None,
+            );
+            slots.push(slot);
+        }
+        func.set_terminator(
+            func.entry,
+            Terminator::Branch {
+                cond: condition,
+                then_target: left,
+                else_target: right,
+            },
+        );
+        for slot in &slots {
+            func.append_inst(
+                left,
+                InstKind::Store {
+                    ptr: *slot,
+                    value: one,
+                },
+                None,
+            );
+            func.append_inst(
+                right,
+                InstKind::Store {
+                    ptr: *slot,
+                    value: two,
+                },
+                None,
+            );
+        }
+        func.set_terminator(left, Terminator::Jump(merge));
+        func.set_terminator(right, Terminator::Jump(merge));
+        let first = func
+            .append_inst(merge, InstKind::Load { ptr: slots[0] }, Some(Type::I32))
+            .unwrap();
+        let second = func
+            .append_inst(merge, InstKind::Load { ptr: slots[1] }, Some(Type::I32))
+            .unwrap();
+        let sum = func
+            .append_inst(
+                merge,
+                InstKind::Binary {
+                    op: crate::ir::BinaryOp::Iadd,
+                    lhs: first,
+                    rhs: second,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(merge, Terminator::Return(Some(sum)));
+
+        promote_function(&mut func);
+
+        assert!(func.verify().is_ok());
+        assert_eq!(
+            func.values
+                .iter()
+                .filter(|value| matches!(value.kind, ValueKind::Const(Const::Zero(Type::I32))))
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn completes_promoted_phis_for_unreachable_predecessors() {

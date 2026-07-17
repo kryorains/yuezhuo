@@ -91,7 +91,7 @@ fn match_candidate(
     natural_loop: &NaturalLoop,
 ) -> Option<UnrollCandidate> {
     let header_id = natural_loop.header;
-    let preheader_id = natural_loop.preheader?;
+    let preheader_id = natural_loop.dedicated_preheader?;
     let latch = natural_loop.unique_latch()?;
     let header = func.blocks.get(header_id.0)?;
     let Terminator::Branch {

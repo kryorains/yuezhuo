@@ -78,6 +78,12 @@ impl<'a> Verifier<'a> {
             return;
         }
         let cfg = ControlFlowGraph::new(self.func);
+        if !cfg.preds[self.func.entry.0].is_empty() {
+            self.error(format!(
+                "entry block {} has predecessors {:?}",
+                self.func.entry, cfg.preds[self.func.entry.0]
+            ));
+        }
         let dom = Dominators::new(self.func, &cfg);
         self.verify_phi_predecessors(&cfg);
         self.verify_ssa_uses(&dom);
@@ -117,6 +123,9 @@ impl<'a> Verifier<'a> {
         for inst in &block.insts {
             match inst.kind {
                 InstKind::Nop => {}
+                InstKind::Phi { .. } if block_id == self.func.entry => {
+                    self.error(format!("entry block {} contains a phi", block_id));
+                }
                 InstKind::Phi { .. } if seen_non_phi => {
                     self.error(format!("{} has phi after non-phi instruction", block_id));
                 }
@@ -402,12 +411,7 @@ impl<'a> Verifier<'a> {
             return;
         }
 
-        // Dominance is defined from the function entry. Cross-block uses in an
-        // unreachable region cannot execute, so retain structural and local
-        // ordering checks without inventing an order among unreachable roots.
-        if dom.is_reachable(use_block)
-            && (!dom.is_reachable(def_block) || !dom.dominates(def_block, use_block))
-        {
+        if !dom.dominates_for_availability(def_block, use_block) {
             self.error(format!(
                 "definition of {} in {} does not dominate its use in {}",
                 value, def_block, context
@@ -436,10 +440,7 @@ impl<'a> Verifier<'a> {
         };
         // Every instruction in the predecessor is available at its outgoing
         // edge. Otherwise the definition must dominate that predecessor.
-        if def_block != predecessor
-            && dom.is_reachable(predecessor)
-            && (!dom.is_reachable(def_block) || !dom.dominates(def_block, predecessor))
-        {
+        if def_block != predecessor && !dom.dominates_for_availability(def_block, predecessor) {
             self.error(format!(
                 "definition of {} in {} is not available on edge {} -> {} for phi {:?}",
                 value, def_block, predecessor, phi_block, phi
@@ -536,6 +537,33 @@ mod tests {
             messages.iter().any(|message| message.contains(expected)),
             "expected error containing {expected:?}, got {messages:#?}"
         );
+    }
+
+    #[test]
+    fn rejects_phi_in_physical_entry_block() {
+        let mut func = Function::new("entry_phi", Type::I32);
+        let phi = func
+            .append_inst(
+                func.entry,
+                InstKind::Phi {
+                    incomings: Vec::new(),
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(func.entry, Terminator::Return(Some(phi)));
+
+        assert_error(&error_messages(&func), "entry block bb0 contains a phi");
+    }
+
+    #[test]
+    fn rejects_predecessors_and_backedges_to_physical_entry_block() {
+        let mut func = Function::new("entry_backedge", Type::Void);
+        let latch = func.add_block("latch");
+        func.set_terminator(func.entry, Terminator::Jump(latch));
+        func.set_terminator(latch, Terminator::Jump(func.entry));
+
+        assert_error(&error_messages(&func), "entry block bb0 has predecessors");
     }
 
     #[test]
@@ -769,18 +797,121 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_dominating_ordinary_use_in_dead_diamond() {
+        let mut func = Function::new("dead_ordinary_diamond", Type::I32);
+        let dead_root = func.add_block("dead.root");
+        let dead_left = func.add_block("dead.left");
+        let dead_right = func.add_block("dead.right");
+        let dead_merge = func.add_block("dead.merge");
+        let condition = func.add_const(Const::Bool(true));
+        let one = func.add_const(Const::Int(1));
+        func.set_terminator(func.entry, Terminator::Return(Some(one)));
+        func.set_terminator(
+            dead_root,
+            Terminator::Branch {
+                cond: condition,
+                then_target: dead_left,
+                else_target: dead_right,
+            },
+        );
+        let left_value = func
+            .append_inst(
+                dead_left,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: one,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(dead_left, Terminator::Jump(dead_merge));
+        func.set_terminator(dead_right, Terminator::Jump(dead_merge));
+        let used = func
+            .append_inst(
+                dead_merge,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: left_value,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(dead_merge, Terminator::Return(Some(used)));
+
+        assert_error(&error_messages(&func), "does not dominate its use");
+    }
+
+    #[test]
+    fn rejects_unavailable_phi_incoming_in_dead_diamond() {
+        let mut func = Function::new("dead_diamond", Type::I32);
+        let dead_root = func.add_block("dead.root");
+        let dead_left = func.add_block("dead.left");
+        let dead_right = func.add_block("dead.right");
+        let dead_merge = func.add_block("dead.merge");
+        let condition = func.add_const(Const::Bool(true));
+        let one = func.add_const(Const::Int(1));
+        func.set_terminator(func.entry, Terminator::Return(Some(one)));
+        func.set_terminator(
+            dead_root,
+            Terminator::Branch {
+                cond: condition,
+                then_target: dead_left,
+                else_target: dead_right,
+            },
+        );
+        func.set_terminator(dead_left, Terminator::Jump(dead_merge));
+        let right_value = func
+            .append_inst(
+                dead_right,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: one,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(dead_right, Terminator::Jump(dead_merge));
+        let phi = func
+            .append_inst(
+                dead_merge,
+                InstKind::Phi {
+                    incomings: vec![(dead_left, right_value), (dead_right, right_value)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(dead_merge, Terminator::Return(Some(phi)));
+
+        assert_error(&error_messages(&func), "is not available on edge");
+    }
+
+    #[test]
     fn accepts_well_formed_unreachable_regions_without_invented_dominance() {
         let mut func = Function::new("unreachable", Type::I32);
         let dead_use = func.add_block("dead.use");
         let dead_def = func.add_block("dead.def");
         let one = func.add_const(Const::Int(1));
+        let entry_value = func
+            .append_inst(
+                func.entry,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: one,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
         func.set_terminator(func.entry, Terminator::Return(Some(one)));
         let defined = func
             .append_inst(
                 dead_def,
                 InstKind::Binary {
                     op: BinaryOp::Iadd,
-                    lhs: one,
+                    lhs: entry_value,
                     rhs: one,
                 },
                 Some(Type::I32),

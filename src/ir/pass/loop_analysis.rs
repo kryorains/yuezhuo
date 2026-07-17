@@ -32,7 +32,7 @@ impl LoopInfo {
 
                 let mut blocks = HashSet::from([header]);
                 for latch in &latches {
-                    collect_backedge_blocks(cfg, header, *latch, &mut blocks);
+                    collect_backedge_blocks(cfg, dom, header, *latch, &mut blocks);
                 }
 
                 let outside_predecessors = cfg.preds[header.0]
@@ -40,10 +40,12 @@ impl LoopInfo {
                     .copied()
                     .filter(|pred| !blocks.contains(pred))
                     .collect::<Vec<_>>();
-                let preheader = match outside_predecessors.as_slice() {
-                    [preheader] if cfg.succs[preheader.0] == [header] => Some(*preheader),
+                let unique_entering_pred = match outside_predecessors.as_slice() {
+                    [entering_pred] => Some(*entering_pred),
                     _ => None,
                 };
+                let dedicated_preheader = unique_entering_pred
+                    .filter(|entering_pred| cfg.succs[entering_pred.0] == [header]);
 
                 let mut exit_edges = blocks
                     .iter()
@@ -59,7 +61,8 @@ impl LoopInfo {
 
                 NaturalLoop {
                     header,
-                    preheader,
+                    unique_entering_pred,
+                    dedicated_preheader,
                     latches,
                     blocks,
                     exit_edges,
@@ -77,7 +80,8 @@ impl LoopInfo {
 #[derive(Debug, Clone)]
 pub(super) struct NaturalLoop {
     pub(super) header: BlockId,
-    pub(super) preheader: Option<BlockId>,
+    pub(super) unique_entering_pred: Option<BlockId>,
+    pub(super) dedicated_preheader: Option<BlockId>,
     pub(super) latches: Vec<BlockId>,
     pub(super) blocks: HashSet<BlockId>,
     pub(super) exit_edges: Vec<(BlockId, BlockId)>,
@@ -100,6 +104,7 @@ impl NaturalLoop {
 
 fn collect_backedge_blocks(
     cfg: &ControlFlowGraph,
+    dom: &Dominators,
     header: BlockId,
     latch: BlockId,
     blocks: &mut HashSet<BlockId>,
@@ -108,7 +113,11 @@ fn collect_backedge_blocks(
         let mut stack = vec![latch];
         while let Some(block) = stack.pop() {
             for pred in &cfg.preds[block.0] {
-                if *pred != header && blocks.insert(*pred) {
+                if *pred != header
+                    && dom.is_reachable(*pred)
+                    && dom.dominates(header, *pred)
+                    && blocks.insert(*pred)
+                {
                     stack.push(*pred);
                 }
             }
@@ -132,7 +141,7 @@ pub(super) fn analyze_i32_induction(
     natural_loop: &NaturalLoop,
     phi: ValueId,
 ) -> Option<InductionVariable> {
-    let preheader = natural_loop.preheader?;
+    let entering_pred = natural_loop.unique_entering_pred?;
     let latch = natural_loop.unique_latch()?;
     let value = func.values.get(phi.0)?;
     if value.ty != Type::I32 {
@@ -154,7 +163,7 @@ pub(super) fn analyze_i32_induction(
     if incomings.len() != 2 {
         return None;
     }
-    let initial = unique_incoming(incomings, preheader)?;
+    let initial = unique_incoming(incomings, entering_pred)?;
     let next = unique_incoming(incomings, latch)?;
     if func.values.get(initial.0)?.ty != Type::I32
         || func.values.get(next.0)?.ty != Type::I32
@@ -348,7 +357,8 @@ mod tests {
             assert_eq!(induction.phi, phi);
             assert_eq!(induction.step, expected_step);
             assert!(natural_loop.unique_latch().is_some());
-            assert!(natural_loop.preheader.is_some());
+            assert!(natural_loop.unique_entering_pred.is_some());
+            assert!(natural_loop.dedicated_preheader.is_some());
             assert!(natural_loop.unique_exit().is_some());
         }
     }
@@ -385,7 +395,38 @@ mod tests {
         let loops = LoopInfo::new(&cfg, &dom);
         assert_eq!(loops.loops().len(), 1);
         assert_eq!(loops.loops()[0].header, header);
-        assert_eq!(loops.loops()[0].preheader, None);
+        assert_eq!(loops.loops()[0].unique_entering_pred, Some(func.entry));
+        assert_eq!(loops.loops()[0].dedicated_preheader, None);
+    }
+
+    #[test]
+    fn excludes_unreachable_predecessors_from_natural_loop_blocks() {
+        let mut func = Function::new("dead_loop_predecessor", Type::Void);
+        let header = func.add_block("header");
+        let body = func.add_block("body");
+        let exit = func.add_block("exit");
+        let dead = func.add_block("dead");
+        let condition = func.add_const(Const::Bool(true));
+
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: body,
+                else_target: exit,
+            },
+        );
+        func.set_terminator(body, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+        func.set_terminator(dead, Terminator::Jump(body));
+
+        let natural_loop = only_loop(&func);
+        assert_eq!(natural_loop.header, header);
+        assert!(natural_loop.blocks.contains(&body));
+        assert!(!natural_loop.blocks.contains(&dead));
+        assert_eq!(natural_loop.unique_entering_pred, Some(func.entry));
+        assert_eq!(natural_loop.dedicated_preheader, Some(func.entry));
     }
 
     #[test]
@@ -427,12 +468,14 @@ mod tests {
         let loops = LoopInfo::new(&cfg, &dom);
         assert_eq!(loops.loops().len(), 2);
         assert_eq!(loops.loops()[0].header, first_header);
-        assert_eq!(loops.loops()[0].preheader, Some(entry));
+        assert_eq!(loops.loops()[0].unique_entering_pred, Some(entry));
+        assert_eq!(loops.loops()[0].dedicated_preheader, Some(entry));
         assert_eq!(loops.loops()[0].unique_latch(), Some(first_latch));
         assert_eq!(loops.loops()[0].exit_edges, vec![(first_header, between)]);
         assert_eq!(loops.loops()[0].unique_exit(), Some(between));
         assert_eq!(loops.loops()[1].header, second_header);
-        assert_eq!(loops.loops()[1].preheader, Some(between));
+        assert_eq!(loops.loops()[1].unique_entering_pred, Some(between));
+        assert_eq!(loops.loops()[1].dedicated_preheader, Some(between));
         assert_eq!(loops.loops()[1].unique_latch(), Some(second_latch));
         assert_eq!(loops.loops()[1].unique_exit(), Some(exit));
     }
