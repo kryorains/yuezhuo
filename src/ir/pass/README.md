@@ -24,15 +24,14 @@
   9. `LicmPass`
   10. `InvariantLoadForwardPass`
   11. `DcePass`
-  12. `BitwiseIdiomPass`
-  13. `PiecewiseExprPass`
-  14. `RepeatReductionPass`
-  15. `SimpleLoopUnrollPass`
-  16. `ConstFoldPass`
-  17. `SimplifyCfgPass`
-  18. `DcePass`
+  12. `RepeatReductionPass`
+  13. `SimpleLoopUnrollPass`（按目标收益门控）
+  14. `InstCombinePass`
+  15. `ConstFoldPass`
+  16. `SimplifyCfgPass`
+  17. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行常量折叠、CSE、LICM 等主动改写表达式的优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi，末尾 DCE 再清理归约折叠后失效的循环记账指令。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `InstCombinePass`、常量折叠、CSE、LICM 等主动改写表达式的优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾的 InstCombine 只做局部整数改写，随后由 ConstFold 和 DCE 清理新暴露的常量及死指令。
 
 ## Pass 列表
 
@@ -52,6 +51,18 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 - `x * 1` 简化成 `x`。
 - `x == x` 简化成 `true`。
 - 所有 incoming 都相同的 `phi` 简化成那个唯一值。
+
+### `InstCombinePass` (`inst_combine.rs`)
+
+逐指令执行的通用整数表达式规范化。它遍历所有函数，只检查当前指令及其操作数的直接定义，不读取函数名、变量名、块名，也不匹配整函数或 CFG 形状。目前支持：
+
+- 把可交换 i32 运算规范到稳定操作数顺序，并把常量放在 RHS；
+- 把 `x + x` 改写为 wrapping `x * 2`；
+- 在 wrapping 语义下重关联嵌套常量加法和乘法，例如 `(x * 2) * 2` 变为 `x * 4`；
+- 当 use-def 链精确证明相同 dividend 和相同已知非零 i32 常量除数时，把 `x - (x / d) * d` 改写为 `x % d`；
+- 把 `icmp` 常量换到 RHS，并同步反转大小比较谓词。
+
+pass 不重关联或以其它方式改写浮点运算，也不把局部常量二次幂乘除主动改写成 shift；这类局部指令选择继续由现有后端负责。IR 的动态 shift 仍采用计数低 5 位语义。
 
 ### `SimplifyCfgPass` (`simplify_cfg.rs`)
 
@@ -125,17 +136,11 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 
 它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
 
-### `BitwiseIdiomPass` (`bit_idiom.rs`)
+### `BitwiseIdiomPass`（暂停）
 
-按 SSA 递推语义识别 bit-sliced 整数运算循环。候选必须是无副作用的纯标量 helper，并包含两个逐轮 `/ 2` 的输入、逐轮 `* 2` 的位权、有限位数倒计时和按条件累加位权的结果。pass 对一轮循环的四组输入位做符号执行，从真值表综合出整数 `and/or/xor` 表达式；它不读取变量名、块名、块编号，也不依赖固定的指令数量。
+`bit_idiom.rs` 暂时保留，便于后续按新的证明边界重写和直接测试，但该 pass **没有接入任何生产优化流水线**，O0/O1 均不会运行它。
 
-迭代次数可以是 1 到 32；不足 32 位时自动添加低位掩码。原循环作为慢路径完整保留，只有两个输入都非负时才执行原生位运算快速路径，从而保持 SysY 有符号除法和取模对负数的语义。
-
-### `PiecewiseExprPass` (`piecewise_expr.rs`)
-
-解释无环纯函数中的 selector 等值决策树。当连续的 selector 范围分别返回 `x * 2^selector` 或 `x / 2^selector`，范围外返回 `x` 时，将整条决策树版本化为范围检查和动态移位快速路径。比较顺序、`if` 组织方式、参数顺序及范围端点均不固定。
-
-左移在通过 `0..31` 范围检查后可直接使用；有符号除法只在 `x >= 0` 时使用算术右移，负数和范围外输入继续执行原函数，保持向零截断语义。非连续映射、混合乘除、额外副作用或未知分支都会让 pass 保守退出。
+旧 `PiecewiseExprPass` 已连同模块和专属测试移除，不再做 selector 决策树或整函数快速路径匹配。局部常量二次幂乘除保持普通 IR，由现有后端的局部指令选择处理。
 
 ### `RepeatReductionPass` (`repeat_reduction.rs`)
 
