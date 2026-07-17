@@ -93,14 +93,19 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 self.load_value(*index);
                 "w0".to_string()
             };
-            if (stride & (stride - 1)) == 0 && stride.trailing_zeros() <= 4 {
-                self.body.push_str(&format!(
-                    "  add {}, {}, {}, sxtw #{}\n",
-                    destination,
-                    current_base,
-                    index_reg,
-                    stride.trailing_zeros()
-                ));
+            if (stride & (stride - 1)) == 0 {
+                let shift = stride.trailing_zeros();
+                if shift <= 4 {
+                    self.body.push_str(&format!(
+                        "  add {}, {}, {}, sxtw #{}\n",
+                        destination, current_base, index_reg, shift
+                    ));
+                } else {
+                    self.body.push_str(&format!(
+                        "  sxtw x0, {}\n  add {}, {}, x0, lsl #{}\n",
+                        index_reg, destination, current_base, shift
+                    ));
+                }
             } else {
                 self.body.push_str(&format!("  sxtw x0, {}\n", index_reg));
                 if stride != 1 {
