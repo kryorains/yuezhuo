@@ -1,4 +1,4 @@
-use crate::codegen::common::ir_value_use_counts;
+use crate::codegen::common::{ir_value_use_counts, natural_loop_depths};
 use crate::ir::{Function, InstKind, Terminator, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
@@ -12,7 +12,7 @@ const LEAF_CROSS_REGS: [&str; 6] = ["a2", "a3", "a4", "a5", "a6", "a7"];
 /// 这里先不引入机器 IR，而是直接给 IR value 分配 callee-saved `s` 寄存器：
 /// - `s1..s11` 跨 call 保持，所以 non-leaf function 也能安全使用；
 /// - 只分配 i1/i32/ptr，不碰 f32；
-/// - 有 phi 时先给 phi 结果分配互不复用的寄存器，再把剩余寄存器用于跨块 load/GEP；
+/// - 有 phi 时按自然循环深度优先给热点 phi 分配互不复用的寄存器，再把剩余寄存器用于跨块 load/GEP；
 /// - 叶函数还可把 `a2..a7` 用作无需保存的跨块寄存器；
 /// - 无 phi 时用线性位置估算 live interval，不重叠的区间可以复用寄存器；
 /// - 没有寄存器时回退到原来的栈槽路径。
@@ -26,26 +26,24 @@ impl Riscv64RegAlloc {
         if has_phi(func) {
             let mut regs = HashMap::new();
             let mut used_regs = Vec::new();
-
-            'blocks: for block in &func.blocks {
-                for inst in &block.insts {
-                    if used_regs.len() == INT_REGS.len() {
-                        break 'blocks;
-                    }
-                    if !matches!(inst.kind, InstKind::Phi { .. }) {
-                        continue;
-                    }
-                    let Some(result) = inst.result else {
-                        continue;
+            let scores = weighted_use_scores(func);
+            let mut phi_candidates = func
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .filter_map(|inst| {
+                    let InstKind::Phi { .. } = inst.kind else {
+                        return None;
                     };
-                    if !matches!(func.value(result).ty, Type::I1 | Type::I32 | Type::Ptr(_)) {
-                        continue;
-                    }
-
-                    let reg = INT_REGS[used_regs.len()];
-                    regs.insert(result, reg);
-                    used_regs.push(reg);
-                }
+                    let result = inst.result?;
+                    matches!(func.value(result).ty, Type::I1 | Type::I32 | Type::Ptr(_))
+                        .then_some((result, scores[result.0]))
+                })
+                .collect::<Vec<_>>();
+            phi_candidates.sort_by_key(|(value, score)| (std::cmp::Reverse(*score), value.0));
+            for ((phi, _), reg) in phi_candidates.into_iter().zip(INT_REGS) {
+                regs.insert(phi, reg);
+                used_regs.push(reg);
             }
             let use_counts = ir_value_use_counts(func);
             coalesce_phi_incomings(func, &mut regs, &use_counts);
@@ -62,7 +60,6 @@ impl Riscv64RegAlloc {
                     used_regs.push(reg);
                 }
             }
-
             return Self { regs, used_regs };
         }
 
@@ -290,6 +287,35 @@ fn terminator_uses(terminator: &Terminator) -> Vec<ValueId> {
         Terminator::Branch { cond, .. } => vec![*cond],
         Terminator::Return(None) | Terminator::Jump(_) => Vec::new(),
     }
+}
+
+fn weighted_use_scores(func: &Function) -> Vec<usize> {
+    let loop_depths = natural_loop_depths(func);
+    let weight_for = |block_idx: usize| 1usize << loop_depths[block_idx].saturating_mul(4).min(20);
+    let mut scores = vec![0usize; func.values.len()];
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let weight = weight_for(block_idx);
+        for inst in &block.insts {
+            match &inst.kind {
+                InstKind::Phi { incomings } => {
+                    for (pred, value) in incomings {
+                        scores[value.0] = scores[value.0].saturating_add(weight_for(pred.0));
+                    }
+                }
+                kind => {
+                    for value in inst_uses(kind) {
+                        scores[value.0] = scores[value.0].saturating_add(weight);
+                    }
+                }
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            for value in terminator_uses(terminator) {
+                scores[value.0] = scores[value.0].saturating_add(weight);
+            }
+        }
+    }
+    scores
 }
 
 fn cross_block_memory_candidates(

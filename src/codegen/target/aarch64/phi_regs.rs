@@ -1,4 +1,4 @@
-use crate::codegen::common::ir_value_use_counts;
+use crate::codegen::common::{ir_value_use_counts, natural_loop_depths};
 use crate::ir::{Function, InstKind, Terminator, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
@@ -9,9 +9,9 @@ const LEAF_REGS: [&str; 7] = ["x9", "x10", "x11", "x12", "x13", "x14", "x15"];
 
 /// Conservatively keeps selected integer and pointer values in registers.
 ///
-/// Phi results are assigned first. Every other globally selected value owns a
-/// distinct register for the whole function, so correctness does not depend on
-/// an approximate live-interval analysis. Leaf functions may also use the
+/// Loop-depth-weighted phi results are assigned first. Every other globally
+/// selected value owns a distinct register for the whole function, so
+/// correctness does not depend on an approximate live-interval analysis. Leaf functions may also use the
 /// caller-saved x9-x15 set; every x19-x28 assignment is saved normally.
 pub(super) struct AArch64PhiRegs {
     regs: HashMap<ValueId, &'static str>,
@@ -33,28 +33,27 @@ impl AArch64PhiRegs {
         };
         let mut regs = HashMap::new();
         let mut occupied = HashSet::new();
-
-        'phis: for block in &func.blocks {
-            for inst in &block.insts {
-                if occupied.len() == phi_registers.len() {
-                    break 'phis;
-                }
-                if !matches!(inst.kind, InstKind::Phi { .. }) {
-                    continue;
-                }
-                let Some(result) = inst.result else {
-                    continue;
+        let scores = weighted_use_scores(func);
+        let mut phi_candidates = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| {
+                let InstKind::Phi { .. } = inst.kind else {
+                    return None;
                 };
-                if !is_register_type(&func.value(result).ty) {
-                    continue;
-                }
-
-                let reg = phi_registers[occupied.len()];
-                regs.insert(result, reg);
-                occupied.insert(reg);
-            }
+                let result = inst.result?;
+                is_register_type(&func.value(result).ty).then_some((result, scores[result.0]))
+            })
+            .collect::<Vec<_>>();
+        phi_candidates.sort_by_key(|(value, score)| (std::cmp::Reverse(*score), value.0));
+        for ((phi, _), reg) in phi_candidates
+            .into_iter()
+            .zip(phi_registers.iter().copied())
+        {
+            regs.insert(phi, reg);
+            occupied.insert(reg);
         }
-
         coalesce_phi_incomings(func, &mut regs);
 
         let mut available = Vec::new();
@@ -72,8 +71,6 @@ impl AArch64PhiRegs {
                 .copied()
                 .filter(|reg| !occupied.contains(reg)),
         );
-
-        let scores = weighted_use_scores(func);
         let block_local_values = collect_block_local_values(func);
         let direct_branch_conditions = collect_direct_branch_conditions(func);
         let mut candidates = func
@@ -103,7 +100,6 @@ impl AArch64PhiRegs {
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(value, score)| (std::cmp::Reverse(*score), value.0));
-
         for ((value, _), reg) in candidates.into_iter().zip(available) {
             regs.insert(value, reg);
             occupied.insert(reg);
@@ -299,42 +295,16 @@ fn collect_block_local_values(func: &Function) -> HashSet<ValueId> {
 }
 
 fn weighted_use_scores(func: &Function) -> Vec<usize> {
-    let mut loop_delta = vec![0isize; func.blocks.len() + 1];
-    for (pred_idx, block) in func.blocks.iter().enumerate() {
-        let mut mark_backedge = |target: crate::ir::BlockId| {
-            if target.0 <= pred_idx {
-                loop_delta[target.0] += 1;
-                loop_delta[pred_idx + 1] -= 1;
-            }
-        };
-        match block.terminator.as_ref() {
-            Some(Terminator::Jump(target)) => mark_backedge(*target),
-            Some(Terminator::Branch {
-                then_target,
-                else_target,
-                ..
-            }) => {
-                mark_backedge(*then_target);
-                mark_backedge(*else_target);
-            }
-            Some(Terminator::Return(_)) | None => {}
-        }
-    }
-    let mut loop_blocks = vec![false; func.blocks.len()];
-    let mut active_loops = 0isize;
-    for block_idx in 0..func.blocks.len() {
-        active_loops += loop_delta[block_idx];
-        loop_blocks[block_idx] = active_loops > 0;
-    }
-
+    let loop_depths = natural_loop_depths(func);
+    let weight_for = |block_idx: usize| 1usize << loop_depths[block_idx].saturating_mul(4).min(20);
     let mut scores = vec![0usize; func.values.len()];
     for (block_idx, block) in func.blocks.iter().enumerate() {
-        let weight = if loop_blocks[block_idx] { 16 } else { 1 };
+        let weight = weight_for(block_idx);
         for inst in &block.insts {
             match &inst.kind {
                 InstKind::Phi { incomings } => {
                     for (pred, value) in incomings {
-                        let edge_weight = if loop_blocks[pred.0] { 16 } else { 1 };
+                        let edge_weight = weight_for(pred.0);
                         scores[value.0] = scores[value.0].saturating_add(edge_weight);
                     }
                 }
