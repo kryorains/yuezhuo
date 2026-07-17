@@ -37,4 +37,5 @@
 3. Phi 结果拥有函数级专用寄存器；有限寄存器按自然循环深度加权后的使用成本优先分给热点 phi，安全的单用途 backedge incoming 会与目标 phi 合并。AArch64 还会给高频跨块值分配唯一的函数级寄存器；RISC-V64 在剩余 `s` 寄存器以及叶函数的 `a2-a7` 中保守分配跨块 load/GEP 值。
 4. 无法证明寄存器分配安全的 IR value 仍落到 `IrFuncLayout` 栈槽。`alloca` 的 value 栈槽保存对象地址，对象本体紧跟在地址槽之后。
 5. 普通二元运算、比较、store 和 GEP 直接从两个临时寄存器求值，不再借助运行时求值栈；已有寄存器分配时，load/store、GEP、立即数运算以及 AArch64 `madd` 会直接使用最终寄存器。
-6. Phi 在 terminator 边上生成并行 copy；同寄存器 incoming 不再生成 copy，多值环仍使用栈暂存保证并行语义。无 phi copy 的热分支会直接跳向目标并优先使用顺序后继作为 fallthrough。
+6. 整数 `Iand/Ior/Ixor/Ishl/Iashr` 是普通 IR 指令，由各目标的 `inst.rs` 直接选择原生指令；后端不再按函数 CFG 或源码变量形状注入整函数快速路径。
+7. Phi 在 terminator 边上生成并行 copy；同寄存器 incoming 不再生成 copy，多值环仍使用栈暂存保证并行语义。无 phi copy 的热分支会直接跳向目标并优先使用顺序后继作为 fallthrough。

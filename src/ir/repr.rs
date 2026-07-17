@@ -296,6 +296,12 @@ pub enum BinaryOp {
     Imul,
     Idiv,
     Imod,
+    Iand,
+    Ior,
+    Ixor,
+    /// Variable i32 shifts use the low five bits of the shift count.
+    Ishl,
+    Iashr,
     Fadd,
     Fsub,
     Fmul,

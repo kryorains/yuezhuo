@@ -1,9 +1,6 @@
 use super::regalloc::Riscv64RegAlloc;
 use super::{Riscv64IrEmitter, Riscv64IrFuncEmitter};
-use crate::codegen::common::{
-    emit_ir_data_section, emulated_bitwise_op, emulated_shift_op, ir_align_to, EmulatedBitwiseOp,
-    EmulatedShiftOp, IrFuncLayout, IrModuleCtx,
-};
+use crate::codegen::common::{emit_ir_data_section, ir_align_to, IrFuncLayout, IrModuleCtx};
 use crate::ir::{Function, Module};
 
 pub(super) fn emit_asm(module: &Module) -> String {
@@ -62,37 +59,6 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             ".globl {0}\n.type {0}, @function\n{0}:\n",
             self.func.name
         ));
-        if let Some(op) = emulated_bitwise_op(self.func) {
-            let slow_label = self.parent.ctx.fresh_label("bitwise_slow");
-            let instruction = match op {
-                EmulatedBitwiseOp::And => "and",
-                EmulatedBitwiseOp::Or => "or",
-                EmulatedBitwiseOp::Xor => "xor",
-            };
-            self.parent.out.push_str(&format!(
-                "  bltz a0, {0}\n  bltz a1, {0}\n  {1} a0, a0, a1\n  ret\n{0}:\n",
-                slow_label, instruction
-            ));
-        } else if let Some(op) = emulated_shift_op(self.func) {
-            let slow_label = self.parent.ctx.fresh_label("shift_slow");
-            self.parent.out.push_str(&format!(
-                "  addi t0, a1, -1\n  li t1, 7\n  bgtu t0, t1, {0}\n",
-                slow_label
-            ));
-            match op {
-                EmulatedShiftOp::Left => self
-                    .parent
-                    .out
-                    .push_str(&format!("  sllw a0, a0, a1\n  ret\n{}:\n", slow_label)),
-                EmulatedShiftOp::SignedRight => {
-                    let signed_label = self.parent.ctx.fresh_label("shift_signed");
-                    self.parent.out.push_str(&format!(
-                        "  bltz a0, {0}\n  sraw a0, a0, a1\n  ret\n{0}:\n  li t0, 1\n  sllw t0, t0, a1\n  divw a0, a0, t0\n  ret\n{1}:\n",
-                        signed_label, slow_label
-                    ));
-                }
-            }
-        }
         self.parent
             .out
             .push_str("  addi sp, sp, -16\n  sd ra, 8(sp)\n  sd s0, 0(sp)\n  mv s0, sp\n");

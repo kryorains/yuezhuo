@@ -205,6 +205,18 @@ impl<'a, 'b> X86IrFuncEmitter<'a, 'b> {
                     self.body.push_str("  orl %ecx, %eax\n");
                 }
             }
+            BinaryOp::Ishl | BinaryOp::Iashr => {
+                self.load_value(lhs);
+                self.push_rax();
+                self.load_value(rhs);
+                self.body.push_str("  movl %eax, %ecx\n");
+                self.pop_rax();
+                if op == BinaryOp::Ishl {
+                    self.body.push_str("  sall %cl, %eax\n");
+                } else {
+                    self.body.push_str("  sarl %cl, %eax\n");
+                }
+            }
             _ => {
                 self.load_value(lhs);
                 self.push_rax();
@@ -222,6 +234,9 @@ impl<'a, 'b> X86IrFuncEmitter<'a, 'b> {
                             self.body.push_str("  movl %edx, %eax\n");
                         }
                     }
+                    BinaryOp::Iand => self.body.push_str("  andl %ecx, %eax\n"),
+                    BinaryOp::Ior => self.body.push_str("  orl %ecx, %eax\n"),
+                    BinaryOp::Ixor => self.body.push_str("  xorl %ecx, %eax\n"),
                     _ => unreachable!(),
                 }
             }

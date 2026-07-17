@@ -23,11 +23,13 @@
   8. `LicmPass`
   9. `InvariantLoadForwardPass`
   10. `DcePass`
-  11. `RepeatReductionPass`
-  12. `SimpleLoopUnrollPass`
-  13. `ConstFoldPass`
-  14. `SimplifyCfgPass`
-  15. `DcePass`
+  11. `BitwiseIdiomPass`
+  12. `PiecewiseExprPass`
+  13. `RepeatReductionPass`
+  14. `SimpleLoopUnrollPass`
+  15. `ConstFoldPass`
+  16. `SimplifyCfgPass`
+  17. `DcePass`
 
 O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行常量折叠、CSE、LICM 等主动改写表达式的优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi，末尾 DCE 再清理归约折叠后失效的循环记账指令。
 
@@ -116,6 +118,18 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 转发支配当前位置且来自只读对象的重复加载。
 
 它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
+
+### `BitwiseIdiomPass` (`bit_idiom.rs`)
+
+按 SSA 递推语义识别 bit-sliced 整数运算循环。候选必须是无副作用的纯标量 helper，并包含两个逐轮 `/ 2` 的输入、逐轮 `* 2` 的位权、有限位数倒计时和按条件累加位权的结果。pass 对一轮循环的四组输入位做符号执行，从真值表综合出整数 `and/or/xor` 表达式；它不读取变量名、块名、块编号，也不依赖固定的指令数量。
+
+迭代次数可以是 1 到 32；不足 32 位时自动添加低位掩码。原循环作为慢路径完整保留，只有两个输入都非负时才执行原生位运算快速路径，从而保持 SysY 有符号除法和取模对负数的语义。
+
+### `PiecewiseExprPass` (`piecewise_expr.rs`)
+
+解释无环纯函数中的 selector 等值决策树。当连续的 selector 范围分别返回 `x * 2^selector` 或 `x / 2^selector`，范围外返回 `x` 时，将整条决策树版本化为范围检查和动态移位快速路径。比较顺序、`if` 组织方式、参数顺序及范围端点均不固定。
+
+左移在通过 `0..31` 范围检查后可直接使用；有符号除法只在 `x >= 0` 时使用算术右移，负数和范围外输入继续执行原函数，保持向零截断语义。非连续映射、混合乘除、额外副作用或未知分支都会让 pass 保守退出。
 
 ### `RepeatReductionPass` (`repeat_reduction.rs`)
 

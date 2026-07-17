@@ -147,7 +147,13 @@ impl ExprKey {
 fn normalize_binary_args(op: BinaryOp, lhs: ValueId, rhs: ValueId) -> (ValueId, ValueId) {
     if matches!(
         op,
-        BinaryOp::Iadd | BinaryOp::Imul | BinaryOp::And | BinaryOp::Or
+        BinaryOp::Iadd
+            | BinaryOp::Imul
+            | BinaryOp::Iand
+            | BinaryOp::Ior
+            | BinaryOp::Ixor
+            | BinaryOp::And
+            | BinaryOp::Or
     ) && rhs.0 < lhs.0
     {
         (rhs, lhs)

@@ -1,8 +1,5 @@
 use super::{X86IrEmitter, X86IrFuncEmitter};
-use crate::codegen::common::{
-    emit_ir_data_section, emulated_bitwise_op, emulated_shift_op, ir_align_to, EmulatedBitwiseOp,
-    EmulatedShiftOp, IrFuncLayout, IrModuleCtx,
-};
+use crate::codegen::common::{emit_ir_data_section, ir_align_to, IrFuncLayout, IrModuleCtx};
 use crate::ir::{Function, Module};
 
 pub(super) fn emit_asm(module: &Module) -> String {
@@ -57,37 +54,6 @@ impl<'a, 'b> X86IrFuncEmitter<'a, 'b> {
             ".globl {0}\n.type {0}, @function\n{0}:\n",
             self.func.name
         ));
-        if let Some(op) = emulated_bitwise_op(self.func) {
-            let slow_label = self.parent.ctx.fresh_label("bitwise_slow");
-            let instruction = match op {
-                EmulatedBitwiseOp::And => "andl",
-                EmulatedBitwiseOp::Or => "orl",
-                EmulatedBitwiseOp::Xor => "xorl",
-            };
-            self.parent.out.push_str(&format!(
-                "  testl %edi, %edi\n  js {0}\n  testl %esi, %esi\n  js {0}\n  movl %edi, %eax\n  {1} %esi, %eax\n  ret\n{0}:\n",
-                slow_label, instruction
-            ));
-        } else if let Some(op) = emulated_shift_op(self.func) {
-            let slow_label = self.parent.ctx.fresh_label("shift_slow");
-            self.parent.out.push_str(&format!(
-                "  leal -1(%rsi), %ecx\n  cmpl $7, %ecx\n  ja {0}\n  movl %esi, %ecx\n  movl %edi, %eax\n",
-                slow_label
-            ));
-            match op {
-                EmulatedShiftOp::Left => self
-                    .parent
-                    .out
-                    .push_str(&format!("  sall %cl, %eax\n  ret\n{}:\n", slow_label)),
-                EmulatedShiftOp::SignedRight => {
-                    let signed_label = self.parent.ctx.fresh_label("shift_signed");
-                    self.parent.out.push_str(&format!(
-                        "  testl %eax, %eax\n  js {0}\n  sarl %cl, %eax\n  ret\n{0}:\n  movl $1, %r8d\n  sall %cl, %r8d\n  cltd\n  idivl %r8d\n  ret\n{1}:\n",
-                        signed_label, slow_label
-                    ));
-                }
-            }
-        }
         self.parent
             .out
             .push_str("  pushq %rbp\n  movq %rsp, %rbp\n");

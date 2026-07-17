@@ -144,6 +144,31 @@ fn simplify_binary(
             _ if lhs == rhs => Some(get_or_add_const(func, Const::Int(0))),
             _ => None,
         },
+        BinaryOp::Iand => match (const_int(func, lhs), const_int(func, rhs)) {
+            (Some(0), _) | (_, Some(0)) => Some(get_or_add_const(func, Const::Int(0))),
+            (Some(-1), _) => Some(rhs),
+            (_, Some(-1)) => Some(lhs),
+            _ if lhs == rhs => Some(lhs),
+            _ => None,
+        },
+        BinaryOp::Ior => match (const_int(func, lhs), const_int(func, rhs)) {
+            (Some(0), _) => Some(rhs),
+            (_, Some(0)) => Some(lhs),
+            (Some(-1), _) | (_, Some(-1)) => Some(get_or_add_const(func, Const::Int(-1))),
+            _ if lhs == rhs => Some(lhs),
+            _ => None,
+        },
+        BinaryOp::Ixor => match (const_int(func, lhs), const_int(func, rhs)) {
+            (Some(0), _) => Some(rhs),
+            (_, Some(0)) => Some(lhs),
+            _ if lhs == rhs => Some(get_or_add_const(func, Const::Int(0))),
+            _ => None,
+        },
+        BinaryOp::Ishl | BinaryOp::Iashr => match (const_int(func, lhs), const_int(func, rhs)) {
+            (Some(0), _) => Some(get_or_add_const(func, Const::Int(0))),
+            (_, Some(0)) => Some(lhs),
+            _ => None,
+        },
         BinaryOp::Fadd => None,
         BinaryOp::Fsub => match const_float(func, rhs) {
             Some(value) if value == 0.0 => Some(lhs),
@@ -203,6 +228,15 @@ fn fold_binary(op: BinaryOp, lhs: &Const, rhs: &Const) -> Option<Const> {
         }
         (BinaryOp::Imod, Const::Int(lhs), Const::Int(rhs)) => {
             Some(Const::Int(lhs.wrapping_rem(*rhs)))
+        }
+        (BinaryOp::Iand, Const::Int(lhs), Const::Int(rhs)) => Some(Const::Int(*lhs & *rhs)),
+        (BinaryOp::Ior, Const::Int(lhs), Const::Int(rhs)) => Some(Const::Int(*lhs | *rhs)),
+        (BinaryOp::Ixor, Const::Int(lhs), Const::Int(rhs)) => Some(Const::Int(*lhs ^ *rhs)),
+        (BinaryOp::Ishl, Const::Int(lhs), Const::Int(rhs)) => {
+            Some(Const::Int(lhs.wrapping_shl((*rhs as u32) & 31)))
+        }
+        (BinaryOp::Iashr, Const::Int(lhs), Const::Int(rhs)) => {
+            Some(Const::Int(lhs.wrapping_shr((*rhs as u32) & 31)))
         }
         (BinaryOp::Fadd, Const::Float(lhs), Const::Float(rhs)) => Some(Const::Float(
             (f32::from_bits(*lhs) + f32::from_bits(*rhs)).to_bits(),

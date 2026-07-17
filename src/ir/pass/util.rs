@@ -1,4 +1,4 @@
-use crate::ir::{Function, Inst, InstKind, Terminator, ValueId};
+use crate::ir::{BlockId, Const, Function, Inst, InstKind, Terminator, ValueId, ValueKind};
 use std::collections::HashMap;
 
 pub(super) type ValueReplacements = HashMap<ValueId, ValueId>;
@@ -30,6 +30,95 @@ pub(super) fn resolve_replacement(mut value: ValueId, replacements: &ValueReplac
         value = next;
     }
     value
+}
+
+/// Moves the original entry body to an appended fallback block, leaving the
+/// physical entry block empty so an optimization can install a guarded fast
+/// path without changing the backend's block-zero entry convention.
+pub(super) fn move_entry_to_fallback(
+    func: &mut Function,
+    fallback_name: impl Into<String>,
+) -> Option<BlockId> {
+    let entry = func.entry;
+    if entry.0 != 0 || func.blocks.get(entry.0)?.terminator.is_none() {
+        return None;
+    }
+    if func.blocks.iter().any(|block| {
+        terminator_targets(block.terminator.as_ref())
+            .into_iter()
+            .any(|target| target == entry)
+    }) {
+        return None;
+    }
+
+    let fallback = func.add_block(fallback_name);
+    let entry_insts = std::mem::take(&mut func.blocks[entry.0].insts);
+    let entry_terminator = func.blocks[entry.0].terminator.take();
+    func.blocks[fallback.0].insts = entry_insts;
+    func.blocks[fallback.0].terminator = entry_terminator;
+
+    for value in &mut func.values {
+        if let ValueKind::Inst(owner, _) = &mut value.kind {
+            if *owner == entry {
+                *owner = fallback;
+            }
+        }
+    }
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            let InstKind::Phi { incomings } = &mut inst.kind else {
+                continue;
+            };
+            for (pred, _) in incomings {
+                if *pred == entry {
+                    *pred = fallback;
+                }
+            }
+        }
+    }
+    Some(fallback)
+}
+
+pub(super) fn defining_inst(func: &Function, value: ValueId) -> Option<&InstKind> {
+    let ValueKind::Inst(block, inst_idx) = func.values.get(value.0)?.kind else {
+        return None;
+    };
+    let inst = func.blocks.get(block.0)?.insts.get(inst_idx)?;
+    (inst.result == Some(value)).then_some(&inst.kind)
+}
+
+pub(super) fn const_i32(func: &Function, value: ValueId) -> Option<i32> {
+    match func.values.get(value.0).map(|value| &value.kind) {
+        Some(ValueKind::Const(Const::Int(value))) => Some(*value),
+        _ => None,
+    }
+}
+
+pub(super) fn get_or_add_i32_const(func: &mut Function, expected: i32) -> ValueId {
+    func.values
+        .iter()
+        .position(
+            |value| matches!(value.kind, ValueKind::Const(Const::Int(value)) if value == expected),
+        )
+        .map(ValueId)
+        .unwrap_or_else(|| func.add_const(Const::Int(expected)))
+}
+
+fn terminator_targets(terminator: Option<&Terminator>) -> Vec<BlockId> {
+    match terminator {
+        Some(Terminator::Jump(target)) => vec![*target],
+        Some(Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        }) if then_target == else_target => vec![*then_target],
+        Some(Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        }) => vec![*then_target, *else_target],
+        Some(Terminator::Return(_)) | None => Vec::new(),
+    }
 }
 
 fn rewrite_value(value: &mut ValueId, replacements: &ValueReplacements) -> bool {

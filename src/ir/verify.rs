@@ -1,4 +1,6 @@
-use super::{Block, BlockId, Function, Inst, InstKind, Terminator, ValueId, ValueKind};
+use super::{
+    BinaryOp, Block, BlockId, Function, Inst, InstKind, Terminator, Type, ValueId, ValueKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyError {
@@ -129,9 +131,12 @@ impl<'a> Verifier<'a> {
                 }
             }
             InstKind::Unary { value, .. } => self.check_value_id(*value, "unary operand"),
-            InstKind::Binary { lhs, rhs, .. }
-            | InstKind::Icmp { lhs, rhs, .. }
-            | InstKind::Fcmp { lhs, rhs, .. } => {
+            InstKind::Binary { op, lhs, rhs } => {
+                self.check_value_id(*lhs, "lhs operand");
+                self.check_value_id(*rhs, "rhs operand");
+                self.verify_binary_types(block, inst, *op, *lhs, *rhs);
+            }
+            InstKind::Icmp { lhs, rhs, .. } | InstKind::Fcmp { lhs, rhs, .. } => {
                 self.check_value_id(*lhs, "lhs operand");
                 self.check_value_id(*rhs, "rhs operand");
             }
@@ -145,6 +150,44 @@ impl<'a> Verifier<'a> {
             InstKind::Call { args, .. } => {
                 for arg in args {
                     self.check_value_id(*arg, "call argument");
+                }
+            }
+        }
+    }
+
+    fn verify_binary_types(
+        &mut self,
+        block: BlockId,
+        inst: &Inst,
+        op: BinaryOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) {
+        let expected = match op {
+            BinaryOp::Iadd
+            | BinaryOp::Isub
+            | BinaryOp::Imul
+            | BinaryOp::Idiv
+            | BinaryOp::Imod
+            | BinaryOp::Iand
+            | BinaryOp::Ior
+            | BinaryOp::Ixor
+            | BinaryOp::Ishl
+            | BinaryOp::Iashr => Type::I32,
+            BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => Type::F32,
+            BinaryOp::And | BinaryOp::Or => Type::I1,
+        };
+        let Some(result) = inst.result else {
+            self.error(format!("{} has binary instruction without result", block));
+            return;
+        };
+        for (label, value) in [("lhs", lhs), ("rhs", rhs), ("result", result)] {
+            if let Some(actual) = self.func.values.get(value.0).map(|value| &value.ty) {
+                if actual != &expected {
+                    self.error(format!(
+                        "{} binary {:?} {} {} has type {:?}, expected {:?}",
+                        block, op, label, value, actual, expected
+                    ));
                 }
             }
         }
