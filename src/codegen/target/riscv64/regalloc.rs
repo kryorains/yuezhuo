@@ -24,6 +24,12 @@ pub(super) struct Riscv64RegAlloc {
 impl Riscv64RegAlloc {
     pub(super) fn new(func: &Function) -> Self {
         if has_phi(func) {
+            let leaf = is_leaf(func);
+            let mut available = Vec::new();
+            if leaf {
+                available.extend(LEAF_CROSS_REGS);
+            }
+            available.extend(INT_REGS);
             let mut regs = HashMap::new();
             let mut used_regs = Vec::new();
             let scores = weighted_use_scores(func);
@@ -41,20 +47,27 @@ impl Riscv64RegAlloc {
                 })
                 .collect::<Vec<_>>();
             phi_candidates.sort_by_key(|(value, score)| (std::cmp::Reverse(*score), value.0));
-            for ((phi, _), reg) in phi_candidates.into_iter().zip(INT_REGS) {
+            for ((phi, _), reg) in phi_candidates.into_iter().zip(available.iter().copied()) {
                 regs.insert(phi, reg);
-                used_regs.push(reg);
+                if INT_REGS.contains(&reg) {
+                    used_regs.push(reg);
+                }
             }
             let use_counts = ir_value_use_counts(func);
             coalesce_phi_incomings(func, &mut regs, &use_counts);
-            let mut cross_regs = INT_REGS[used_regs.len()..].to_vec();
-            if is_leaf(func) {
-                cross_regs.extend(LEAF_CROSS_REGS);
-            }
-            for (value, reg) in cross_block_memory_candidates(func, &regs)
+            let occupied = regs.values().copied().collect::<HashSet<_>>();
+            let cross_regs = available
                 .into_iter()
-                .zip(cross_regs)
-            {
+                .filter(|reg| !occupied.contains(reg))
+                .collect::<Vec<_>>();
+            let mut global_candidates = call_crossing_candidates(func, &regs);
+            let global_candidate_set = global_candidates.iter().copied().collect::<HashSet<_>>();
+            let memory_candidates = cross_block_memory_candidates(func, &regs)
+                .into_iter()
+                .filter(|value| !global_candidate_set.contains(value))
+                .collect::<Vec<_>>();
+            global_candidates.extend(memory_candidates);
+            for (value, reg) in global_candidates.into_iter().zip(cross_regs) {
                 regs.insert(value, reg);
                 if INT_REGS.contains(&reg) {
                     used_regs.push(reg);
@@ -289,6 +302,66 @@ fn terminator_uses(terminator: &Terminator) -> Vec<ValueId> {
     }
 }
 
+fn call_crossing_candidates(
+    func: &Function,
+    assigned: &HashMap<ValueId, &'static str>,
+) -> Vec<ValueId> {
+    let mut candidates = Vec::new();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let calls = block
+            .insts
+            .iter()
+            .enumerate()
+            .filter_map(|(inst_idx, inst)| {
+                matches!(inst.kind, InstKind::Call { .. }).then_some(inst_idx)
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            continue;
+        }
+
+        let mut uses = HashMap::<ValueId, (usize, usize)>::new();
+        for (inst_idx, inst) in block.insts.iter().enumerate() {
+            for operand in inst_uses(&inst.kind) {
+                let entry = uses.entry(operand).or_insert((inst_idx, 0));
+                entry.0 = entry.0.max(inst_idx);
+                entry.1 += 1;
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            for operand in terminator_uses(terminator) {
+                let entry = uses.entry(operand).or_insert((block.insts.len(), 0));
+                entry.0 = block.insts.len();
+                entry.1 += 1;
+            }
+        }
+
+        for (value, (last_use, use_count)) in uses {
+            if assigned.contains_key(&value)
+                || !matches!(func.value(value).ty, Type::I1 | Type::I32 | Type::Ptr(_))
+            {
+                continue;
+            }
+            let ValueKind::Inst(owner, def_idx) = func.value(value).kind else {
+                continue;
+            };
+            let next_call = calls.partition_point(|call_idx| *call_idx <= def_idx);
+            if owner.0 != block_idx
+                || !calls
+                    .get(next_call)
+                    .is_some_and(|call_idx| *call_idx < last_use)
+            {
+                continue;
+            }
+            candidates.push((value, use_count, last_use - def_idx));
+        }
+    }
+    candidates.sort_by_key(|(value, uses, span)| {
+        (std::cmp::Reverse(*uses), std::cmp::Reverse(*span), value.0)
+    });
+    candidates.into_iter().map(|(value, _, _)| value).collect()
+}
+
 fn weighted_use_scores(func: &Function) -> Vec<usize> {
     let loop_depths = natural_loop_depths(func);
     let weight_for = |block_idx: usize| 1usize << loop_depths[block_idx].saturating_mul(4).min(20);
@@ -402,22 +475,34 @@ fn coalesce_phi_incomings(
             {
                 continue;
             }
-            let ValueKind::Inst(owner, inst_idx) = func.value(incoming).kind else {
-                continue;
-            };
-            if owner != pred
-                || !matches!(
-                    func.blocks.get(owner.0).and_then(|block| block.insts.get(inst_idx)),
-                    Some(crate::ir::Inst {
-                        result: Some(result),
-                        ..
-                    }) if *result == incoming
-                )
-                || phi_used_after(pred, inst_idx, phi, &local_last_uses, &edge_phi_uses)
-            {
-                continue;
+            match func.value(incoming).kind {
+                ValueKind::Param => {
+                    // A parameter can share the phi register only on an entry edge. On a
+                    // later edge, the phi register may already have been overwritten before
+                    // the original parameter is consumed (for example by a nested loop).
+                    if pred == func.entry && !LEAF_CROSS_REGS.contains(&reg) {
+                        regs.insert(incoming, reg);
+                    }
+                }
+                ValueKind::Inst(owner, inst_idx) => {
+                    if owner != pred
+                        || !matches!(
+                            func.blocks
+                                .get(owner.0)
+                                .and_then(|block| block.insts.get(inst_idx)),
+                            Some(crate::ir::Inst {
+                                result: Some(result),
+                                ..
+                            }) if *result == incoming
+                        )
+                        || phi_used_after(pred, inst_idx, phi, &local_last_uses, &edge_phi_uses)
+                    {
+                        continue;
+                    }
+                    regs.insert(incoming, reg);
+                }
+                ValueKind::Const(_) | ValueKind::Global(_) => {}
             }
-            regs.insert(incoming, reg);
         }
     }
 }

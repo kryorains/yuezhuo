@@ -33,7 +33,11 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             func,
             layout: IrFuncLayout::new(func),
             regalloc: Riscv64RegAlloc::new(func),
-            local_regs: crate::codegen::common::IrLocalRegs::new(func, &["t3", "t4", "t5", "t6"]),
+            local_regs: crate::codegen::common::IrLocalRegs::new(
+                func,
+                &["t3", "t4", "t5", "t6"],
+                true,
+            ),
             value_use_counts: crate::codegen::common::ir_value_use_counts(func),
             body: String::new(),
             return_label: format!(".L_return_{}", func.name),
@@ -55,9 +59,21 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
         let saved_regs = self.regalloc.used_regs().to_vec();
         let stack_size = ir_align_to(self.layout.stack_size + self.regalloc.saved_area_size(), 16);
+        let recursive = self.func.blocks.iter().any(|block| {
+            block.insts.iter().any(|inst| {
+                matches!(&inst.kind, crate::ir::InstKind::Call { name, .. } if name == &self.func.name)
+            })
+        });
+        // Keep large/recursive hot functions on a stable fetch boundary. Small
+        // functions use a modest alignment to limit padding growth.
+        let function_alignment = if self.func.blocks.len() >= 16 || recursive {
+            7
+        } else {
+            4
+        };
         self.parent.out.push_str(&format!(
-            ".globl {0}\n.type {0}, @function\n{0}:\n",
-            self.func.name
+            ".p2align {1}\n.globl {0}\n.type {0}, @function\n{0}:\n",
+            self.func.name, function_alignment
         ));
         self.parent
             .out

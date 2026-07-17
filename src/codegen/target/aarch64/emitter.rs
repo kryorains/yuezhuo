@@ -37,6 +37,7 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             local_regs: crate::codegen::common::IrLocalRegs::new(
                 func,
                 &["x3", "x4", "x5", "x6", "x7"],
+                false,
             ),
             value_use_counts: crate::codegen::common::ir_value_use_counts(func),
             body: String::new(),

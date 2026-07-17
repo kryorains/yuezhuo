@@ -191,6 +191,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
     fn emit_branch_if_false(&mut self, cond: ValueId, target: String) {
         if let Some((op, lhs, rhs)) = self.direct_branch_icmp(cond) {
+            if self.emit_zero_icmp_branch_if_false(op, lhs, rhs, &target) {
+                return;
+            }
             self.load_value_into(lhs, "a1");
             self.load_value(rhs);
             let branch = match op {
@@ -206,6 +209,42 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             self.load_value(cond);
             self.body.push_str(&format!("  beqz a0, {}\n", target));
         }
+    }
+
+    fn emit_zero_icmp_branch_if_false(
+        &mut self,
+        op: CmpOp,
+        lhs: ValueId,
+        rhs: ValueId,
+        target: &str,
+    ) -> bool {
+        let (value, branch) = if const_i32(self.func, rhs) == Some(0) {
+            let branch = match op {
+                CmpOp::Lt => "bgez",
+                CmpOp::Gt => "blez",
+                CmpOp::Le => "bgtz",
+                CmpOp::Ge => "bltz",
+                CmpOp::Eq => "bnez",
+                CmpOp::Ne => "beqz",
+            };
+            (lhs, branch)
+        } else if const_i32(self.func, lhs) == Some(0) {
+            let branch = match op {
+                CmpOp::Lt => "blez",
+                CmpOp::Gt => "bgez",
+                CmpOp::Le => "bltz",
+                CmpOp::Ge => "bgtz",
+                CmpOp::Eq => "bnez",
+                CmpOp::Ne => "beqz",
+            };
+            (rhs, branch)
+        } else {
+            return false;
+        };
+        let reg = self.load_or_assigned(value, "a0");
+        self.body
+            .push_str(&format!("  {} {}, {}\n", branch, reg, target));
+        true
     }
 
     fn emit_unary(&mut self, op: UnaryOp, value: ValueId) {
@@ -495,10 +534,17 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             self.body.push_str("  negw t0, t0\n");
         }
         if remainder {
-            self.body.push_str(&format!(
-                "  li t1, {}\n  mulw t0, t0, t1\n  subw a0, t2, t0\n",
-                divisor
-            ));
+            if divisor > 0 && ((divisor as u32) + 1).is_power_of_two() {
+                self.body.push_str(&format!(
+                    "  slliw t1, t0, {}\n  subw t0, t1, t0\n  subw a0, t2, t0\n",
+                    ((divisor as u32) + 1).trailing_zeros()
+                ));
+            } else {
+                self.body.push_str(&format!(
+                    "  li t1, {}\n  mulw t0, t0, t1\n  subw a0, t2, t0\n",
+                    divisor
+                ));
+            }
         } else {
             self.body.push_str("  mv a0, t0\n");
         }
