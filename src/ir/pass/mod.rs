@@ -4,6 +4,7 @@ mod dce;
 mod dominators;
 mod licm;
 mod local_forward;
+mod repeat_reduction;
 mod scalar_promote;
 mod simplify_cfg;
 mod tail_recursion;
@@ -15,6 +16,7 @@ use cse::CsePass;
 use dce::DcePass;
 use licm::LicmPass;
 use local_forward::LocalForwardPass;
+use repeat_reduction::RepeatReductionPass;
 use scalar_promote::ScalarPromotePass;
 use simplify_cfg::SimplifyCfgPass;
 use tail_recursion::TailRecursionPass;
@@ -29,7 +31,13 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel) {
     // 所有优化 pass 都在这里排队，方便统一调整执行顺序。
     let mut pipeline = PassPipeline::new();
     match opt_level {
-        OptLevel::O0 => {}
+        OptLevel::O0 => {
+            pipeline.add(ScalarPromotePass::new());
+            pipeline.add(LocalForwardPass::new());
+            pipeline.add(DcePass::new());
+            pipeline.add(RepeatReductionPass::new());
+            pipeline.add(DcePass::new());
+        }
         OptLevel::O1 => {
             // 先折叠常量和死分支，再做标量提升/局部转发，最后再清一次新产生的机会。
             pipeline.add(ConstFoldPass::new());
@@ -39,6 +47,8 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel) {
             pipeline.add(LocalForwardPass::new());
             pipeline.add(CsePass::new());
             pipeline.add(LicmPass::new());
+            pipeline.add(DcePass::new());
+            pipeline.add(RepeatReductionPass::new());
             pipeline.add(ConstFoldPass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());

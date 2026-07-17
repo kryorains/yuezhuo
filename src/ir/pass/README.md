@@ -6,7 +6,12 @@
 
 入口在 `mod.rs` 的 `run_pipeline`：
 
-- `OptLevel::O0`：不跑任何优化 pass。
+- `OptLevel::O0`：仍保留源码层面的控制流与表达式，但会执行后端所需的标量规范化：
+  1. `ScalarPromotePass`
+  2. `LocalForwardPass`
+  3. `DcePass`
+  4. `RepeatReductionPass`
+  5. `DcePass`
 - `OptLevel::O1`：按下面顺序执行：
   1. `ConstFoldPass`
   2. `SimplifyCfgPass`
@@ -15,11 +20,13 @@
   5. `LocalForwardPass`
   6. `CsePass`
   7. `LicmPass`
-  8. `ConstFoldPass`
-  9. `SimplifyCfgPass`
-  10. `DcePass`
+  8. `DcePass`
+  9. `RepeatReductionPass`
+  10. `ConstFoldPass`
+  11. `SimplifyCfgPass`
+  12. `DcePass`
 
-这里会重复跑常量折叠和 CFG 简化，因为前面的 pass 可能制造新的常量、死分支或无用指令，后面的 pass 再把这些机会吃掉。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行常量折叠、CSE、LICM 等主动改写表达式的优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi，末尾 DCE 再清理归约折叠后失效的循环记账指令。
 
 ## Pass 列表
 
@@ -94,6 +101,18 @@
 - 遇到 `call` 或 `memzero` 这类可能改写内存的指令时，清空记录。
 
 目前只跟踪非数组的本地 `alloca` 指针，避免别名关系不清导致错误优化。
+
+### `RepeatReductionPass` (`repeat_reduction.rs`)
+
+无副作用重复归约折叠。
+
+它识别从 0 开始、每轮加 1 的计数循环；当循环体没有 `store`、`call`、`memzero` 等副作用，并且唯一可观察的循环状态满足 `acc' = acc + delta` 时，把重复执行改写为：
+
+1. 执行一次原循环体，得到单轮增量 `delta`；
+2. 计算 `initial + delta * count`；
+3. 把计数器直接推进到循环上界并退出。
+
+变换使用 i32 环绕算术，因此与逐轮累加在模 2^32 下等价。计数器参与循环体计算、非线性累加、额外活跃 loop phi、依赖累加器的分支、循环内存写入及侧出口都会让该 pass 保守退出。
 
 ### `DcePass` (`dce.rs`)
 

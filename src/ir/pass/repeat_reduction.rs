@@ -1,0 +1,465 @@
+use super::dominators::{ControlFlowGraph, Dominators};
+use super::ModulePass;
+use crate::ir::{
+    BinaryOp, BlockId, CmpOp, Const, Function, InstKind, Module, Terminator, Type, ValueId,
+    ValueKind,
+};
+use std::collections::HashSet;
+
+/// Collapses a side-effect-free counted loop whose only loop-carried state is
+/// `accumulator += invariant_work` into one iteration and a final multiply.
+pub(super) struct RepeatReductionPass;
+
+impl RepeatReductionPass {
+    pub(super) fn new() -> Self {
+        Self
+    }
+}
+
+impl ModulePass for RepeatReductionPass {
+    fn run(&mut self, module: &mut Module) {
+        for func in &mut module.funcs {
+            collapse_repeated_reductions(func);
+        }
+    }
+}
+
+fn collapse_repeated_reductions(func: &mut Function) {
+    if func.blocks.len() > 1024 || func.values.len() > 8192 {
+        return;
+    }
+
+    let cfg = ControlFlowGraph::new(func);
+    let dom = Dominators::new(func, &cfg);
+    let mut loops = find_natural_loops(&cfg, &dom);
+    // Applying a reduction only changes values, not CFG edges, so one analysis
+    // can serve every candidate in the function.
+    loops.sort_by_key(|natural_loop| std::cmp::Reverse(natural_loop.blocks.len()));
+
+    let mut changed = false;
+    for natural_loop in loops {
+        let Some(reduction) = match_reduction(func, &cfg, &natural_loop) else {
+            continue;
+        };
+        apply_reduction(func, reduction);
+        changed = true;
+    }
+
+    if changed {
+        if let Err(errors) = func.verify() {
+            panic!(
+                "repeat reduction produced invalid IR in {}: {:?}",
+                func.name, errors
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NaturalLoop {
+    header: BlockId,
+    preheader: BlockId,
+    latch: BlockId,
+    blocks: HashSet<BlockId>,
+}
+
+#[derive(Clone, Copy)]
+struct Reduction {
+    header: BlockId,
+    latch: BlockId,
+    accumulator: ValueId,
+    accumulator_next: ValueId,
+    accumulator_initial: ValueId,
+    counter: ValueId,
+    bound: ValueId,
+}
+
+fn find_natural_loops(cfg: &ControlFlowGraph, dom: &Dominators) -> Vec<NaturalLoop> {
+    let mut loops = Vec::new();
+    for latch_idx in 0..cfg.succs.len() {
+        let latch = BlockId(latch_idx);
+        for header in &cfg.succs[latch_idx] {
+            if !dom.dominates(*header, latch) {
+                continue;
+            }
+            let blocks = collect_loop_blocks(cfg, *header, latch);
+            let outside_preds = cfg.preds[header.0]
+                .iter()
+                .copied()
+                .filter(|pred| !blocks.contains(pred))
+                .collect::<Vec<_>>();
+            let [preheader] = outside_preds.as_slice() else {
+                continue;
+            };
+            if cfg.preds[header.0].len() != 2 {
+                continue;
+            }
+            loops.push(NaturalLoop {
+                header: *header,
+                preheader: *preheader,
+                latch,
+                blocks,
+            });
+        }
+    }
+    loops
+}
+
+fn collect_loop_blocks(
+    cfg: &ControlFlowGraph,
+    header: BlockId,
+    latch: BlockId,
+) -> HashSet<BlockId> {
+    let mut blocks = HashSet::from([header, latch]);
+    let mut stack = vec![latch];
+    while let Some(block) = stack.pop() {
+        for pred in &cfg.preds[block.0] {
+            if blocks.insert(*pred) {
+                stack.push(*pred);
+            }
+        }
+    }
+    blocks
+}
+
+fn match_reduction(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    natural_loop: &NaturalLoop,
+) -> Option<Reduction> {
+    let header = &func.blocks[natural_loop.header.0];
+    let Terminator::Branch {
+        cond,
+        then_target,
+        else_target,
+    } = header.terminator.as_ref()?
+    else {
+        return None;
+    };
+    if !natural_loop.blocks.contains(then_target)
+        || natural_loop.blocks.contains(else_target)
+        || natural_loop.blocks.iter().any(|block| {
+            *block != natural_loop.header
+                && cfg.succs[block.0]
+                    .iter()
+                    .any(|succ| !natural_loop.blocks.contains(succ))
+        })
+    {
+        return None;
+    }
+
+    let InstKind::Icmp {
+        op: CmpOp::Lt,
+        lhs: counter,
+        rhs: bound,
+    } = defining_inst(func, *cond)?
+    else {
+        return None;
+    };
+    if value_defined_in_blocks(func, *bound, &natural_loop.blocks)
+        || value_use_count(func, *counter) != 2
+        || loop_has_side_effects(func, natural_loop)
+    {
+        return None;
+    }
+
+    let phi_results = header
+        .insts
+        .iter()
+        .filter_map(|inst| {
+            matches!(inst.kind, InstKind::Phi { .. })
+                .then_some(inst.result)
+                .flatten()
+        })
+        .filter(|value| has_nontrivial_use(func, *value))
+        .collect::<Vec<_>>();
+    if phi_results.len() != 2 || !phi_results.contains(counter) {
+        return None;
+    }
+    let accumulator = *phi_results.iter().find(|value| *value != counter)?;
+    if func.value(accumulator).ty != Type::I32 || func.value(*counter).ty != Type::I32 {
+        return None;
+    }
+
+    let counter_initial = phi_incoming(func, *counter, natural_loop.preheader)?;
+    let counter_next = phi_incoming(func, *counter, natural_loop.latch)?;
+    if !is_const_int(func, counter_initial, 0)
+        || !is_add_one(func, counter_next, *counter)
+        || !value_defined_in_block(func, counter_next, natural_loop.latch)
+        || value_use_count(func, counter_next) != 1
+    {
+        return None;
+    }
+
+    let accumulator_initial = phi_incoming(func, accumulator, natural_loop.preheader)?;
+    let accumulator_next = phi_incoming(func, accumulator, natural_loop.latch)?;
+    if !value_defined_in_blocks(func, accumulator_next, &natural_loop.blocks)
+        || !accumulator_is_affine(func, natural_loop, accumulator, accumulator_next)
+        || cfg.succs[natural_loop.latch.0] != [natural_loop.header]
+    {
+        return None;
+    }
+
+    Some(Reduction {
+        header: natural_loop.header,
+        latch: natural_loop.latch,
+        accumulator,
+        accumulator_next,
+        accumulator_initial,
+        counter: *counter,
+        bound: *bound,
+    })
+}
+
+fn loop_has_side_effects(func: &Function, natural_loop: &NaturalLoop) -> bool {
+    natural_loop.blocks.iter().any(|block| {
+        func.blocks[block.0].insts.iter().any(|inst| {
+            matches!(
+                inst.kind,
+                InstKind::Store { .. } | InstKind::MemZero { .. } | InstKind::Call { .. }
+            )
+        })
+    })
+}
+
+fn accumulator_is_affine(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    accumulator: ValueId,
+    accumulator_next: ValueId,
+) -> bool {
+    let mut dependent = HashSet::from([accumulator]);
+    loop {
+        let mut changed = false;
+        for block in &natural_loop.blocks {
+            for inst in &func.blocks[block.0].insts {
+                let Some(result) = inst.result else {
+                    continue;
+                };
+                if dependent.contains(&result) {
+                    continue;
+                }
+                if inst_operands(&inst.kind)
+                    .iter()
+                    .any(|value| dependent.contains(value))
+                {
+                    dependent.insert(result);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if !dependent.contains(&accumulator_next) {
+        return false;
+    }
+
+    for block in &natural_loop.blocks {
+        if terminator_operands(func.blocks[block.0].terminator.as_ref())
+            .iter()
+            .any(|value| dependent.contains(value))
+        {
+            return false;
+        }
+        for inst in &func.blocks[block.0].insts {
+            let Some(result) = inst.result else {
+                continue;
+            };
+            if result == accumulator {
+                continue;
+            }
+            let operands = inst_operands(&inst.kind);
+            let dependent_operands = operands
+                .iter()
+                .filter(|value| dependent.contains(value))
+                .count();
+            if dependent_operands == 0 {
+                continue;
+            }
+            let valid = match &inst.kind {
+                InstKind::Phi { incomings } => {
+                    incomings.iter().all(|(_, value)| dependent.contains(value))
+                }
+                InstKind::Binary {
+                    op: BinaryOp::Iadd, ..
+                } => dependent_operands == 1,
+                InstKind::Binary {
+                    op: BinaryOp::Isub,
+                    lhs,
+                    rhs,
+                } => dependent.contains(lhs) && !dependent.contains(rhs),
+                _ => false,
+            };
+            if !valid {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn apply_reduction(func: &mut Function, reduction: Reduction) {
+    let delta = func
+        .append_inst(
+            reduction.latch,
+            InstKind::Binary {
+                op: BinaryOp::Isub,
+                lhs: reduction.accumulator_next,
+                rhs: reduction.accumulator,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let repeated_delta = func
+        .append_inst(
+            reduction.latch,
+            InstKind::Binary {
+                op: BinaryOp::Imul,
+                lhs: delta,
+                rhs: reduction.bound,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let collapsed = func
+        .append_inst(
+            reduction.latch,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: reduction.accumulator_initial,
+                rhs: repeated_delta,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+
+    replace_phi_incoming(func, reduction.accumulator, reduction.latch, collapsed);
+    replace_phi_incoming(func, reduction.counter, reduction.latch, reduction.bound);
+}
+
+fn replace_phi_incoming(func: &mut Function, phi: ValueId, pred: BlockId, value: ValueId) {
+    let ValueKind::Inst(block, inst_idx) = func.value(phi).kind else {
+        return;
+    };
+    let InstKind::Phi { incomings } = &mut func.blocks[block.0].insts[inst_idx].kind else {
+        return;
+    };
+    if let Some((_, incoming)) = incomings
+        .iter_mut()
+        .find(|(incoming_pred, _)| *incoming_pred == pred)
+    {
+        *incoming = value;
+    }
+}
+
+fn defining_inst(func: &Function, value: ValueId) -> Option<&InstKind> {
+    let ValueKind::Inst(block, inst_idx) = func.value(value).kind else {
+        return None;
+    };
+    Some(&func.blocks.get(block.0)?.insts.get(inst_idx)?.kind)
+}
+
+fn phi_incoming(func: &Function, phi: ValueId, pred: BlockId) -> Option<ValueId> {
+    let InstKind::Phi { incomings } = defining_inst(func, phi)? else {
+        return None;
+    };
+    incomings
+        .iter()
+        .find_map(|(incoming_pred, value)| (*incoming_pred == pred).then_some(*value))
+}
+
+fn is_add_one(func: &Function, value: ValueId, counter: ValueId) -> bool {
+    matches!(
+        defining_inst(func, value),
+        Some(InstKind::Binary { op: BinaryOp::Iadd, lhs, rhs })
+            if (*lhs == counter && is_const_int(func, *rhs, 1))
+                || (*rhs == counter && is_const_int(func, *lhs, 1))
+    )
+}
+
+fn is_const_int(func: &Function, value: ValueId, expected: i32) -> bool {
+    matches!(func.value(value).kind, ValueKind::Const(Const::Int(actual)) if actual == expected)
+}
+
+fn value_defined_in_block(func: &Function, value: ValueId, block: BlockId) -> bool {
+    matches!(func.value(value).kind, ValueKind::Inst(owner, _) if owner == block)
+}
+
+fn value_defined_in_blocks(func: &Function, value: ValueId, blocks: &HashSet<BlockId>) -> bool {
+    matches!(func.value(value).kind, ValueKind::Inst(owner, _) if blocks.contains(&owner))
+}
+
+fn has_nontrivial_use(func: &Function, value: ValueId) -> bool {
+    let mut visited = HashSet::new();
+    let mut worklist = vec![value];
+    while let Some(current) = worklist.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.insts {
+                if !inst_operands(&inst.kind).contains(&current) {
+                    continue;
+                }
+                if let InstKind::Phi { .. } = inst.kind {
+                    if let Some(result) = inst.result {
+                        worklist.push(result);
+                        continue;
+                    }
+                }
+                return true;
+            }
+            if terminator_operands(block.terminator.as_ref()).contains(&current) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn value_use_count(func: &Function, value: ValueId) -> usize {
+    let mut count = 0;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            count += inst_operands(&inst.kind)
+                .iter()
+                .filter(|operand| **operand == value)
+                .count();
+        }
+        count += terminator_operands(block.terminator.as_ref())
+            .iter()
+            .filter(|operand| **operand == value)
+            .count();
+    }
+    count
+}
+
+fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
+    match kind {
+        InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
+        InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
+        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Store { ptr, value } => vec![*ptr, *value],
+        InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
+        InstKind::Binary { lhs, rhs, .. }
+        | InstKind::Icmp { lhs, rhs, .. }
+        | InstKind::Fcmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+        InstKind::Gep { base, indices } => {
+            let mut values = Vec::with_capacity(indices.len() + 1);
+            values.push(*base);
+            values.extend(indices.iter().copied());
+            values
+        }
+        InstKind::Call { args, .. } => args.clone(),
+    }
+}
+
+fn terminator_operands(terminator: Option<&Terminator>) -> Vec<ValueId> {
+    match terminator {
+        Some(Terminator::Return(Some(value))) => vec![*value],
+        Some(Terminator::Branch { cond, .. }) => vec![*cond],
+        Some(Terminator::Return(None) | Terminator::Jump(_)) | None => Vec::new(),
+    }
+}
