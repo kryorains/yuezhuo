@@ -95,20 +95,40 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 .push_str(&mov_x_imm("x16", stack_size as i64));
             self.parent.out.push_str("  sub sp, sp, x16\n");
         }
-        for (idx, reg) in saved_regs.iter().enumerate() {
+        let mut saved_idx = 0;
+        while saved_idx + 1 < saved_regs.len() {
+            self.parent.out.push_str(&format!(
+                "  stp {}, {}, [sp, #{}]\n",
+                saved_regs[saved_idx],
+                saved_regs[saved_idx + 1],
+                saved_idx * 8
+            ));
+            saved_idx += 2;
+        }
+        if let Some(reg) = saved_regs.get(saved_idx) {
             self.parent
                 .out
-                .push_str(&format!("  str {}, [sp, #{}]\n", reg, idx * 8));
+                .push_str(&format!("  str {}, [sp, #{}]\n", reg, saved_idx * 8));
         }
         self.parent.out.push_str(&setup);
         self.parent.out.push_str(&blocks);
         self.parent
             .out
             .push_str(&format!("{}:\n", self.return_label));
-        for (idx, reg) in saved_regs.iter().enumerate() {
+        let mut saved_idx = 0;
+        while saved_idx + 1 < saved_regs.len() {
+            self.parent.out.push_str(&format!(
+                "  ldp {}, {}, [sp, #{}]\n",
+                saved_regs[saved_idx],
+                saved_regs[saved_idx + 1],
+                saved_idx * 8
+            ));
+            saved_idx += 2;
+        }
+        if let Some(reg) = saved_regs.get(saved_idx) {
             self.parent
                 .out
-                .push_str(&format!("  ldr {}, [sp, #{}]\n", reg, idx * 8));
+                .push_str(&format!("  ldr {}, [sp, #{}]\n", reg, saved_idx * 8));
         }
         if stack_size != 0 {
             self.parent

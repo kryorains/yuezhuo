@@ -34,7 +34,7 @@
    - AArch64：整数/指针结果在 `x0/w0`，直接求值的左操作数在 `x1/w1`；浮点对应使用 `s0` 和 `s1`。GEP 也用 `x1` 保存地址累加器，避免与大偏移寻址使用的 `x16/x17` 临时寄存器冲突。
    - RISC-V64：整数/指针结果在 `a0`，直接求值的左操作数在 `a1`；浮点对应使用 `fa0` 和 `fa1`。
 2. 单基本块内、不跨调用的整数/指针值可使用 AArch64 `x3-x7` 或 RISC-V64 `t3-t6`；RISC-V64 还允许调用参数和不跨后续调用的调用结果直接使用这些局部寄存器，避免多余的栈往返。
-3. Phi 结果拥有函数级专用寄存器；有限寄存器按自然循环深度加权后的使用成本优先分给热点 phi，安全的单用途 backedge incoming 会与目标 phi 合并。AArch64 还会给高频跨块值分配唯一的函数级寄存器；RISC-V64 使用 `s` 寄存器保存同一基本块内跨调用活跃的值，并在叶函数中优先把 `a2-a7` 分给跨块 phi 和 load/GEP 值。
+3. Phi 结果拥有函数级专用寄存器；有限寄存器按自然循环深度加权后的使用成本优先分给热点 phi，安全的单用途 entry 参数或 backedge incoming 会与目标 phi 合并。AArch64 还会给高频跨块值分配唯一的函数级寄存器，并成对保存连续的 callee-saved 寄存器；RISC-V64 使用 `s` 寄存器保存同一基本块内跨调用活跃的值，并在叶函数中优先把 `a2-a7` 分给跨块 phi 和 load/GEP 值。
 4. 无法证明寄存器分配安全的 IR value 仍落到 `IrFuncLayout` 栈槽。`alloca` 的 value 栈槽保存对象地址，对象本体紧跟在地址槽之后。
 5. 普通二元运算、比较、store 和 GEP 直接从两个临时寄存器求值，不再借助运行时求值栈；已有寄存器分配时，load/store、GEP、立即数运算以及 AArch64 `madd` 会直接使用最终寄存器。单索引常量 GEP 会先按元素类型计算通用 byte offset；AArch64 在 add/sub immediate 编码范围内直接更新地址，RISC-V64 在 signed 12-bit 范围内选择 `addi`，范围外也只 materialize 最终 byte offset 后做一次寄存器 add/sub，不再重复生成 index scaling。
 6. 整数 `Iand/Ior/Ixor/Ishl/Iashr` 是普通 IR 指令，由各目标的 `inst.rs` 直接选择原生指令；后端不再按函数 CFG 或源码变量形状注入整函数快速路径。

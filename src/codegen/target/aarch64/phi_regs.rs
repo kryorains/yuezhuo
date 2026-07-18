@@ -152,22 +152,35 @@ fn coalesce_phi_incomings(func: &Function, regs: &mut HashMap<ValueId, &'static 
             {
                 continue;
             }
-            let ValueKind::Inst(owner, inst_idx) = func.value(incoming).kind else {
-                continue;
-            };
-            if owner != pred
-                || !matches!(
-                    func.blocks.get(owner.0).and_then(|block| block.insts.get(inst_idx)),
-                    Some(crate::ir::Inst {
-                        result: Some(result),
-                        ..
-                    }) if *result == incoming
-                )
-                || phi_used_after(pred, inst_idx, phi, &local_last_uses, &edge_phi_uses)
-            {
-                continue;
+            match func.value(incoming).kind {
+                ValueKind::Param => {
+                    // Parameters are still in their ABI registers on the physical entry
+                    // edge. AArch64 phi registers never overlap x0-x7, so moving an entry
+                    // parameter directly into its phi register cannot clobber a later
+                    // parameter before emit_params has consumed it.
+                    if pred == func.entry {
+                        regs.insert(incoming, reg);
+                    }
+                }
+                ValueKind::Inst(owner, inst_idx) => {
+                    if owner != pred
+                        || !matches!(
+                            func.blocks
+                                .get(owner.0)
+                                .and_then(|block| block.insts.get(inst_idx)),
+                            Some(crate::ir::Inst {
+                                result: Some(result),
+                                ..
+                            }) if *result == incoming
+                        )
+                        || phi_used_after(pred, inst_idx, phi, &local_last_uses, &edge_phi_uses)
+                    {
+                        continue;
+                    }
+                    regs.insert(incoming, reg);
+                }
+                ValueKind::Const(_) | ValueKind::Global(_) => {}
             }
-            regs.insert(incoming, reg);
         }
     }
 }
