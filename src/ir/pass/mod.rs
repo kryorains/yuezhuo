@@ -3,6 +3,7 @@ mod const_fold;
 mod cse;
 mod dce;
 pub(crate) mod dominators;
+mod gep_induction;
 mod global_scalar_localize;
 mod inline;
 mod inst_combine;
@@ -24,6 +25,7 @@ use bit_idiom::LoopIdiomPass;
 use const_fold::ConstFoldPass;
 use cse::CsePass;
 use dce::DcePass;
+use gep_induction::GepInductionPass;
 use global_scalar_localize::GlobalScalarLocalizePass;
 use inline::InlineSmallExprPass;
 use inst_combine::InstCombinePass;
@@ -83,6 +85,10 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(ConstFoldPass::new());
             pipeline.add(LoopIdiomPass::new());
             pipeline.add(ConstFoldPass::new());
+            // Run address strength reduction after transforms whose matching
+            // intentionally expects the source loop-phi set. In particular,
+            // this preserves the existing simple-unroll profitability gate.
+            pipeline.add(GepInductionPass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());
         }

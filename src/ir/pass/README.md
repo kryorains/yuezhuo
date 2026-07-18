@@ -32,10 +32,11 @@
   17. `ConstFoldPass`
   18. `LoopIdiomPass`
   19. `ConstFoldPass`
-  20. `SimplifyCfgPass`
-  21. `DcePass`
+  20. `GepInductionPass`
+  21. `SimplifyCfgPass`
+  22. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `PiecewiseExprPass`、`LoopIdiomPass`、`InstCombinePass`、常量折叠、CSE、LICM 等主动优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾先由 InstCombine 和 ConstFold 把局部整数算术规范化，再让 LoopIdiom 识别循环区域，最后由 ConstFold、SimplifyCfg 和 DCE 清理新暴露的常量、控制流及死指令。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `PiecewiseExprPass`、`LoopIdiomPass`、`GepInductionPass`、`InstCombinePass`、常量折叠、CSE、LICM 等主动优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾先由 InstCombine 和 ConstFold 把局部整数算术规范化，再让 LoopIdiom 识别循环区域，随后执行 GEP 地址归纳强度削弱，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。GEP 变换放在 simple unroll 和其它依赖原始 loop-phi 集合的 matcher 之后，避免新增 pointer phi 屏蔽已有收益。
 
 ## Pass 列表
 
@@ -157,6 +158,14 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 证明边界是保守的：必须有唯一专用 preheader、唯一 latch、唯一 exiting edge 和唯一 exit，不能有返回、内存访问、调用等 side exit/副作用；fast operands 必须在 preheader 可用；除 accumulator 外不能有 loop-defined live-out。exit 的已有 phi 只有在 fast edge 能复用其原 incoming 时才会补边，否则拒绝。变换后 preheader 不再是原循环的专用 preheader，因此重复运行幂等。
 
 当循环结果所在的 exit 块只包含 Nop 并直接返回 accumulator 时，fast block 会直接返回综合结果，避免为未改写的 fallback 循环增加合并 phi 和寄存器压力；其它区域仍使用 exit phi 合并 live-out。
+
+### `GepInductionPass` (`gep_induction.rs`)
+
+对自然循环中的仿射 GEP 地址构造 pointer recurrence。候选循环必须有唯一 entering predecessor、唯一 latch 和专用 preheader；pass 从 header 的直接 i32 induction、GEP 类型大小、use-def 和支配关系证明地址为 `base + induction * constant stride + invariant offset`。循环内的 nested GEP chain 可以包含任意循环不变量索引，数组长度和正负 induction step 都不参与形状匹配。
+
+变换在 preheader 用 induction 初值重建完整地址，在 header 插入 pointer phi，在 latch 用单索引常量 GEP 生成固定步长 next pointer。只有全部使用都位于循环内且新 phi 支配普通使用及 phi edge 时才替换原 GEP；仅作为其它已选 nested GEP base 的中间地址不会单独生成死 recurrence。常量 trip-count 分析或 header signed comparison 还必须证明 i32 induction 在每个回边不 wrap，否则 sign extension 后的重算地址与 pointer increment 并不等价，pass 会拒绝。
+
+pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有 live-out 地址时，header pointer state 仍只沿唯一 backedge 更新。动态大步长、循环内变化的 offset、非 GEP 派生链、不能在 preheader 使用的定义、不可整除为最终 pointee stride 的步长及类型大小溢出都保守保留。变换后立即运行 verifier，重复执行不会再次匹配生成的 pointer recurrence。
 
 ### `PiecewiseExprPass` (`piecewise_expr.rs`)
 

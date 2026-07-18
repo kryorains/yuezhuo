@@ -87,6 +87,16 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 gep_elem_type(&ty)
             };
             let stride = ir_size(&elem_ty).max(1);
+            if let Some(offset) = const_gep_offset(self.func, *index, stride) {
+                self.emit_gep_const_add(destination, &current_base, offset);
+                current_base = destination.to_string();
+                ty = if idx + 1 == indices.len() {
+                    self.func.value(result).ty.clone()
+                } else {
+                    elem_ty
+                };
+                continue;
+            }
             let index_reg = if let Some(index_reg) = self.assigned_w_reg(*index) {
                 index_reg
             } else {
@@ -135,6 +145,15 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 gep_elem_type(&ty)
             };
             let stride = ir_size(&elem_ty).max(1);
+            if let Some(offset) = const_gep_offset(self.func, *index, stride) {
+                self.emit_gep_const_add("x1", "x1", offset);
+                ty = if idx + 1 == indices.len() {
+                    self.func.value(result).ty.clone()
+                } else {
+                    elem_ty
+                };
+                continue;
+            }
             self.load_value(*index);
             self.body.push_str("  sxtw x0, w0\n");
             if stride != 1 {
@@ -154,6 +173,30 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             };
         }
         self.body.push_str("  mov x0, x1\n");
+    }
+
+    fn emit_gep_const_add(&mut self, destination: &str, base: &str, offset: i64) {
+        if offset == 0 {
+            self.body
+                .push_str(&format!("  mov {}, {}\n", destination, base));
+            return;
+        }
+        let (op, magnitude) = if offset > 0 {
+            ("add", offset as u64)
+        } else {
+            ("sub", (-offset) as u64)
+        };
+        if let Some((immediate, shifted)) = aarch64_addsub_immediate(magnitude) {
+            let shift = if shifted { ", lsl #12" } else { "" };
+            self.body.push_str(&format!(
+                "  {} {}, {}, #{}{}\n",
+                op, destination, base, immediate, shift
+            ));
+        } else {
+            self.body.push_str(&mov_x_imm("x16", magnitude as i64));
+            self.body
+                .push_str(&format!("  {} {}, {}, x16\n", op, destination, base));
+        }
     }
 
     pub(super) fn load_value(&mut self, value: ValueId) {
@@ -460,6 +503,28 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
 fn w_reg(x_reg: &str) -> String {
     x_reg.replacen('x', "w", 1)
+}
+
+fn const_gep_offset(func: &crate::ir::Function, index: ValueId, stride: i32) -> Option<i64> {
+    let index = match &func.value(index).kind {
+        ValueKind::Const(Const::Int(value)) => *value,
+        ValueKind::Const(Const::Bool(value)) => *value as i32,
+        _ => return None,
+    };
+    Some(i64::from(index) * i64::from(stride))
+}
+
+fn aarch64_addsub_immediate(magnitude: u64) -> Option<(u64, bool)> {
+    const MAX_IMMEDIATE: u64 = (1 << 12) - 1;
+    const SHIFTED_UNIT: u64 = 1 << 12;
+
+    if magnitude <= MAX_IMMEDIATE {
+        Some((magnitude, false))
+    } else if magnitude.is_multiple_of(SHIFTED_UNIT) && magnitude / SHIFTED_UNIT <= MAX_IMMEDIATE {
+        Some((magnitude / SHIFTED_UNIT, true))
+    } else {
+        None
+    }
 }
 
 fn direct_mem_op(offset: i32, size: i32) -> Option<&'static str> {

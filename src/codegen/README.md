@@ -36,7 +36,7 @@
 2. 单基本块内、不跨调用的整数/指针值可使用 AArch64 `x3-x7` 或 RISC-V64 `t3-t6`；RISC-V64 还允许调用参数和不跨后续调用的调用结果直接使用这些局部寄存器，避免多余的栈往返。
 3. Phi 结果拥有函数级专用寄存器；有限寄存器按自然循环深度加权后的使用成本优先分给热点 phi，安全的单用途 backedge incoming 会与目标 phi 合并。AArch64 还会给高频跨块值分配唯一的函数级寄存器；RISC-V64 使用 `s` 寄存器保存同一基本块内跨调用活跃的值，并在叶函数中优先把 `a2-a7` 分给跨块 phi 和 load/GEP 值。
 4. 无法证明寄存器分配安全的 IR value 仍落到 `IrFuncLayout` 栈槽。`alloca` 的 value 栈槽保存对象地址，对象本体紧跟在地址槽之后。
-5. 普通二元运算、比较、store 和 GEP 直接从两个临时寄存器求值，不再借助运行时求值栈；已有寄存器分配时，load/store、GEP、立即数运算以及 AArch64 `madd` 会直接使用最终寄存器。
+5. 普通二元运算、比较、store 和 GEP 直接从两个临时寄存器求值，不再借助运行时求值栈；已有寄存器分配时，load/store、GEP、立即数运算以及 AArch64 `madd` 会直接使用最终寄存器。单索引常量 GEP 会先按元素类型计算通用 byte offset；AArch64 在 add/sub immediate 编码范围内直接更新地址，RISC-V64 在 signed 12-bit 范围内选择 `addi`，范围外也只 materialize 最终 byte offset 后做一次寄存器 add/sub，不再重复生成 index scaling。
 6. 整数 `Iand/Ior/Ixor/Ishl/Iashr` 是普通 IR 指令，由各目标的 `inst.rs` 直接选择原生指令；后端不再按函数 CFG 或源码变量形状注入整函数快速路径。
 7. Phi 在 terminator 边上生成并行 copy；同寄存器 incoming 不再生成 copy，多值环仍使用栈暂存保证并行语义。无 phi copy 的热分支会直接跳向目标并优先使用顺序后继作为 fallthrough。
 8. AArch64 和 RISC-V64 会识别只依赖寄存器参数的入口守卫；当一侧是无副作用且只有入口前驱的短返回表达式时，该路径会在函数序言前执行，只有慢路径才建立栈帧。有帧路径先生成原入口到慢分支的 phi copy，再绕过已执行的守卫；不满足结构、类型、ABI 寄存器或规模证明时完全保留普通发射。
