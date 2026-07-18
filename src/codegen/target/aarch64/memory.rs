@@ -520,7 +520,7 @@ fn aarch64_addsub_immediate(magnitude: u64) -> Option<(u64, bool)> {
 
     if magnitude <= MAX_IMMEDIATE {
         Some((magnitude, false))
-    } else if magnitude.is_multiple_of(SHIFTED_UNIT) && magnitude / SHIFTED_UNIT <= MAX_IMMEDIATE {
+    } else if magnitude % SHIFTED_UNIT == 0 && magnitude / SHIFTED_UNIT <= MAX_IMMEDIATE {
         Some((magnitude / SHIFTED_UNIT, true))
     } else {
         None
