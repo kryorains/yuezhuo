@@ -7,12 +7,13 @@ const CALLEE_SAVED_REGS: [&str; 10] = [
 ];
 const LEAF_REGS: [&str; 7] = ["x9", "x10", "x11", "x12", "x13", "x14", "x15"];
 
-/// Conservatively keeps selected integer and pointer values in registers.
+/// Keeps selected integer and pointer values in registers.
 ///
-/// Loop-depth-weighted phi results are assigned first. Every other globally
-/// selected value owns a distinct register for the whole function, so
-/// correctness does not depend on an approximate live-interval analysis. Leaf functions may also use the
-/// caller-saved x9-x15 set; every x19-x28 assignment is saved normally.
+/// Ordinary functions preserve the conservative unique-register policy. A
+/// function produced by reduction jam uses exact CFG liveness, phi-edge uses,
+/// interference coloring and copy affinity so its additional accumulators do
+/// not spill merely because earlier sequential loops used the same register
+/// set. Leaf functions may also use x9-x15; x19-x28 are saved normally.
 pub(super) struct AArch64PhiRegs {
     regs: HashMap<ValueId, &'static str>,
     saved_regs: Vec<&'static str>,
@@ -20,6 +21,88 @@ pub(super) struct AArch64PhiRegs {
 
 impl AArch64PhiRegs {
     pub(super) fn new(func: &Function) -> Self {
+        if !func.has_reduction_jam() {
+            return Self::new_conservative(func);
+        }
+        let is_leaf = !func.blocks.iter().any(|block| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Call { .. }))
+        });
+        let scores = weighted_use_scores(func);
+        let block_local_values = collect_block_local_values(func);
+        let direct_branch_conditions = collect_direct_branch_conditions(func);
+        let mut candidates = func
+            .values
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, value)| {
+                let value_id = ValueId(idx);
+                if !is_register_type(&value.ty)
+                    || matches!(value.kind, ValueKind::Const(_) | ValueKind::Global(_))
+                    || scores[idx] < 2
+                    || block_local_values.contains(&value_id)
+                    || direct_branch_conditions.contains(&value_id)
+                {
+                    return None;
+                }
+                if let ValueKind::Inst(block, inst_idx) = value.kind {
+                    let inst = func.blocks.get(block.0)?.insts.get(inst_idx)?;
+                    if inst.result != Some(value_id) || matches!(inst.kind, InstKind::Nop) {
+                        return None;
+                    }
+                }
+                Some((value_id, scores[idx]))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(value, score)| (std::cmp::Reverse(*score), value.0));
+
+        // Rank loop phis and other cross-block values in one pool. Reserving all
+        // registers for phis can leave a loop bound in the frame even when it is
+        // read on every iteration, while a much colder outer phi occupies a
+        // register for the whole function.
+        let mut available = Vec::new();
+        if is_leaf {
+            available.extend(LEAF_REGS);
+        }
+        available.extend(CALLEE_SAVED_REGS);
+        let candidate_set = candidates
+            .iter()
+            .map(|(value, _)| *value)
+            .collect::<HashSet<_>>();
+        let interference = interference_graph(func, &candidate_set);
+        let affinities = phi_affinities(func, &candidate_set, &interference);
+        let mut regs = HashMap::new();
+        for (value, _) in candidates {
+            let unavailable = interference[value.0]
+                .iter()
+                .filter_map(|neighbor| regs.get(neighbor).copied())
+                .collect::<HashSet<_>>();
+            let preferred = affinities[value.0]
+                .iter()
+                .find_map(|neighbor| regs.get(neighbor).copied())
+                .filter(|reg| !unavailable.contains(reg));
+            if let Some(reg) = preferred.or_else(|| {
+                available
+                    .iter()
+                    .copied()
+                    .find(|reg| !unavailable.contains(reg))
+            }) {
+                regs.insert(value, reg);
+            }
+        }
+
+        let occupied = regs.values().copied().collect::<HashSet<_>>();
+        let saved_regs = CALLEE_SAVED_REGS
+            .iter()
+            .copied()
+            .filter(|reg| occupied.contains(reg))
+            .collect();
+        Self { regs, saved_regs }
+    }
+
+    fn new_conservative(func: &Function) -> Self {
         let is_leaf = !func.blocks.iter().any(|block| {
             block
                 .insts
@@ -124,6 +207,167 @@ impl AArch64PhiRegs {
 
 fn is_register_type(ty: &Type) -> bool {
     matches!(ty, Type::I1 | Type::I32 | Type::Ptr(_))
+}
+
+fn interference_graph(func: &Function, candidates: &HashSet<ValueId>) -> Vec<HashSet<ValueId>> {
+    let block_count = func.blocks.len();
+    let mut defs = vec![HashSet::new(); block_count];
+    let mut uses = vec![HashSet::new(); block_count];
+    let mut phi_defs = vec![HashSet::new(); block_count];
+    let mut edge_phi_uses = HashMap::<(usize, usize), Vec<ValueId>>::new();
+
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.insts {
+            if let InstKind::Phi { incomings } = &inst.kind {
+                if let Some(result) = inst.result {
+                    defs[block_idx].insert(result);
+                    phi_defs[block_idx].insert(result);
+                }
+                for (pred, incoming) in incomings {
+                    edge_phi_uses
+                        .entry((pred.0, block_idx))
+                        .or_default()
+                        .push(*incoming);
+                }
+                continue;
+            }
+            for operand in inst_operands(&inst.kind) {
+                if !defs[block_idx].contains(&operand) {
+                    uses[block_idx].insert(operand);
+                }
+            }
+            if let Some(result) = inst.result {
+                defs[block_idx].insert(result);
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            for operand in terminator_operands(terminator) {
+                if !defs[block_idx].contains(&operand) {
+                    uses[block_idx].insert(operand);
+                }
+            }
+        }
+    }
+
+    let successors = func
+        .blocks
+        .iter()
+        .map(|block| match block.terminator.as_ref() {
+            Some(Terminator::Jump(target)) => vec![target.0],
+            Some(Terminator::Branch {
+                then_target,
+                else_target,
+                ..
+            }) if then_target == else_target => vec![then_target.0],
+            Some(Terminator::Branch {
+                then_target,
+                else_target,
+                ..
+            }) => vec![then_target.0, else_target.0],
+            Some(Terminator::Return(_)) | None => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut live_in = vec![HashSet::new(); block_count];
+    let mut live_out = vec![HashSet::new(); block_count];
+    loop {
+        let mut changed = false;
+        for block_idx in (0..block_count).rev() {
+            let mut next_out = HashSet::new();
+            for successor in &successors[block_idx] {
+                next_out.extend(
+                    live_in[*successor]
+                        .iter()
+                        .filter(|value| !phi_defs[*successor].contains(value))
+                        .copied(),
+                );
+                if let Some(incomings) = edge_phi_uses.get(&(block_idx, *successor)) {
+                    next_out.extend(incomings.iter().copied());
+                }
+            }
+            let mut next_in = uses[block_idx].clone();
+            next_in.extend(
+                next_out
+                    .iter()
+                    .filter(|value| !defs[block_idx].contains(value))
+                    .copied(),
+            );
+            if live_out[block_idx] != next_out || live_in[block_idx] != next_in {
+                live_out[block_idx] = next_out;
+                live_in[block_idx] = next_in;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut graph = vec![HashSet::new(); func.values.len()];
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let mut live = live_out[block_idx].clone();
+        if let Some(terminator) = &block.terminator {
+            live.extend(terminator_operands(terminator));
+        }
+        for inst in block.insts.iter().rev() {
+            if let Some(result) = inst.result {
+                if candidates.contains(&result) {
+                    for other in live
+                        .iter()
+                        .copied()
+                        .filter(|value| candidates.contains(value))
+                    {
+                        if other != result {
+                            graph[result.0].insert(other);
+                            graph[other.0].insert(result);
+                        }
+                    }
+                }
+                live.remove(&result);
+            }
+            if !matches!(inst.kind, InstKind::Phi { .. }) {
+                live.extend(inst_operands(&inst.kind));
+            }
+        }
+    }
+    let params = func
+        .params
+        .iter()
+        .copied()
+        .filter(|param| candidates.contains(param))
+        .collect::<Vec<_>>();
+    for (idx, lhs) in params.iter().copied().enumerate() {
+        for rhs in params.iter().copied().skip(idx + 1) {
+            graph[lhs.0].insert(rhs);
+            graph[rhs.0].insert(lhs);
+        }
+    }
+    graph
+}
+
+fn phi_affinities(
+    func: &Function,
+    candidates: &HashSet<ValueId>,
+    interference: &[HashSet<ValueId>],
+) -> Vec<Vec<ValueId>> {
+    let mut affinities = vec![Vec::new(); func.values.len()];
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let (Some(phi), InstKind::Phi { incomings }) = (inst.result, &inst.kind) else {
+            continue;
+        };
+        if !candidates.contains(&phi) {
+            continue;
+        }
+        for (_, incoming) in incomings {
+            if candidates.contains(incoming)
+                && func.value(phi).ty == func.value(*incoming).ty
+                && !interference[phi.0].contains(incoming)
+            {
+                affinities[phi.0].push(*incoming);
+                affinities[incoming.0].push(phi);
+            }
+        }
+    }
+    affinities
 }
 
 fn coalesce_phi_incomings(func: &Function, regs: &mut HashMap<ValueId, &'static str>) {
@@ -361,5 +605,38 @@ fn terminator_operands(terminator: &Terminator) -> Vec<ValueId> {
         Terminator::Return(Some(value)) => vec![*value],
         Terminator::Branch { cond, .. } => vec![*cond],
         Terminator::Return(None) | Terminator::Jump(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{BinaryOp, Function};
+
+    #[test]
+    fn interfering_jam_parameters_receive_distinct_registers() {
+        let mut func = Function::new("parameter_interference", Type::Void);
+        let lhs = func.add_param("lhs", Type::I32);
+        let rhs = func.add_param("rhs", Type::I32);
+        let body = func.add_block("body");
+        func.set_terminator(func.entry, Terminator::Jump(body));
+        for _ in 0..2 {
+            func.append_inst(
+                body,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs,
+                    rhs,
+                },
+                Some(Type::I32),
+            );
+        }
+        func.set_terminator(body, Terminator::Return(None));
+        func.mark_reduction_jammed();
+
+        let regs = AArch64PhiRegs::new(&func);
+        assert!(regs.reg(lhs).is_some());
+        assert!(regs.reg(rhs).is_some());
+        assert_ne!(regs.reg(lhs), regs.reg(rhs));
     }
 }

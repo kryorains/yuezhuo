@@ -87,7 +87,12 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         }
     }
 
-    pub(super) fn emit_terminator(&mut self, block_idx: usize, terminator: &Terminator) {
+    pub(super) fn emit_terminator(
+        &mut self,
+        block_idx: usize,
+        terminator: &Terminator,
+        next_block: Option<usize>,
+    ) {
         match terminator {
             Terminator::Return(value) => {
                 if let Some(value) = value {
@@ -100,19 +105,34 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             }
             Terminator::Jump(target) => {
                 self.emit_phi_copies(block_idx, target.0);
-                self.body
-                    .push_str(&format!("  j {}\n", self.block_label(target.0)));
+                if next_block != Some(target.0) {
+                    self.body
+                        .push_str(&format!("  j {}\n", self.block_label(target.0)));
+                }
             }
             Terminator::Branch {
                 cond,
                 then_target,
                 else_target,
             } => {
+                if then_target == else_target {
+                    self.emit_phi_copies(block_idx, then_target.0);
+                    if next_block != Some(then_target.0) {
+                        self.body
+                            .push_str(&format!("  j {}\n", self.block_label(then_target.0)));
+                    }
+                    return;
+                }
+
                 if !self.edge_has_phi_copy(block_idx, then_target.0)
                     && !self.edge_has_phi_copy(block_idx, else_target.0)
                 {
-                    self.emit_branch_if_false(*cond, self.block_label(else_target.0));
-                    if then_target.0 != block_idx + 1 {
+                    if next_block == Some(then_target.0) {
+                        self.emit_branch_if_false(*cond, self.block_label(else_target.0));
+                    } else if next_block == Some(else_target.0) {
+                        self.emit_branch_if_true(*cond, self.block_label(then_target.0));
+                    } else {
+                        self.emit_branch_if_false(*cond, self.block_label(else_target.0));
                         self.body
                             .push_str(&format!("  j {}\n", self.block_label(then_target.0)));
                     }
@@ -159,8 +179,15 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             .collect::<Vec<_>>();
 
         if let [(result, value)] = copies.as_slice() {
-            self.load_value(*value);
-            self.store_result(*result);
+            if let (Some(destination), Some(source)) =
+                (self.assigned_reg(*result), self.assigned_reg(*value))
+            {
+                self.body
+                    .push_str(&format!("  mv {}, {}\n", destination, source));
+            } else {
+                self.load_value(*value);
+                self.store_result(*result);
+            }
             return;
         }
 
@@ -180,12 +207,18 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             .block(BlockId(target_idx))
             .insts
             .iter()
-            .any(|inst| {
-                matches!(
-                    &inst.kind,
-                    InstKind::Phi { incomings }
-                        if incomings.iter().any(|(pred, _)| pred.0 == pred_idx)
-                )
+            .filter_map(|inst| {
+                let (Some(result), InstKind::Phi { incomings }) = (inst.result, &inst.kind) else {
+                    return None;
+                };
+                incomings
+                    .iter()
+                    .find(|(pred, _)| pred.0 == pred_idx)
+                    .map(|(_, incoming)| (result, *incoming))
+            })
+            .any(|(result, incoming)| {
+                self.regalloc.reg(result) != self.regalloc.reg(incoming)
+                    || self.regalloc.reg(result).is_none()
             })
     }
 
@@ -194,20 +227,44 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             if self.emit_zero_icmp_branch_if_false(op, lhs, rhs, &target) {
                 return;
             }
-            self.load_value_into(lhs, "a1");
-            self.load_value(rhs);
-            let branch = match op {
-                CmpOp::Lt => "bge a1, a0",
-                CmpOp::Gt => "bge a0, a1",
-                CmpOp::Le => "blt a0, a1",
-                CmpOp::Ge => "blt a1, a0",
-                CmpOp::Eq => "bne a1, a0",
-                CmpOp::Ne => "beq a1, a0",
+            let lhs = self.load_or_assigned(lhs, "a1");
+            let rhs = self.load_or_assigned(rhs, "a0");
+            let (branch, first, second) = match op {
+                CmpOp::Lt => ("bge", lhs, rhs),
+                CmpOp::Gt => ("bge", rhs, lhs),
+                CmpOp::Le => ("blt", rhs, lhs),
+                CmpOp::Ge => ("blt", lhs, rhs),
+                CmpOp::Eq => ("bne", lhs, rhs),
+                CmpOp::Ne => ("beq", lhs, rhs),
             };
-            self.body.push_str(&format!("  {}, {}\n", branch, target));
+            self.body
+                .push_str(&format!("  {} {}, {}, {}\n", branch, first, second, target));
         } else {
             self.load_value(cond);
             self.body.push_str(&format!("  beqz a0, {}\n", target));
+        }
+    }
+
+    fn emit_branch_if_true(&mut self, cond: ValueId, target: String) {
+        if let Some((op, lhs, rhs)) = self.direct_branch_icmp(cond) {
+            if self.emit_zero_icmp_branch_if_true(op, lhs, rhs, &target) {
+                return;
+            }
+            let lhs = self.load_or_assigned(lhs, "a1");
+            let rhs = self.load_or_assigned(rhs, "a0");
+            let (branch, first, second) = match op {
+                CmpOp::Lt => ("blt", lhs, rhs),
+                CmpOp::Gt => ("blt", rhs, lhs),
+                CmpOp::Le => ("bge", rhs, lhs),
+                CmpOp::Ge => ("bge", lhs, rhs),
+                CmpOp::Eq => ("beq", lhs, rhs),
+                CmpOp::Ne => ("bne", lhs, rhs),
+            };
+            self.body
+                .push_str(&format!("  {} {}, {}, {}\n", branch, first, second, target));
+        } else {
+            self.load_value(cond);
+            self.body.push_str(&format!("  bnez a0, {}\n", target));
         }
     }
 
@@ -236,6 +293,42 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 CmpOp::Ge => "bgtz",
                 CmpOp::Eq => "bnez",
                 CmpOp::Ne => "beqz",
+            };
+            (rhs, branch)
+        } else {
+            return false;
+        };
+        let reg = self.load_or_assigned(value, "a0");
+        self.body
+            .push_str(&format!("  {} {}, {}\n", branch, reg, target));
+        true
+    }
+
+    fn emit_zero_icmp_branch_if_true(
+        &mut self,
+        op: CmpOp,
+        lhs: ValueId,
+        rhs: ValueId,
+        target: &str,
+    ) -> bool {
+        let (value, branch) = if const_i32(self.func, rhs) == Some(0) {
+            let branch = match op {
+                CmpOp::Lt => "bltz",
+                CmpOp::Gt => "bgtz",
+                CmpOp::Le => "blez",
+                CmpOp::Ge => "bgez",
+                CmpOp::Eq => "beqz",
+                CmpOp::Ne => "bnez",
+            };
+            (lhs, branch)
+        } else if const_i32(self.func, lhs) == Some(0) {
+            let branch = match op {
+                CmpOp::Lt => "bgtz",
+                CmpOp::Gt => "bltz",
+                CmpOp::Le => "bgez",
+                CmpOp::Ge => "blez",
+                CmpOp::Eq => "beqz",
+                CmpOp::Ne => "bnez",
             };
             (rhs, branch)
         } else {
@@ -306,6 +399,14 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     let source = self.load_or_assigned(rhs, "a0");
                     self.body
                         .push_str(&format!("  slliw {}, {}, {}\n", destination, source, shift));
+                    return true;
+                }
+            }
+            BinaryOp::Iand => {
+                if let Some(mask) = const_i32(self.func, rhs).filter(|mask| fits_i12(*mask)) {
+                    let source = self.load_or_assigned(lhs, "a0");
+                    self.body
+                        .push_str(&format!("  andi {}, {}, {}\n", destination, source, mask));
                     return true;
                 }
             }
@@ -461,6 +562,13 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 if let Some(shift) = pow2_shift(self.func, lhs) {
                     self.load_value(rhs);
                     self.body.push_str(&format!("  slliw a0, a0, {}\n", shift));
+                    return true;
+                }
+            }
+            BinaryOp::Iand => {
+                if let Some(mask) = const_i32(self.func, rhs).filter(|mask| fits_i12(*mask)) {
+                    self.load_value(lhs);
+                    self.body.push_str(&format!("  andi a0, a0, {}\n", mask));
                     return true;
                 }
             }

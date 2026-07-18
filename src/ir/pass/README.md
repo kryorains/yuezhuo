@@ -25,16 +25,21 @@
   10. `LicmPass`
   11. `InvariantLoadForwardPass`
   12. `DcePass`
-  13. `PiecewiseExprPass`
-  14. `RepeatReductionPass`
-  15. `SimpleLoopUnrollPass`（按目标收益门控）
-  16. `InstCombinePass`
-  17. `ConstFoldPass`
-  18. `LoopIdiomPass`
-  19. `ConstFoldPass`
-  20. `GepInductionPass`
-  21. `SimplifyCfgPass`
-  22. `DcePass`
+  13. `ReductionJamPass`
+  14. `CsePass`
+  15. `LocalForwardPass`
+  16. `InvariantLoadForwardPass`
+  17. `DcePass`
+  18. `PiecewiseExprPass`
+  19. `RepeatReductionPass`
+  20. `SimpleLoopUnrollPass`（按目标收益门控）
+  21. `InstCombinePass`
+  22. `ConstFoldPass`
+  23. `LoopIdiomPass`
+  24. `ConstFoldPass`
+  25. `GepInductionPass`
+  26. `SimplifyCfgPass`
+  27. `DcePass`
 
 O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `PiecewiseExprPass`、`LoopIdiomPass`、`GepInductionPass`、`InstCombinePass`、常量折叠、CSE、LICM 等主动优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾先由 InstCombine 和 ConstFold 把局部整数算术规范化，再让 LoopIdiom 识别循环区域，随后执行 GEP 地址归纳强度削弱，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。GEP 变换放在 simple unroll 和其它依赖原始 loop-phi 集合的 matcher 之后，避免新增 pointer phi 屏蔽已有收益。
 
@@ -65,6 +70,7 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 - 把 `x + x` 改写为 wrapping `x * 2`；
 - 在 wrapping 语义下重关联嵌套常量加法和乘法，例如 `(x * 2) * 2` 变为 `x * 4`；
 - 当 use-def 链精确证明相同 dividend 和相同已知非零 i32 常量除数时，把 `x - (x / d) * d` 改写为 `x % d`；
+- 当有符号余数的全部观察都只是与零比较，且除数绝对值为二次幂时，把 divisibility test 改写为低位掩码；负 dividend 的余数值若在其它位置可见则拒绝；
 - 把 `icmp` 常量换到 RHS，并同步反转大小比较谓词。
 
 pass 不重关联或以其它方式改写浮点运算，也不把局部常量二次幂乘除主动改写成 shift；这类局部指令选择继续由现有后端负责。IR 的动态 shift 仍采用计数低 5 位语义。
@@ -138,10 +144,10 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 它在单个基本块内跟踪“某个可跟踪指针当前存着哪个值”：
 
 - 遇到 `store ptr, value` 时，记录 `ptr -> value`。
-- 遇到后续 `load ptr` 时，如果类型一致，就把 load 的结果替换成已知的 `value`。
-- 遇到 `call` 或 `memzero` 这类可能改写内存的指令时，清空记录。
+- 遇到后续 `load ptr` 时，如果类型一致，就把 load 的结果替换成已知的 `value`；同一基本块内、没有 intervening clobber 的相同指针重复 load 也会复用第一次结果。
+- 遇到任意可能别名的 `store`、`call` 或 `memzero` 时，清空通用 load 记录；本地标量 `alloca` 的 store-to-load 转发仍保持精确。
 
-目前只跟踪非数组的本地 `alloca` 指针，避免别名关系不清导致错误优化。
+跨块读写关系继续交给更强的 SSA 与 alias 分析，局部 load CSE 不越过任何未知写入。
 
 ### `InvariantLoadForwardPass` (`invariant_load.rs`)
 
@@ -173,6 +179,12 @@ pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有
 
 左移在通过 `0..31` 范围检查后可直接使用；有符号除法只在 `x >= 0` 时使用算术右移，负数和范围外输入继续执行原函数，保持向零截断语义。非连续映射、混合乘除、额外副作用或未知分支都会让 pass 保守退出。
 
+### `ReductionJamPass` (`reduction_jam.rs`)
+
+对严格规范化的双层自然循环执行二路 reduction unroll-and-jam。候选外层与内层都必须是从非负初值开始、步长为 1 的直接 signed `<` 归纳循环；内层只有一个 i32 accumulator、一个无副作用基本块，外层每轮唯一副作用必须是归约结果 store。fast loop 一次处理相邻两个外层迭代并共享内层 induction，完整原循环作为动态零/一迭代 tail，因此负边界、奇数次数和小次数仍保持原语义。
+
+内存证明不读取符号名或固定维度：store 地址必须追溯到完整全局对象且最终 GEP 索引就是外层 induction；内层 load 若来自同一全局对象，也必须具有相同最终索引，才能证明两个 lane 访问不同列。未知根、不同索引、循环内 store/call/memzero、多 latch/exit、额外 phi、非专用 preheader 或超出代码预算都会拒绝。克隆后重新运行 CSE、块内 load forwarding、只读 load forwarding和 DCE，再由 verifier 检查；fast loop 的步长 2 也使 pass 重复运行幂等。
+
 ### `RepeatReductionPass` (`repeat_reduction.rs`)
 
 无副作用重复归约折叠。
@@ -195,15 +207,9 @@ pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有
 
 死代码删除。
 
-它先收集所有被指令或 terminator 使用到的 `ValueId`，然后删除那些：
+它从 `store`、`call`、`memzero` 等可观察副作用以及 terminator 操作数反向标记完整依赖闭包，再把未标记的纯结果指令改成 `Nop`。这种 mark-and-sweep 形式不仅删除普通零使用值，也能删除 `phi -> add -> phi` 这类内部互相引用、但没有任何可观察出口的死 SSA 环。
 
-- 有结果值；
-- 结果值没有被使用；
-- 指令本身没有副作用、可以安全移除；
-
-的指令。删除方式是把指令结果清空，并把指令改成 `Nop`。
-
-`store`、`call`、`memzero` 等有副作用或可能影响外部状态的指令不会被删除。
+`store`、`call`、`memzero` 本身始终保留；删除仍以 `Nop` 占位，不重排 `ValueKind::Inst` 的指令索引。
 
 ## 支撑模块
 

@@ -15,7 +15,7 @@ pub(crate) use data::emit_ir_data_section;
 pub(crate) use early_return::{entry_early_return, EarlyReturnResult, EntryEarlyReturn};
 pub(crate) use layout::{ir_align_to, ir_size, IrFuncLayout};
 pub(crate) use local_regs::IrLocalRegs;
-pub(crate) use loop_depths::natural_loop_depths;
+pub(crate) use loop_depths::{loop_rotated_block_order, natural_loop_depths};
 pub(crate) use sig::{IrFuncSig, IrModuleCtx, IrParamSig};
 pub(crate) use types::{gep_elem_type, pointee};
 pub(crate) use value_uses::ir_value_use_counts;

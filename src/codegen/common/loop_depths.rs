@@ -87,6 +87,145 @@ pub(crate) fn natural_loop_depths(func: &Function) -> Vec<usize> {
     depths
 }
 
+/// Orders canonical natural loops as `body .. latch, header, exit`.
+///
+/// The preheader still jumps to the header for the zero-trip check. On the hot
+/// path, however, the latch falls through to the header and the header branches
+/// back to the body, removing one unconditional branch per iteration. Block
+/// identities and CFG edges are unchanged; this is only an assembly layout.
+pub(crate) fn loop_rotated_block_order(func: &Function) -> Vec<usize> {
+    const MAX_LAYOUT_BLOCKS: usize = 1024;
+    const MAX_ROTATED_LOOPS: usize = 64;
+
+    let block_count = func.blocks.len();
+    let mut order = (0..block_count).collect::<Vec<_>>();
+    if block_count == 0 || block_count > MAX_LAYOUT_BLOCKS || func.entry.0 >= block_count {
+        return order;
+    }
+
+    let (predecessors, successors) = control_flow_graph(func);
+    let reverse_postorder = reverse_postorder(&successors, func.entry.0);
+    let immediate_dominators =
+        immediate_dominators(&predecessors, &reverse_postorder, func.entry.0, block_count);
+    let (dom_in, dom_out) = dominator_tree_intervals(
+        &immediate_dominators,
+        &reverse_postorder,
+        func.entry.0,
+        block_count,
+    );
+
+    let mut latches = vec![Vec::new(); block_count];
+    for (pred, block_successors) in successors.iter().enumerate() {
+        for successor in block_successors {
+            if dominates(*successor, pred, &dom_in, &dom_out) {
+                latches[*successor].push(pred);
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (header, loop_latches) in latches.iter().enumerate() {
+        let [latch] = loop_latches.as_slice() else {
+            continue;
+        };
+        if *latch == header
+            || !matches!(
+                func.blocks[*latch].terminator,
+                Some(Terminator::Jump(target)) if target.0 == header
+            )
+        {
+            continue;
+        }
+
+        let members = natural_loop_members(
+            header,
+            *latch,
+            &predecessors,
+            &dom_in,
+            &dom_out,
+            block_count,
+        );
+        if predecessors[header]
+            .iter()
+            .filter(|pred| !members[**pred])
+            .count()
+            != 1
+        {
+            continue;
+        }
+
+        let Some(Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        }) = func.blocks[header].terminator.as_ref()
+        else {
+            continue;
+        };
+        let then_inside = members[then_target.0];
+        let else_inside = members[else_target.0];
+        if then_inside == else_inside {
+            continue;
+        }
+        let exit = if then_inside {
+            else_target.0
+        } else {
+            then_target.0
+        };
+        if exit == header || exit == *latch || exit == func.entry.0 {
+            continue;
+        }
+        candidates.push((
+            members.iter().filter(|member| **member).count(),
+            header,
+            *latch,
+            exit,
+        ));
+    }
+
+    if candidates.len() > MAX_ROTATED_LOOPS {
+        return order;
+    }
+
+    // Rotate inner loops before their containing loops. Every edit looks up the
+    // current positions, so nested rotations remain stable.
+    candidates.sort_by_key(|(member_count, _, _, _)| *member_count);
+    for (_, header, latch, exit) in candidates {
+        order.retain(|block| *block != header && *block != exit);
+        let Some(latch_position) = order.iter().position(|block| *block == latch) else {
+            continue;
+        };
+        order.insert(latch_position + 1, header);
+        order.insert(latch_position + 2, exit);
+    }
+    order
+}
+
+fn natural_loop_members(
+    header: usize,
+    latch: usize,
+    predecessors: &[Vec<usize>],
+    dom_in: &[usize],
+    dom_out: &[usize],
+    block_count: usize,
+) -> Vec<bool> {
+    let mut members = vec![false; block_count];
+    members[header] = true;
+    members[latch] = true;
+    let mut worklist = vec![latch];
+    while let Some(block) = worklist.pop() {
+        for predecessor in &predecessors[block] {
+            if !members[*predecessor] && dominates(header, *predecessor, dom_in, dom_out) {
+                members[*predecessor] = true;
+                if *predecessor != header {
+                    worklist.push(*predecessor);
+                }
+            }
+        }
+    }
+    members
+}
+
 fn control_flow_graph(func: &Function) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
     let mut predecessors = vec![Vec::new(); func.blocks.len()];
     let mut successors_by_block = vec![Vec::new(); func.blocks.len()];
@@ -250,5 +389,70 @@ fn successors(terminator: Option<&Terminator>) -> Vec<BlockId> {
             ..
         }) => vec![*then_target, *else_target],
         Some(Terminator::Return(_)) | None => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Function, Type};
+
+    #[test]
+    fn places_a_canonical_latch_before_its_header_and_exit() {
+        let mut func = Function::new("rotate", Type::Void);
+        let condition = func.add_param("continue", Type::I1);
+        let header = func.add_block("header");
+        let body = func.add_block("body");
+        let exit = func.add_block("exit");
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: body,
+                else_target: exit,
+            },
+        );
+        func.set_terminator(body, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+
+        assert_eq!(
+            loop_rotated_block_order(&func),
+            vec![func.entry.0, body.0, header.0, exit.0]
+        );
+    }
+
+    #[test]
+    fn preserves_multi_latch_loops() {
+        let mut func = Function::new("several_latches", Type::Void);
+        let condition = func.add_param("choose", Type::I1);
+        let header = func.add_block("header");
+        let left = func.add_block("left");
+        let right = func.add_block("right");
+        let exit = func.add_block("exit");
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: left,
+                else_target: exit,
+            },
+        );
+        func.set_terminator(
+            left,
+            Terminator::Branch {
+                cond: condition,
+                then_target: header,
+                else_target: right,
+            },
+        );
+        func.set_terminator(right, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+
+        assert_eq!(
+            loop_rotated_block_order(&func),
+            (0..func.blocks.len()).collect::<Vec<_>>()
+        );
     }
 }

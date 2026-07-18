@@ -45,7 +45,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Binary { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
-                if *op == BinaryOp::Imul && self.fused_madd_user(result).is_some() {
+                if (*op == BinaryOp::Imul && self.fused_madd_user(result).is_some())
+                    || (*op == BinaryOp::Iand && self.fused_bit_test_branch_user(result))
+                {
                     return;
                 }
                 if *op == BinaryOp::Iadd {
@@ -72,7 +74,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                         return;
                     }
                 }
-                if self.emit_assigned_binary_imm(result, *op, *lhs, *rhs) {
+                if self.emit_assigned_binary_imm(result, *op, *lhs, *rhs)
+                    || self.emit_assigned_binary(result, *op, *lhs, *rhs)
+                {
                     return;
                 }
                 self.emit_binary(*op, *lhs, *rhs);
@@ -115,7 +119,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         }
     }
 
-    pub(super) fn emit_terminator(&mut self, block_idx: usize, terminator: &Terminator) {
+    pub(super) fn emit_terminator(
+        &mut self,
+        block_idx: usize,
+        terminator: &Terminator,
+        next_block: Option<usize>,
+    ) {
         match terminator {
             Terminator::Return(value) => {
                 if let Some(value) = value {
@@ -128,19 +137,34 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             Terminator::Jump(target) => {
                 self.emit_phi_copies(block_idx, target.0);
-                self.body
-                    .push_str(&format!("  b {}\n", self.block_label(target.0)));
+                if next_block != Some(target.0) {
+                    self.body
+                        .push_str(&format!("  b {}\n", self.block_label(target.0)));
+                }
             }
             Terminator::Branch {
                 cond,
                 then_target,
                 else_target,
             } => {
+                if then_target == else_target {
+                    self.emit_phi_copies(block_idx, then_target.0);
+                    if next_block != Some(then_target.0) {
+                        self.body
+                            .push_str(&format!("  b {}\n", self.block_label(then_target.0)));
+                    }
+                    return;
+                }
+
                 if !self.edge_has_phi_copy(block_idx, then_target.0)
                     && !self.edge_has_phi_copy(block_idx, else_target.0)
                 {
-                    self.emit_branch_if_false(*cond, self.block_label(else_target.0));
-                    if then_target.0 != block_idx + 1 {
+                    if next_block == Some(then_target.0) {
+                        self.emit_branch_if_false(*cond, self.block_label(else_target.0));
+                    } else if next_block == Some(else_target.0) {
+                        self.emit_branch_if_true(*cond, self.block_label(then_target.0));
+                    } else {
+                        self.emit_branch_if_false(*cond, self.block_label(else_target.0));
                         self.body
                             .push_str(&format!("  b {}\n", self.block_label(then_target.0)));
                     }
@@ -187,8 +211,23 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             .collect::<Vec<_>>();
 
         if let [(result, value)] = copies.as_slice() {
-            self.load_value(*value);
-            self.store_result(*result);
+            if let (Some(destination), Some(source)) =
+                (self.assigned_x_reg(*result), self.assigned_x_reg(*value))
+            {
+                match self.func.value(*result).ty {
+                    Type::Ptr(_) => self
+                        .body
+                        .push_str(&format!("  mov {}, {}\n", destination, source)),
+                    _ => self.body.push_str(&format!(
+                        "  mov {}, {}\n",
+                        w_reg_name(destination),
+                        w_reg_name(source)
+                    )),
+                }
+            } else {
+                self.load_value(*value);
+                self.store_result(*result);
+            }
             return;
         }
 
@@ -208,16 +247,25 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             .block(BlockId(target_idx))
             .insts
             .iter()
-            .any(|inst| {
-                matches!(
-                    &inst.kind,
-                    InstKind::Phi { incomings }
-                        if incomings.iter().any(|(pred, _)| pred.0 == pred_idx)
-                )
+            .filter_map(|inst| {
+                let (Some(result), InstKind::Phi { incomings }) = (inst.result, &inst.kind) else {
+                    return None;
+                };
+                incomings
+                    .iter()
+                    .find(|(pred, _)| pred.0 == pred_idx)
+                    .map(|(_, incoming)| (result, *incoming))
+            })
+            .any(|(result, incoming)| {
+                self.phi_regs.reg(result) != self.phi_regs.reg(incoming)
+                    || self.phi_regs.reg(result).is_none()
             })
     }
 
     fn emit_branch_if_false(&mut self, cond: ValueId, target: String) {
+        if self.emit_bit_test_branch(cond, &target, false) {
+            return;
+        }
         if let Some((op, lhs, rhs)) = self.direct_branch_icmp(cond) {
             self.emit_int_compare(lhs, rhs);
             self.body
@@ -227,6 +275,102 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             self.body
                 .push_str(&format!("  cmp w0, #0\n  beq {}\n", target));
         }
+    }
+
+    fn emit_branch_if_true(&mut self, cond: ValueId, target: String) {
+        if self.emit_bit_test_branch(cond, &target, true) {
+            return;
+        }
+        if let Some((op, lhs, rhs)) = self.direct_branch_icmp(cond) {
+            self.emit_int_compare(lhs, rhs);
+            self.body
+                .push_str(&format!("  b.{} {}\n", cmp_cc(op), target));
+        } else {
+            self.load_value(cond);
+            self.body
+                .push_str(&format!("  cmp w0, #0\n  bne {}\n", target));
+        }
+    }
+
+    fn emit_bit_test_branch(&mut self, cond: ValueId, target: &str, branch_if_true: bool) -> bool {
+        let Some((op, value, mask, _)) = self.direct_branch_bit_test(cond) else {
+            return false;
+        };
+        let branch_if_nonzero = matches!(op, CmpOp::Ne) == branch_if_true;
+        let source = if let Some(reg) = self.assigned_w_reg(value) {
+            reg
+        } else {
+            self.load_value(value);
+            "w0".to_string()
+        };
+        let short_branch_range = self
+            .func
+            .blocks
+            .iter()
+            .map(|block| block.insts.len())
+            .sum::<usize>()
+            <= 1024;
+        if (mask as u32).is_power_of_two() && short_branch_range {
+            let instruction = if branch_if_nonzero { "tbnz" } else { "tbz" };
+            self.body.push_str(&format!(
+                "  {} {}, #{}, {}\n",
+                instruction,
+                source,
+                (mask as u32).trailing_zeros(),
+                target
+            ));
+        } else {
+            let condition = if branch_if_nonzero { "ne" } else { "eq" };
+            self.body.push_str(&format!(
+                "  tst {}, #{}\n  b.{} {}\n",
+                source, mask, condition, target
+            ));
+        }
+        true
+    }
+
+    fn fused_bit_test_branch_user(&self, masked: ValueId) -> bool {
+        self.value_use_counts[masked.0] == 1
+            && self.func.blocks.iter().any(|block| {
+                let Some(Terminator::Branch { cond, .. }) = block.terminator.as_ref() else {
+                    return false;
+                };
+                self.direct_branch_bit_test(*cond)
+                    .is_some_and(|(_, _, _, candidate)| candidate == masked)
+            })
+    }
+
+    fn direct_branch_bit_test(&self, cond: ValueId) -> Option<(CmpOp, ValueId, i32, ValueId)> {
+        let (op, lhs, rhs) = self.direct_branch_icmp(cond)?;
+        if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+            return None;
+        }
+        let masked = if const_i32(self.func, rhs) == Some(0) {
+            lhs
+        } else if const_i32(self.func, lhs) == Some(0) {
+            rhs
+        } else {
+            return None;
+        };
+        if self.value_use_counts[masked.0] != 1 {
+            return None;
+        }
+        let InstKind::Binary {
+            op: BinaryOp::Iand,
+            lhs: mask_lhs,
+            rhs: mask_rhs,
+        } = defining_inst_kind(self.func, masked)?
+        else {
+            return None;
+        };
+        let (value, mask) = if let Some(mask) = const_i32(self.func, *mask_rhs) {
+            (*mask_lhs, mask)
+        } else if let Some(mask) = const_i32(self.func, *mask_lhs) {
+            (*mask_rhs, mask)
+        } else {
+            return None;
+        };
+        is_low_bit_mask(mask).then_some((op, value, mask, masked))
     }
 
     fn fused_madd_user(&self, multiply: ValueId) -> Option<ValueId> {
@@ -341,9 +485,64 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     return true;
                 }
             }
+            BinaryOp::Iand => {
+                if let (Some(source), Some(mask)) = (
+                    self.assigned_w_reg(lhs),
+                    const_i32(self.func, rhs).filter(|mask| is_low_bit_mask(*mask)),
+                ) {
+                    self.body
+                        .push_str(&format!("  and {}, {}, #{}\n", destination, source, mask));
+                    return true;
+                }
+            }
             _ => {}
         }
         false
+    }
+
+    fn emit_assigned_binary(
+        &mut self,
+        result: ValueId,
+        op: BinaryOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> bool {
+        let (Some(destination), Some(lhs), Some(rhs)) = (
+            self.assigned_w_reg(result),
+            self.assigned_w_reg(lhs),
+            self.assigned_w_reg(rhs),
+        ) else {
+            return false;
+        };
+        let instruction = match op {
+            BinaryOp::Iadd => "add",
+            BinaryOp::Isub => "sub",
+            BinaryOp::Imul => "mul",
+            BinaryOp::Idiv => "sdiv",
+            BinaryOp::Iand => "and",
+            BinaryOp::Ior => "orr",
+            BinaryOp::Ixor => "eor",
+            BinaryOp::Ishl => "lsl",
+            BinaryOp::Iashr => "asr",
+            BinaryOp::Imod => {
+                self.body.push_str(&format!(
+                    "  sdiv w2, {}, {}\n  msub {}, w2, {}, {}\n",
+                    lhs, rhs, destination, rhs, lhs
+                ));
+                return true;
+            }
+            BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Fadd
+            | BinaryOp::Fsub
+            | BinaryOp::Fmul
+            | BinaryOp::Fdiv => return false,
+        };
+        self.body.push_str(&format!(
+            "  {} {}, {}, {}\n",
+            instruction, destination, lhs, rhs
+        ));
+        true
     }
 
     fn emit_binary(&mut self, op: BinaryOp, lhs: ValueId, rhs: ValueId) {
@@ -434,6 +633,14 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     }
                 }
             }
+            BinaryOp::Iand => {
+                if let Some(mask) = const_i32(self.func, rhs).filter(|mask| is_low_bit_mask(*mask))
+                {
+                    self.load_value(lhs);
+                    self.body.push_str(&format!("  and w0, w0, #{}\n", mask));
+                    return true;
+                }
+            }
             BinaryOp::Idiv | BinaryOp::Imod => {
                 if let Some(shift) = pow2_shift(self.func, rhs) {
                     self.emit_signed_divmod_pow2(lhs, shift, op == BinaryOp::Imod);
@@ -513,17 +720,60 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     fn emit_int_compare(&mut self, lhs: ValueId, rhs: ValueId) {
         if let Some(imm) = const_i32(self.func, rhs).filter(|imm| fits_addsub_imm(*imm)) {
-            self.load_value(lhs);
-            self.body.push_str(&format!("  cmp w0, #{}\n", imm));
+            if let Some(lhs) = self.assigned_w_reg(lhs) {
+                self.body.push_str(&format!("  cmp {}, #{}\n", lhs, imm));
+            } else {
+                self.load_value(lhs);
+                self.body.push_str(&format!("  cmp w0, #{}\n", imm));
+            }
             return;
         }
 
-        self.load_value_into(lhs, "x1");
-        self.load_value(rhs);
-        if matches!(self.func.value(lhs).ty, Type::Ptr(_)) {
-            self.body.push_str("  cmp x1, x0\n");
-        } else {
-            self.body.push_str("  cmp w1, w0\n");
+        let is_pointer = matches!(self.func.value(lhs).ty, Type::Ptr(_));
+        match (self.assigned_x_reg(lhs), self.assigned_x_reg(rhs)) {
+            (Some(lhs), Some(rhs)) => {
+                let (lhs, rhs) = if is_pointer {
+                    (lhs.to_string(), rhs.to_string())
+                } else {
+                    (w_reg_name(lhs), w_reg_name(rhs))
+                };
+                self.body.push_str(&format!("  cmp {}, {}\n", lhs, rhs));
+            }
+            (Some(lhs), None) => {
+                let lhs = if is_pointer {
+                    lhs.to_string()
+                } else {
+                    w_reg_name(lhs)
+                };
+                self.load_value(rhs);
+                self.body.push_str(&format!(
+                    "  cmp {}, {}0\n",
+                    lhs,
+                    if is_pointer { "x" } else { "w" }
+                ));
+            }
+            (None, Some(rhs)) => {
+                let rhs = if is_pointer {
+                    rhs.to_string()
+                } else {
+                    w_reg_name(rhs)
+                };
+                self.load_value(lhs);
+                self.body.push_str(&format!(
+                    "  cmp {}0, {}\n",
+                    if is_pointer { "x" } else { "w" },
+                    rhs
+                ));
+            }
+            (None, None) => {
+                self.load_value_into(lhs, "x1");
+                self.load_value(rhs);
+                self.body.push_str(if is_pointer {
+                    "  cmp x1, x0\n"
+                } else {
+                    "  cmp w1, w0\n"
+                });
+            }
         }
     }
 
@@ -578,6 +828,21 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 }
 
+fn w_reg_name(x_reg: &str) -> String {
+    x_reg.replacen('x', "w", 1)
+}
+
+fn defining_inst_kind(func: &crate::ir::Function, value: ValueId) -> Option<&InstKind> {
+    let ValueKind::Inst(block, inst_idx) = func.value(value).kind else {
+        return None;
+    };
+    func.blocks
+        .get(block.0)?
+        .insts
+        .get(inst_idx)
+        .map(|inst| &inst.kind)
+}
+
 fn const_i32(func: &crate::ir::Function, value: ValueId) -> Option<i32> {
     match &func.value(value).kind {
         ValueKind::Const(Const::Int(value)) => Some(*value),
@@ -596,6 +861,21 @@ fn positive_pow2_shift(value: i32) -> Option<u32> {
 
 fn fits_addsub_imm(value: i32) -> bool {
     (0..=4095).contains(&value)
+}
+
+fn is_low_bit_mask(value: i32) -> bool {
+    value > 0 && ((value as u32) & (value as u32).wrapping_add(1)) == 0
+}
+
+fn cmp_cc(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Lt => "lt",
+        CmpOp::Gt => "gt",
+        CmpOp::Le => "le",
+        CmpOp::Ge => "ge",
+        CmpOp::Eq => "eq",
+        CmpOp::Ne => "ne",
+    }
 }
 
 fn inverse_cmp_cc(op: CmpOp) -> &'static str {
