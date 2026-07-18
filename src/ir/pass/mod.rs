@@ -3,6 +3,7 @@ mod const_fold;
 mod cse;
 mod dce;
 pub(crate) mod dominators;
+mod gep_induction;
 mod global_scalar_localize;
 mod inline;
 mod inst_combine;
@@ -11,6 +12,7 @@ mod licm;
 mod local_forward;
 mod loop_analysis;
 mod piecewise_expr;
+mod recursive_inline;
 mod repeat_reduction;
 mod scalar_promote;
 mod simple_loop_unroll;
@@ -23,6 +25,7 @@ use bit_idiom::LoopIdiomPass;
 use const_fold::ConstFoldPass;
 use cse::CsePass;
 use dce::DcePass;
+use gep_induction::GepInductionPass;
 use global_scalar_localize::GlobalScalarLocalizePass;
 use inline::InlineSmallExprPass;
 use inst_combine::InstCombinePass;
@@ -30,6 +33,7 @@ use invariant_load::InvariantLoadForwardPass;
 use licm::LicmPass;
 use local_forward::LocalForwardPass;
 use piecewise_expr::PiecewiseExprPass;
+use recursive_inline::RecursiveInlinePass;
 use repeat_reduction::RepeatReductionPass;
 use scalar_promote::ScalarPromotePass;
 use simple_loop_unroll::SimpleLoopUnrollPass;
@@ -65,6 +69,7 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(TailRecursionPass::new());
             pipeline.add(GlobalScalarLocalizePass::new());
             pipeline.add(ScalarPromotePass::new());
+            pipeline.add(RecursiveInlinePass::new());
             pipeline.add(InlineSmallExprPass::new());
             pipeline.add(LocalForwardPass::new());
             pipeline.add(CsePass::new());
@@ -80,6 +85,10 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(ConstFoldPass::new());
             pipeline.add(LoopIdiomPass::new());
             pipeline.add(ConstFoldPass::new());
+            // Run address strength reduction after transforms whose matching
+            // intentionally expects the source loop-phi set. In particular,
+            // this preserves the existing simple-unroll profitability gate.
+            pipeline.add(GepInductionPass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());
         }

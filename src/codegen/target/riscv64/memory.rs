@@ -87,6 +87,16 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 gep_elem_type(&ty)
             };
             let stride = ir_size(&elem_ty).max(1);
+            if let Some(offset) = const_gep_offset(self.func, *index, stride) {
+                self.emit_gep_const_add(destination, current_base, offset);
+                current_base = destination;
+                ty = if idx + 1 == indices.len() {
+                    self.func.value(result).ty.clone()
+                } else {
+                    elem_ty
+                };
+                continue;
+            }
             let index_reg = if let Some(index_reg) = self.assigned_reg(*index) {
                 index_reg
             } else {
@@ -138,6 +148,15 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 gep_elem_type(&ty)
             };
             let stride = ir_size(&elem_ty).max(1);
+            if let Some(offset) = const_gep_offset(self.func, *index, stride) {
+                self.emit_gep_const_add("a1", "a1", offset);
+                ty = if idx + 1 == indices.len() {
+                    self.func.value(result).ty.clone()
+                } else {
+                    elem_ty
+                };
+                continue;
+            }
             self.load_value(*index);
             if stride != 1 {
                 if stride > 0 && (stride & (stride - 1)) == 0 {
@@ -156,6 +175,21 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             };
         }
         self.body.push_str("  mv a0, a1\n");
+    }
+
+    fn emit_gep_const_add(&mut self, destination: &str, base: &str, offset: i64) {
+        if offset == 0 {
+            self.body
+                .push_str(&format!("  mv {}, {}\n", destination, base));
+        } else if i32::try_from(offset).is_ok_and(fits_i12) {
+            self.body
+                .push_str(&format!("  addi {}, {}, {}\n", destination, base, offset));
+        } else {
+            self.body.push_str(&format!(
+                "  li t0, {}\n  add {}, {}, t0\n",
+                offset, destination, base
+            ));
+        }
     }
 
     pub(super) fn load_value(&mut self, value: ValueId) {
@@ -408,6 +442,15 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     fn frame_slot_offset(&self, offset: i32) -> i32 {
         offset - self.regalloc.saved_area_size()
     }
+}
+
+fn const_gep_offset(func: &crate::ir::Function, index: ValueId, stride: i32) -> Option<i64> {
+    let index = match &func.value(index).kind {
+        ValueKind::Const(Const::Int(value)) => *value,
+        ValueKind::Const(Const::Bool(value)) => *value as i32,
+        _ => return None,
+    };
+    Some(i64::from(index) * i64::from(stride))
 }
 
 fn fits_i12(value: i32) -> bool {
