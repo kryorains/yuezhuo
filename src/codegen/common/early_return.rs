@@ -2,9 +2,8 @@ use crate::ir::{BinaryOp, BlockId, Function, InstKind, Terminator, Type, ValueId
 use std::collections::HashSet;
 
 // Keep this analysis intentionally small: it only moves a side-effect-free,
-// register-only entry decision ahead of the frame setup. The slow successor
-// must need no edge copies, and all omitted blocks must be unreachable from
-// anywhere except the original entry edge.
+// register-only entry decision ahead of the frame setup. The framed path emits
+// the original entry-to-slow phi copies before bypassing the duplicated guard.
 const MAX_GUARD_VALUES: usize = 12;
 
 #[derive(Clone, Copy)]
@@ -58,10 +57,7 @@ pub(crate) fn entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
         (true, *then_target, *else_target),
         (false, *else_target, *then_target),
     ] {
-        if fast_block == slow_block
-            || !has_only_predecessor(func, fast_block, func.entry)
-            || block_has_phi(func, slow_block)
-        {
+        if fast_block == slow_block || !has_only_predecessor(func, fast_block, func.entry) {
             continue;
         }
         let Some(result) = early_result(func, fast_block) else {
@@ -128,22 +124,54 @@ fn collect_guard_values(
 
 fn early_result(func: &Function, block: BlockId) -> Option<EarlyReturnResult> {
     let owner = &func.blocks[block.0];
-    let Terminator::Return(Some(result)) = owner.terminator.as_ref()? else {
-        return None;
+    let result = match owner.terminator.as_ref()? {
+        Terminator::Return(Some(result)) => *result,
+        Terminator::Jump(merge) => {
+            let merge_block = &func.blocks[merge.0];
+            let active = merge_block
+                .insts
+                .iter()
+                .filter(|inst| !matches!(inst.kind, InstKind::Nop))
+                .collect::<Vec<_>>();
+            let [phi] = active.as_slice() else {
+                return None;
+            };
+            let phi_result = phi.result?;
+            if !matches!(
+                merge_block.terminator,
+                Some(Terminator::Return(Some(value))) if value == phi_result
+            ) {
+                return None;
+            }
+            let InstKind::Phi { incomings } = &phi.kind else {
+                return None;
+            };
+            incomings
+                .iter()
+                .find_map(|(pred, value)| (*pred == block).then_some(*value))?
+        }
+        Terminator::Return(None) | Terminator::Branch { .. } => return None,
     };
-    let active = owner
+    result_from_block(func, block, result)
+}
+
+fn result_from_block(
+    func: &Function,
+    block: BlockId,
+    result: ValueId,
+) -> Option<EarlyReturnResult> {
+    let active = func.blocks[block.0]
         .insts
         .iter()
         .filter(|inst| !matches!(inst.kind, InstKind::Nop))
         .collect::<Vec<_>>();
-
-    if active.is_empty() && func.value(*result).ty == func.ret && is_direct_integer(func, *result) {
-        return Some(EarlyReturnResult::Direct(*result));
+    if active.is_empty() && func.value(result).ty == func.ret && is_direct_integer(func, result) {
+        return Some(EarlyReturnResult::Direct(result));
     }
     let [inst] = active.as_slice() else {
         return None;
     };
-    if inst.result != Some(*result) || func.value(*result).ty != Type::I32 {
+    if inst.result != Some(result) || func.value(result).ty != Type::I32 {
         return None;
     }
     let InstKind::Binary { op, lhs, rhs } = inst.kind else {
@@ -173,46 +201,6 @@ fn is_direct_integer(func: &Function, value: ValueId) -> bool {
             func.value(value).kind,
             ValueKind::Param | ValueKind::Const(_)
         )
-}
-
-fn block_has_phi(func: &Function, block: BlockId) -> bool {
-    func.blocks[block.0]
-        .insts
-        .iter()
-        .any(|inst| matches!(inst.kind, InstKind::Phi { .. }))
-}
-
-fn has_predecessor(func: &Function, target: BlockId) -> bool {
-    func.blocks
-        .iter()
-        .any(|block| match block.terminator.as_ref() {
-            Some(Terminator::Jump(successor)) => *successor == target,
-            Some(Terminator::Branch {
-                then_target,
-                else_target,
-                ..
-            }) => *then_target == target || *else_target == target,
-            Some(Terminator::Return(_)) | None => false,
-        })
-}
-
-fn has_only_predecessor(func: &Function, target: BlockId, expected: BlockId) -> bool {
-    let mut predecessors = HashSet::new();
-    for (block_idx, block) in func.blocks.iter().enumerate() {
-        let reaches_target = match block.terminator.as_ref() {
-            Some(Terminator::Jump(successor)) => *successor == target,
-            Some(Terminator::Branch {
-                then_target,
-                else_target,
-                ..
-            }) => *then_target == target || *else_target == target,
-            Some(Terminator::Return(_)) | None => false,
-        };
-        if reaches_target {
-            predecessors.insert(BlockId(block_idx));
-        }
-    }
-    predecessors == HashSet::from([expected])
 }
 
 fn entry_results_escape(func: &Function, entry: BlockId, fast_block: BlockId) -> bool {
@@ -264,4 +252,37 @@ fn terminator_operands(terminator: Option<&Terminator>) -> Vec<ValueId> {
         Some(Terminator::Branch { cond, .. }) => vec![*cond],
         Some(Terminator::Return(None) | Terminator::Jump(_)) | None => Vec::new(),
     }
+}
+
+fn has_predecessor(func: &Function, target: BlockId) -> bool {
+    func.blocks
+        .iter()
+        .any(|block| match block.terminator.as_ref() {
+            Some(Terminator::Jump(successor)) => *successor == target,
+            Some(Terminator::Branch {
+                then_target,
+                else_target,
+                ..
+            }) => *then_target == target || *else_target == target,
+            Some(Terminator::Return(_)) | None => false,
+        })
+}
+
+fn has_only_predecessor(func: &Function, target: BlockId, expected: BlockId) -> bool {
+    let mut predecessors = HashSet::new();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let reaches_target = match block.terminator.as_ref() {
+            Some(Terminator::Jump(successor)) => *successor == target,
+            Some(Terminator::Branch {
+                then_target,
+                else_target,
+                ..
+            }) => *then_target == target || *else_target == target,
+            Some(Terminator::Return(_)) | None => false,
+        };
+        if reaches_target {
+            predecessors.insert(BlockId(block_idx));
+        }
+    }
+    predecessors == HashSet::from([expected])
 }

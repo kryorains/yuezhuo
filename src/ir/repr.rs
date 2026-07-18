@@ -127,6 +127,44 @@ impl Function {
         result
     }
 
+    /// Inserts an instruction at an arbitrary position and keeps every
+    /// instruction-backed value location consistent.
+    pub fn insert_inst(
+        &mut self,
+        block: BlockId,
+        inst_idx: usize,
+        kind: InstKind,
+        result_ty: Option<Type>,
+    ) -> Option<ValueId> {
+        let inst_len = self.block(block).insts.len();
+        assert!(
+            inst_idx <= inst_len,
+            "instruction insertion index out of bounds"
+        );
+        if inst_idx == inst_len {
+            return self.append_inst(block, kind, result_ty);
+        }
+        for value in &mut self.values {
+            if let ValueKind::Inst(owner, owner_idx) = &mut value.kind {
+                if *owner == block && *owner_idx >= inst_idx {
+                    *owner_idx += 1;
+                }
+            }
+        }
+
+        let result = result_ty.map(|ty| {
+            self.add_value(Value {
+                name: None,
+                ty,
+                kind: ValueKind::Inst(block, inst_idx),
+            })
+        });
+        self.block_mut(block)
+            .insts
+            .insert(inst_idx, Inst { result, kind });
+        result
+    }
+
     pub fn set_terminator(&mut self, block: BlockId, terminator: Terminator) {
         let slot = &mut self.block_mut(block).terminator;
         if slot.is_some() {

@@ -53,7 +53,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 .map(|prelude| (plan, prelude))
         });
         self.emit_params();
-        let params_end = self.body.len();
+        if let Some((plan, _)) = &early_return {
+            self.emit_phi_copies(self.func.entry.0, plan.slow_block.0);
+            self.body
+                .push_str(&format!("  b {}\n", self.block_label(plan.slow_block.0)));
+        }
+        let setup_end = self.body.len();
         for (block_idx, block) in self.func.blocks.iter().enumerate() {
             if early_return.as_ref().is_some_and(|(plan, _)| {
                 block_idx == self.func.entry.0 || block_idx == plan.fast_block.0
@@ -69,9 +74,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 self.emit_terminator(block_idx, terminator);
             }
         }
-
-        let params = self.body[..params_end].to_string();
-        let blocks = self.body[params_end..].to_string();
+        let setup = self.body[..setup_end].to_string();
+        let blocks = self.body[setup_end..].to_string();
         let saved_regs = self.phi_regs.saved_regs().to_vec();
         let saved_bytes = (saved_regs.len() as i32) * 8;
         let stack_size = ir_align_to(self.layout.stack_size + saved_bytes, 16);
@@ -96,12 +100,7 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 .out
                 .push_str(&format!("  str {}, [sp, #{}]\n", reg, idx * 8));
         }
-        self.parent.out.push_str(&params);
-        if let Some((plan, _)) = &early_return {
-            self.parent
-                .out
-                .push_str(&format!("  b {}\n", self.block_label(plan.slow_block.0)));
-        }
+        self.parent.out.push_str(&setup);
         self.parent.out.push_str(&blocks);
         self.parent
             .out

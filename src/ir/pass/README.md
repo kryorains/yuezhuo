@@ -24,15 +24,17 @@
   9. `LicmPass`
   10. `InvariantLoadForwardPass`
   11. `DcePass`
-  12. `BitwiseIdiomPass`
-  13. `PiecewiseExprPass`
-  14. `RepeatReductionPass`
-  15. `SimpleLoopUnrollPass`
+  12. `PiecewiseExprPass`
+  13. `RepeatReductionPass`
+  14. `SimpleLoopUnrollPass`（按目标收益门控）
+  15. `InstCombinePass`
   16. `ConstFoldPass`
-  17. `SimplifyCfgPass`
-  18. `DcePass`
+  17. `LoopIdiomPass`
+  18. `ConstFoldPass`
+  19. `SimplifyCfgPass`
+  20. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行常量折叠、CSE、LICM 等主动改写表达式的优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi，末尾 DCE 再清理归约折叠后失效的循环记账指令。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `PiecewiseExprPass`、`LoopIdiomPass`、`InstCombinePass`、常量折叠、CSE、LICM 等主动优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾先由 InstCombine 和 ConstFold 把局部整数算术规范化，再让 LoopIdiom 识别循环区域，最后由 ConstFold、SimplifyCfg 和 DCE 清理新暴露的常量、控制流及死指令。
 
 ## Pass 列表
 
@@ -52,6 +54,18 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 - `x * 1` 简化成 `x`。
 - `x == x` 简化成 `true`。
 - 所有 incoming 都相同的 `phi` 简化成那个唯一值。
+
+### `InstCombinePass` (`inst_combine.rs`)
+
+逐指令执行的通用整数表达式规范化。它遍历所有函数，只检查当前指令及其操作数的直接定义，不读取函数名、变量名、块名，也不匹配整函数或 CFG 形状。目前支持：
+
+- 把可交换 i32 运算规范到稳定操作数顺序，并把常量放在 RHS；
+- 把 `x + x` 改写为 wrapping `x * 2`；
+- 在 wrapping 语义下重关联嵌套常量加法和乘法，例如 `(x * 2) * 2` 变为 `x * 4`；
+- 当 use-def 链精确证明相同 dividend 和相同已知非零 i32 常量除数时，把 `x - (x / d) * d` 改写为 `x % d`；
+- 把 `icmp` 常量换到 RHS，并同步反转大小比较谓词。
+
+pass 不重关联或以其它方式改写浮点运算，也不把局部常量二次幂乘除主动改写成 shift；这类局部指令选择继续由现有后端负责。IR 的动态 shift 仍采用计数低 5 位语义。
 
 ### `SimplifyCfgPass` (`simplify_cfg.rs`)
 
@@ -125,11 +139,15 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 
 它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
 
-### `BitwiseIdiomPass` (`bit_idiom.rs`)
+### `LoopIdiomPass` (`bit_idiom.rs`)
 
-按 SSA 递推语义识别 bit-sliced 整数运算循环。候选必须是无副作用的纯标量 helper，并包含两个逐轮 `/ 2` 的输入、逐轮 `* 2` 的位权、有限位数倒计时和按条件累加位权的结果。pass 对一轮循环的四组输入位做符号执行，从真值表综合出整数 `and/or/xor` 表达式；它不读取变量名、块名、块编号，也不依赖固定的指令数量。
+循环区域级整数 idiom 变换，仅接入 O1。它通过共享的 `LoopInfo`、`NaturalLoop`、i32 归纳变量与精确常量 trip-count 分析，在任意函数中逐个识别两个输入每轮除以 2、位权每轮乘以 2、按输入低位更新 accumulator 的自然循环。单轮控制流会对四组输入位做符号求值，因此可以推导全部二输入布尔真值表；局部余数、倍增和乘法重关联只接受前置 InstCombine/ConstFold 产生的规范形式。
 
-迭代次数可以是 1 到 32；不足 32 位时自动添加低位掩码。原循环作为慢路径完整保留，只有两个输入都非负时才执行原生位运算快速路径，从而保持 SysY 有符号除法和取模对负数的语义。
+变换只 version 目标 loop region：preheader 新增两个输入非负的 guard，fast block 合成整数位运算和不足 32 位时的掩码，负数继续进入完整原循环；唯一 exit 新增 accumulator 合并 phi，循环后的原有计算继续使用合并结果。函数返回类型、参数数量、输入是否直接来自参数、循环数量和结果是否直接返回都不参与匹配。
+
+证明边界是保守的：必须有唯一专用 preheader、唯一 latch、唯一 exiting edge 和唯一 exit，不能有返回、内存访问、调用等 side exit/副作用；fast operands 必须在 preheader 可用；除 accumulator 外不能有 loop-defined live-out。exit 的已有 phi 只有在 fast edge 能复用其原 incoming 时才会补边，否则拒绝。变换后 preheader 不再是原循环的专用 preheader，因此重复运行幂等。
+
+当循环结果所在的 exit 块只包含 Nop 并直接返回 accumulator 时，fast block 会直接返回综合结果，避免为未改写的 fallback 循环增加合并 phi 和寄存器压力；其它区域仍使用 exit phi 合并 live-out。
 
 ### `PiecewiseExprPass` (`piecewise_expr.rs`)
 
@@ -141,7 +159,7 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 
 无副作用重复归约折叠。
 
-它识别从 0 开始、每轮加 1 的计数循环；当循环体没有 `store`、`call`、`memzero` 等副作用，并且唯一可观察的循环状态满足 `acc' = acc + delta` 时，把重复执行改写为：
+它通过共享的 `LoopInfo` 与 i32 归纳变量分析识别从 0 开始、每轮加 1 的计数循环；当循环体没有 `store`、`call`、`memzero` 等副作用，并且唯一可观察的循环状态满足 `acc' = acc + delta` 时，把重复执行改写为：
 
 1. 执行一次原循环体，得到单轮增量 `delta`；
 2. 计算 `initial + delta * count`；
@@ -153,7 +171,7 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 
 对严格规范化的单基本块计数循环做二倍展开。
 
-候选循环必须从 0 开始、每轮加 1、以动态上界做有符号小于比较，并且只有一个活跃 loop phi；含调用、`memzero`、侧出口或额外循环状态时不会展开。pass 在原标量循环前插入两路快速循环，原循环继续处理负数、小于 2 的次数和奇数尾项。两份循环体严格按迭代顺序克隆，因此即使相邻迭代的内存访问互相别名，也不会改变可观察顺序。代码增长受单循环和单函数预算限制。当前 AArch64 后端会让展开后的中间值产生额外栈流量，因此目标收益门控暂时只在 x86-64 和 RISC-V64 启用该 pass。
+候选循环通过共享的 `LoopInfo` 与 i32 归纳变量分析取得结构和计数器信息，但仍严格要求从 0 开始、每轮加 1、以动态上界做有符号小于比较，并且只有一个活跃 loop phi；含调用、`memzero`、侧出口或额外循环状态时不会展开。pass 在原标量循环前插入两路快速循环，原循环继续处理负数、小于 2 的次数和奇数尾项。两份循环体严格按迭代顺序克隆，因此即使相邻迭代的内存访问互相别名，也不会改变可观察顺序。代码增长受单循环和单函数预算限制。当前 AArch64 后端会让展开后的中间值产生额外栈流量，因此目标收益门控暂时只在 x86-64 和 RISC-V64 启用该 pass。
 
 ### `DcePass` (`dce.rs`)
 
@@ -179,11 +197,22 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 
 - `ControlFlowGraph`：每个基本块的前驱和后继。
 - `Dominators`：
-  - 每个块的支配集合；
-  - 支配树 children；
+  - 在入口可达 CFG 的 reverse postorder 上用 Cooper-Harvey-Kennedy 算法求 immediate dominator；
+  - 支配树 children 和 DFS 区间，`dominates` 查询为 O(1)；
   - dominance frontier。
 
-`ScalarPromotePass` 用它来判断定义是否支配使用，以及在哪里需要插入 `phi`。
+不可达块不加入入口支配树；IR verifier 另把虚拟根视为位于 physical entry 指令之后，并连接不可达 CFG 各 source SCC 的全部成员，保守检查 dead region 的跨块定义及 phi-edge 可用性，既不放过 dead diamond 的错误 incoming，也允许 entry 定义及结构正确的 `dead.def -> dead.use`。`ScalarPromotePass` 用入口支配信息判断定义是否支配使用，以及在哪里需要插入 `phi`；`LoopInfo`、LICM 及 IR verifier 都不依赖基本块在 `Function.blocks` 中的存储顺序。
+
+### `loop_analysis.rs`
+
+共享的自然循环与 i32 归纳变量分析，不是独立 pass，也不读取函数名、块名或固定块编号。
+
+- `LoopInfo` 从 CFG 中收集“循环头支配回边源”的 backedge，并按 header 合并成 `NaturalLoop`。
+- `NaturalLoop` 提供 header、所有 latch/backedge、只含入口可达且被 header 支配的 loop blocks、唯一 entering predecessor 与专用 preheader（若存在）、全部退出边和唯一 exit（若存在）；多 latch、多入口或多 exit 会显式保留，而不是猜测某个固定布局。
+- `analyze_i32_induction` 只需从 header phi 的唯一 entering predecessor/latch incoming 识别 `next = phi + constant` 形式，统一处理 `add` 两种操作数顺序及 `sub phi, constant`，支持任意非零 i32 环绕步长，并返回 phi、initial、next、step。
+- `analyze_const_i32_trip_count` 对常量初值、常量步长和 header 直接 signed `icmp` 计算精确迭代次数，统一比较操作数反转和 true/false continuation；依赖 i32 回绕才能终止、越界或不终止的情况会拒绝。
+
+LICM、`SimpleLoopUnrollPass` 和 `LoopIdiomPass` 的 CFG/区域改写要求 dedicated preheader；`RepeatReductionPass` 与归纳分析只要求 unique entering predecessor。各 pass 复用循环结构和归纳变量描述，再施加自身的严格变换门控。LICM 按 invariant use-def 拓扑一次把定义先于使用移入 preheader，避免 BlockId 逆序依赖链上的反复全循环扫描。因此该模块是普通循环优化的公共基础设施，不是某个整数 idiom 的私有 matcher。
 
 ### `util.rs`
 

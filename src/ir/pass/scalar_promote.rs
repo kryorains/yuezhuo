@@ -1,9 +1,7 @@
 use super::dominators::{ControlFlowGraph, Dominators};
 use super::util::{resolve_replacement, rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
-use crate::ir::{
-    BlockId, Function, Inst, InstKind, Module, Terminator, Type, Value, ValueId, ValueKind,
-};
+use crate::ir::{BlockId, Const, Function, InstKind, Module, Terminator, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(super) struct ScalarPromotePass;
@@ -45,11 +43,33 @@ fn promote_function(func: &mut Function) {
         .iter()
         .map(|((block, alloca), phi)| (*phi, (*block, *alloca)))
         .collect::<HashMap<_, _>>();
-    let mut stacks = candidates
-        .iter()
-        .copied()
-        .map(|alloca| (alloca, Vec::<ValueId>::new()))
-        .collect::<HashMap<_, _>>();
+    // Unpruned phi placement can create a dead phi before the first real
+    // store. Only allocas that actually received a phi need a seed, and one
+    // type-correct zero can serve every such alloca of the same type.
+    // `loads_are_defined` guarantees a seed never replaces an observable load.
+    let phi_candidates = phi_values
+        .keys()
+        .map(|(_, alloca)| *alloca)
+        .collect::<HashSet<_>>();
+    let mut seeds_by_type = Vec::<(Type, ValueId)>::new();
+    let mut stacks = HashMap::new();
+    for alloca in &candidates {
+        let seed = if phi_candidates.contains(alloca) {
+            let Some(ty) = promoted_type(func, *alloca) else {
+                continue;
+            };
+            if let Some((_, seed)) = seeds_by_type.iter().find(|(seed_ty, _)| *seed_ty == ty) {
+                Some(*seed)
+            } else {
+                let seed = func.add_const(Const::Zero(ty.clone()));
+                seeds_by_type.push((ty, seed));
+                Some(seed)
+            }
+        } else {
+            None
+        };
+        stacks.insert(*alloca, seed.into_iter().collect());
+    }
     let mut replacements = ValueReplacements::new();
 
     rename_block(
@@ -63,6 +83,7 @@ fn promote_function(func: &mut Function) {
         &mut stacks,
         &mut replacements,
     );
+    fill_unreachable_phi_incomings(func, &cfg, &dom, &phi_values, &stacks);
 
     rewrite_function_uses(func, &replacements);
     if let Err(errors) = func.verify() {
@@ -292,32 +313,15 @@ fn insert_phi(func: &mut Function, block: BlockId, ty: Type) -> ValueId {
         .iter()
         .take_while(|inst| matches!(inst.kind, InstKind::Nop | InstKind::Phi { .. }))
         .count();
-    let result = ValueId(func.values.len());
-    func.values.push(Value {
-        name: None,
-        ty,
-        kind: ValueKind::Inst(block, pos),
-    });
-    func.blocks[block.0].insts.insert(
+    func.insert_inst(
+        block,
         pos,
-        Inst {
-            result: Some(result),
-            kind: InstKind::Phi {
-                incomings: Vec::new(),
-            },
+        InstKind::Phi {
+            incomings: Vec::new(),
         },
-    );
-    reindex_block(func, block);
-    result
-}
-
-fn reindex_block(func: &mut Function, block: BlockId) {
-    for inst_idx in 0..func.blocks[block.0].insts.len() {
-        let Some(result) = func.blocks[block.0].insts[inst_idx].result else {
-            continue;
-        };
-        func.values[result.0].kind = ValueKind::Inst(block, inst_idx);
-    }
+        Some(ty),
+    )
+    .unwrap()
 }
 
 fn rename_block(
@@ -404,6 +408,41 @@ fn rename_block(
     for alloca in pushed.into_iter().rev() {
         // 离开当前支配树节点时回滚值栈，恢复父路径的“当前值”。
         stacks.get_mut(&alloca).unwrap().pop();
+    }
+}
+
+fn fill_unreachable_phi_incomings(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dom: &Dominators,
+    phi_values: &HashMap<(BlockId, ValueId), ValueId>,
+    stacks: &HashMap<ValueId, Vec<ValueId>>,
+) {
+    // rename_block only visits the entry-reachable dominator tree. Dead CFG
+    // predecessors still need a structurally complete phi, but their value can
+    // never be observed, so use the type-correct seed for those edges.
+    for ((block, alloca), phi) in phi_values {
+        let Some(seed) = stacks.get(alloca).and_then(|stack| stack.first()).copied() else {
+            continue;
+        };
+        let ValueKind::Inst(owner, inst_idx) = func.value(*phi).kind else {
+            continue;
+        };
+        let InstKind::Phi { incomings } = &func.blocks[owner.0].insts[inst_idx].kind else {
+            continue;
+        };
+        let present = incomings
+            .iter()
+            .map(|(pred, _)| *pred)
+            .collect::<HashSet<_>>();
+        let missing = cfg.preds[block.0]
+            .iter()
+            .copied()
+            .filter(|pred| !dom.is_reachable(*pred) && !present.contains(pred))
+            .collect::<Vec<_>>();
+        for pred in missing {
+            add_phi_incoming(func, *phi, pred, seed);
+        }
     }
 }
 

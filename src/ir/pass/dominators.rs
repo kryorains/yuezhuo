@@ -1,13 +1,12 @@
 use crate::ir::{BlockId, Function, Terminator};
-use std::collections::{HashSet, VecDeque};
 
-pub(super) struct ControlFlowGraph {
-    pub(super) preds: Vec<Vec<BlockId>>,
-    pub(super) succs: Vec<Vec<BlockId>>,
+pub(crate) struct ControlFlowGraph {
+    pub(crate) preds: Vec<Vec<BlockId>>,
+    pub(crate) succs: Vec<Vec<BlockId>>,
 }
 
 impl ControlFlowGraph {
-    pub(super) fn new(func: &Function) -> Self {
+    pub(crate) fn new(func: &Function) -> Self {
         // 根据每个基本块的 terminator 建出前驱/后继表。
         let mut preds = vec![Vec::new(); func.blocks.len()];
         let mut succs = vec![Vec::new(); func.blocks.len()];
@@ -42,89 +41,130 @@ fn add_edge(pred: BlockId, succ: BlockId, preds: &mut [Vec<BlockId>], succs: &mu
     preds[succ.0].push(pred);
 }
 
-pub(super) struct Dominators {
-    pub(super) dom_sets: Vec<HashSet<usize>>,
-    pub(super) children: Vec<Vec<BlockId>>,
-    pub(super) frontier: Vec<Vec<BlockId>>,
+pub(crate) struct Dominators {
+    pub(crate) children: Vec<Vec<BlockId>>,
+    pub(crate) frontier: Vec<Vec<BlockId>>,
+    entry: BlockId,
+    reachable: Vec<bool>,
+    tree_preorder: Vec<usize>,
+    tree_subtree_end: Vec<usize>,
+    unreachable_preorder: Vec<usize>,
+    unreachable_subtree_end: Vec<usize>,
 }
 
 impl Dominators {
-    pub(super) fn new(func: &Function, cfg: &ControlFlowGraph) -> Self {
-        // 支配信息只对入口可达块有意义；不可达块单独保守处理。
-        let reachable = reachable_blocks(func, cfg);
-        let dom_sets = compute_dom_sets(func, cfg, &reachable);
-        let idom = compute_idoms(func, &dom_sets, &reachable);
+    pub(crate) fn new(func: &Function, cfg: &ControlFlowGraph) -> Self {
+        // Cooper-Harvey-Kennedy：只在入口可达 CFG 的 RPO 上求 immediate dominator。
+        let (rpo, reachable) = compute_reverse_postorder(func, cfg);
+        let idom = compute_idoms(func, cfg, &rpo);
         let children = compute_children(func, &idom);
+        let (tree_preorder, tree_subtree_end) =
+            compute_tree_intervals(func.entry, &children, func.blocks.len());
         let frontier = compute_frontier(func, cfg, &idom, &reachable);
+        let (unreachable_preorder, unreachable_subtree_end) =
+            compute_unreachable_intervals(cfg, &reachable);
         Self {
-            dom_sets,
             children,
             frontier,
+            entry: func.entry,
+            reachable,
+            tree_preorder,
+            tree_subtree_end,
+            unreachable_preorder,
+            unreachable_subtree_end,
         }
     }
 
-    pub(super) fn dominates(&self, dominator: BlockId, block: BlockId) -> bool {
-        self.dom_sets[block.0].contains(&dominator.0)
+    pub(crate) fn dominates(&self, dominator: BlockId, block: BlockId) -> bool {
+        // 不可达块保持原有保守语义：只认为块支配自身，不在不同不可达根之间
+        // 发明支配关系。可达块则通过支配树 DFS 的半开区间 O(1) 查询。
+        if !self.is_reachable(block) {
+            return dominator == block;
+        }
+        if !self.is_reachable(dominator) {
+            return false;
+        }
+        let dominator_preorder = self.tree_preorder[dominator.0];
+        let block_preorder = self.tree_preorder[block.0];
+        dominator_preorder <= block_preorder && block_preorder < self.tree_subtree_end[dominator.0]
+    }
+
+    /// Returns whether a definition is available on every structural path to
+    /// `block`. For dead CFG regions this uses a synthetic-root dominance
+    /// forest instead of either accepting or rejecting every cross-block use.
+    pub(crate) fn dominates_for_availability(&self, dominator: BlockId, block: BlockId) -> bool {
+        if self.is_reachable(block) {
+            return self.dominates(dominator, block);
+        }
+        if self.is_reachable(dominator) {
+            // Entry instructions execute before every possible function path.
+            // Treat the synthetic dead-region root as following the physical
+            // entry so cleanup passes may leave entry-defined values in code
+            // that later became disconnected. No other reachable definition
+            // is conservatively available in an unrelated dead component.
+            return dominator == self.entry;
+        }
+        let dominator_preorder = self.unreachable_preorder[dominator.0];
+        let block_preorder = self.unreachable_preorder[block.0];
+        dominator_preorder != usize::MAX
+            && dominator_preorder <= block_preorder
+            && block_preorder < self.unreachable_subtree_end[dominator.0]
+    }
+
+    pub(crate) fn is_reachable(&self, block: BlockId) -> bool {
+        self.reachable.get(block.0).copied().unwrap_or(false)
     }
 }
 
-fn reachable_blocks(func: &Function, cfg: &ControlFlowGraph) -> HashSet<usize> {
-    let mut reachable = HashSet::new();
-    let mut worklist = VecDeque::from([func.entry]);
-    while let Some(block) = worklist.pop_front() {
-        if !reachable.insert(block.0) {
-            continue;
-        }
-        for succ in &cfg.succs[block.0] {
-            worklist.push_back(*succ);
-        }
-    }
-    reachable
-}
+fn compute_reverse_postorder(func: &Function, cfg: &ControlFlowGraph) -> (Vec<BlockId>, Vec<bool>) {
+    let mut reachable = vec![false; func.blocks.len()];
+    let mut postorder = Vec::new();
+    let mut stack = vec![(func.entry, 0usize)];
+    reachable[func.entry.0] = true;
 
-fn compute_dom_sets(
-    func: &Function,
-    cfg: &ControlFlowGraph,
-    reachable: &HashSet<usize>,
-) -> Vec<HashSet<usize>> {
-    // 朴素迭代算法：dom(B) = {B} ∪ 所有前驱 dom 集合的交集，直到不再变化。
-    let n = func.blocks.len();
-    let all = reachable.iter().copied().collect::<HashSet<_>>();
-    let mut doms = (0..n)
-        .map(|block| {
-            if reachable.contains(&block) {
-                all.clone()
-            } else {
-                HashSet::from([block])
+    // 用显式栈避免大型直线 CFG 使宿主 Rust 栈溢出。
+    while let Some((block, next_succ)) = stack.pop() {
+        if next_succ < cfg.succs[block.0].len() {
+            stack.push((block, next_succ + 1));
+            let succ = cfg.succs[block.0][next_succ];
+            if !reachable[succ.0] {
+                reachable[succ.0] = true;
+                stack.push((succ, 0));
             }
-        })
-        .collect::<Vec<_>>();
-    doms[func.entry.0] = HashSet::from([func.entry.0]);
+        } else {
+            postorder.push(block);
+        }
+    }
+
+    postorder.reverse();
+    (postorder, reachable)
+}
+
+fn compute_idoms(func: &Function, cfg: &ControlFlowGraph, rpo: &[BlockId]) -> Vec<Option<BlockId>> {
+    let mut rpo_index = vec![usize::MAX; func.blocks.len()];
+    for (index, block) in rpo.iter().enumerate() {
+        rpo_index[block.0] = index;
+    }
+
+    // 在求解期间让 entry 的 idom 指向自身，作为 intersect 的根哨兵。
+    let mut idom = vec![None; func.blocks.len()];
+    idom[func.entry.0] = Some(func.entry);
 
     loop {
         let mut changed = false;
-        for block_idx in 0..n {
-            if block_idx == func.entry.0 || !reachable.contains(&block_idx) {
-                continue;
-            }
-
-            let reachable_preds = cfg.preds[block_idx]
+        for block in rpo.iter().copied().skip(1) {
+            let mut processed_preds = cfg.preds[block.0]
                 .iter()
-                .filter(|pred| reachable.contains(&pred.0))
-                .collect::<Vec<_>>();
-            let mut next = if reachable_preds.is_empty() {
-                HashSet::new()
-            } else {
-                reachable_preds
-                    .iter()
-                    .map(|pred| doms[pred.0].clone())
-                    .reduce(|acc, pred_doms| acc.intersection(&pred_doms).copied().collect())
-                    .unwrap_or_default()
+                .copied()
+                .filter(|pred| idom[pred.0].is_some());
+            let Some(mut new_idom) = processed_preds.next() else {
+                continue;
             };
-            next.insert(block_idx);
-
-            if next != doms[block_idx] {
-                doms[block_idx] = next;
+            for pred in processed_preds {
+                new_idom = intersect(pred, new_idom, &idom, &rpo_index);
+            }
+            if idom[block.0] != Some(new_idom) {
+                idom[block.0] = Some(new_idom);
                 changed = true;
             }
         }
@@ -133,36 +173,25 @@ fn compute_dom_sets(
         }
     }
 
-    doms
+    idom[func.entry.0] = None;
+    idom
 }
 
-fn compute_idoms(
-    func: &Function,
-    dom_sets: &[HashSet<usize>],
-    reachable: &HashSet<usize>,
-) -> Vec<Option<BlockId>> {
-    // immediate dominator 是严格支配者里“离当前块最近”的那个。
-    let mut idom = vec![None; func.blocks.len()];
-
-    for block_idx in 0..func.blocks.len() {
-        if block_idx == func.entry.0 || !reachable.contains(&block_idx) {
-            continue;
+fn intersect(
+    mut first: BlockId,
+    mut second: BlockId,
+    idom: &[Option<BlockId>],
+    rpo_index: &[usize],
+) -> BlockId {
+    while first != second {
+        while rpo_index[first.0] > rpo_index[second.0] {
+            first = idom[first.0].expect("processed RPO predecessor must have an idom");
         }
-
-        let strict_doms = dom_sets[block_idx]
-            .iter()
-            .copied()
-            .filter(|dom| *dom != block_idx)
-            .collect::<Vec<_>>();
-
-        let immediate = strict_doms
-            .iter()
-            .copied()
-            .max_by_key(|candidate| dom_sets[*candidate].len());
-        idom[block_idx] = immediate.map(BlockId);
+        while rpo_index[second.0] > rpo_index[first.0] {
+            second = idom[second.0].expect("processed RPO predecessor must have an idom");
+        }
     }
-
-    idom
+    first
 }
 
 fn compute_children(func: &Function, idom: &[Option<BlockId>]) -> Vec<Vec<BlockId>> {
@@ -175,22 +204,251 @@ fn compute_children(func: &Function, idom: &[Option<BlockId>]) -> Vec<Vec<BlockI
     children
 }
 
+fn compute_tree_intervals(
+    entry: BlockId,
+    children: &[Vec<BlockId>],
+    block_count: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut preorder = vec![usize::MAX; block_count];
+    let mut subtree_end = vec![usize::MAX; block_count];
+    let mut next_preorder = 0usize;
+    let mut stack = vec![(entry, 0usize)];
+    preorder[entry.0] = next_preorder;
+    next_preorder += 1;
+
+    while let Some((block, next_child)) = stack.pop() {
+        if next_child < children[block.0].len() {
+            stack.push((block, next_child + 1));
+            let child = children[block.0][next_child];
+            preorder[child.0] = next_preorder;
+            next_preorder += 1;
+            stack.push((child, 0));
+        } else {
+            subtree_end[block.0] = next_preorder;
+        }
+    }
+
+    (preorder, subtree_end)
+}
+
+fn compute_unreachable_intervals(
+    cfg: &ControlFlowGraph,
+    reachable: &[bool],
+) -> (Vec<usize>, Vec<usize>) {
+    let block_count = cfg.succs.len();
+    let virtual_root = block_count;
+    let mut succs = vec![Vec::<usize>::new(); block_count + 1];
+    let mut preds = vec![Vec::<usize>::new(); block_count + 1];
+
+    for block in 0..block_count {
+        if reachable[block] {
+            continue;
+        }
+        for succ in &cfg.succs[block] {
+            if !reachable[succ.0] {
+                succs[block].push(succ.0);
+                preds[succ.0].push(block);
+            }
+        }
+    }
+
+    // A dead region may have several ordinary roots or consist only of
+    // cycles. Connect a virtual root to every member of each source SCC. The
+    // latter avoids inventing an arbitrary first block inside a rootless dead
+    // cycle, while still proving dominance in well-formed dead.def->dead.use
+    // chains and downstream regions.
+    let roots =
+        unreachable_source_scc_members(&succs[..block_count], &preds[..block_count], reachable);
+    for root in roots {
+        succs[virtual_root].push(root);
+        preds[root].push(virtual_root);
+    }
+
+    let rpo = compute_index_reverse_postorder(virtual_root, &succs);
+    let idom = compute_index_idoms(virtual_root, &preds, &rpo);
+    let mut children = vec![Vec::new(); block_count + 1];
+    for (node, parent) in idom.iter().enumerate() {
+        if let Some(parent) = parent {
+            children[*parent].push(node);
+        }
+    }
+
+    let mut preorder = vec![usize::MAX; block_count + 1];
+    let mut subtree_end = vec![usize::MAX; block_count + 1];
+    let mut next_preorder = 0usize;
+    let mut stack = vec![(virtual_root, 0usize)];
+    preorder[virtual_root] = next_preorder;
+    next_preorder += 1;
+    while let Some((node, next_child)) = stack.pop() {
+        if next_child < children[node].len() {
+            stack.push((node, next_child + 1));
+            let child = children[node][next_child];
+            preorder[child] = next_preorder;
+            next_preorder += 1;
+            stack.push((child, 0));
+        } else {
+            subtree_end[node] = next_preorder;
+        }
+    }
+
+    preorder.truncate(block_count);
+    subtree_end.truncate(block_count);
+    (preorder, subtree_end)
+}
+
+fn unreachable_source_scc_members(
+    succs: &[Vec<usize>],
+    preds: &[Vec<usize>],
+    reachable: &[bool],
+) -> Vec<usize> {
+    let mut visited = reachable.to_vec();
+    let mut postorder = Vec::new();
+    for start in 0..succs.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, next_succ)) = stack.pop() {
+            if next_succ < succs[node].len() {
+                stack.push((node, next_succ + 1));
+                let succ = succs[node][next_succ];
+                if !visited[succ] {
+                    visited[succ] = true;
+                    stack.push((succ, 0));
+                }
+            } else {
+                postorder.push(node);
+            }
+        }
+    }
+
+    let mut component = vec![usize::MAX; succs.len()];
+    let mut component_count = 0usize;
+    for start in postorder.into_iter().rev() {
+        if component[start] != usize::MAX {
+            continue;
+        }
+        component[start] = component_count;
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            for pred in &preds[node] {
+                if component[*pred] == usize::MAX {
+                    component[*pred] = component_count;
+                    stack.push(*pred);
+                }
+            }
+        }
+        component_count += 1;
+    }
+
+    let mut is_source = vec![true; component_count];
+    for from in 0..succs.len() {
+        if reachable[from] {
+            continue;
+        }
+        for to in &succs[from] {
+            if component[from] != component[*to] {
+                is_source[component[*to]] = false;
+            }
+        }
+    }
+
+    (0..succs.len())
+        .filter(|node| !reachable[*node] && is_source[component[*node]])
+        .collect()
+}
+
+fn compute_index_reverse_postorder(root: usize, succs: &[Vec<usize>]) -> Vec<usize> {
+    let mut visited = vec![false; succs.len()];
+    let mut postorder = Vec::new();
+    let mut stack = vec![(root, 0usize)];
+    visited[root] = true;
+    while let Some((node, next_succ)) = stack.pop() {
+        if next_succ < succs[node].len() {
+            stack.push((node, next_succ + 1));
+            let succ = succs[node][next_succ];
+            if !visited[succ] {
+                visited[succ] = true;
+                stack.push((succ, 0));
+            }
+        } else {
+            postorder.push(node);
+        }
+    }
+    postorder.reverse();
+    postorder
+}
+
+fn compute_index_idoms(root: usize, preds: &[Vec<usize>], rpo: &[usize]) -> Vec<Option<usize>> {
+    let mut rpo_index = vec![usize::MAX; preds.len()];
+    for (index, node) in rpo.iter().enumerate() {
+        rpo_index[*node] = index;
+    }
+    let mut idom = vec![None; preds.len()];
+    idom[root] = Some(root);
+
+    loop {
+        let mut changed = false;
+        for node in rpo.iter().copied().skip(1) {
+            let mut processed_preds = preds[node]
+                .iter()
+                .copied()
+                .filter(|pred| idom[*pred].is_some());
+            let Some(mut new_idom) = processed_preds.next() else {
+                continue;
+            };
+            for pred in processed_preds {
+                new_idom = intersect_index(pred, new_idom, &idom, &rpo_index);
+            }
+            if idom[node] != Some(new_idom) {
+                idom[node] = Some(new_idom);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    idom[root] = None;
+    idom
+}
+
+fn intersect_index(
+    mut first: usize,
+    mut second: usize,
+    idom: &[Option<usize>],
+    rpo_index: &[usize],
+) -> usize {
+    while first != second {
+        while rpo_index[first] > rpo_index[second] {
+            first = idom[first].expect("processed RPO predecessor must have an idom");
+        }
+        while rpo_index[second] > rpo_index[first] {
+            second = idom[second].expect("processed RPO predecessor must have an idom");
+        }
+    }
+    first
+}
+
 fn compute_frontier(
     func: &Function,
     cfg: &ControlFlowGraph,
     idom: &[Option<BlockId>],
-    reachable: &HashSet<usize>,
+    reachable: &[bool],
 ) -> Vec<Vec<BlockId>> {
     // dominance frontier 用来回答“某个定义从哪些汇合点开始不再支配所有路径”。
     let mut frontier = vec![Vec::new(); func.blocks.len()];
+    let mut last_inserted = vec![usize::MAX; func.blocks.len()];
 
     for block_idx in 0..func.blocks.len() {
-        if !reachable.contains(&block_idx) {
+        if !reachable[block_idx] {
             continue;
         }
         let reachable_preds = cfg.preds[block_idx]
             .iter()
-            .filter(|pred| reachable.contains(&pred.0))
+            .filter(|pred| reachable[pred.0])
             .copied()
             .collect::<Vec<_>>();
         if reachable_preds.len() < 2 {
@@ -204,7 +462,10 @@ fn compute_frontier(
             // 从每个前驱沿 idom 链向上走到当前块的 idom，沿途都需要把当前块放进 frontier。
             let mut runner = *pred;
             while runner != stop {
-                push_unique(&mut frontier[runner.0], BlockId(block_idx));
+                if last_inserted[runner.0] != block_idx {
+                    frontier[runner.0].push(BlockId(block_idx));
+                    last_inserted[runner.0] = block_idx;
+                }
                 let Some(next) = idom[runner.0] else {
                     break;
                 };
@@ -214,10 +475,4 @@ fn compute_frontier(
     }
 
     frontier
-}
-
-fn push_unique(values: &mut Vec<BlockId>, value: BlockId) {
-    if !values.contains(&value) {
-        values.push(value);
-    }
 }
