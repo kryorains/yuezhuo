@@ -165,7 +165,7 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 
 变换在 preheader 用 induction 初值重建完整地址，在 header 插入 pointer phi，在 latch 用单索引常量 GEP 生成固定步长 next pointer。只有全部使用都位于循环内且新 phi 支配普通使用及 phi edge 时才替换原 GEP；仅作为其它已选 nested GEP base 的中间地址不会单独生成死 recurrence。常量 trip-count 分析或 header signed comparison 还必须证明 i32 induction 在每个回边不 wrap，否则 sign extension 后的重算地址与 pointer increment 并不等价，pass 会拒绝。
 
-pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有 live-out 地址时，header pointer state 仍只沿唯一 backedge 更新。动态大步长、循环内变化的 offset、非 GEP 派生链、不能在 preheader 使用的定义、不可整除为最终 pointee stride 的步长及类型大小溢出都保守保留。变换后立即运行 verifier，重复执行不会再次匹配生成的 pointer recurrence。
+pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有 live-out 地址时，header pointer state 仍只沿唯一 backedge 更新。含调用的循环不会变换，因为跨调用 pointer recurrence 会占用 callee-saved 寄存器或增加 spill，而地址重算通常不是这类循环的主要成本。动态大步长、循环内变化的 offset、非 GEP 派生链、不能在 preheader 使用的定义、不可整除为最终 pointee stride 的步长及类型大小溢出都保守保留。变换后立即运行 verifier，重复执行不会再次匹配生成的 pointer recurrence。
 
 ### `PiecewiseExprPass` (`piecewise_expr.rs`)
 

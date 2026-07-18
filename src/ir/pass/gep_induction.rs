@@ -50,6 +50,10 @@ struct Candidate {
 }
 
 fn strength_reduce_function(func: &mut Function) {
+    if func.blocks.len() > 1024 || func.values.len() > 8192 {
+        return;
+    }
+
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
     let loops = LoopInfo::new(&cfg, &dom).loops().to_vec();
@@ -63,7 +67,18 @@ fn strength_reduce_function(func: &mut Function) {
         ) else {
             continue;
         };
-        if natural_loop.unique_entering_pred != Some(preheader) {
+        if natural_loop.unique_entering_pred != Some(preheader)
+            || natural_loop.blocks.iter().any(|block| {
+                func.blocks[block.0]
+                    .insts
+                    .iter()
+                    .any(|inst| matches!(inst.kind, InstKind::Call { .. }))
+            })
+        {
+            // A pointer carried across a call consumes a callee-saved register
+            // (or adds spill traffic) while address recomputation is usually a
+            // small part of such a loop. Keep this as a target-independent
+            // profitability boundary; call-free inner loops are still reduced.
             continue;
         }
 
@@ -725,6 +740,35 @@ mod tests {
         strength_reduce_function(&mut func);
         assert!(is_nop(&func, target));
         assert!(has_pointer_recurrence(&func, latch, -3));
+        assert!(func.verify().is_ok());
+    }
+
+    #[test]
+    fn rejects_call_crossing_loops_for_profitability() {
+        let (mut func, target, body) = build_linear_loop(
+            Type::Array {
+                elem: Box::new(Type::I32),
+                len: 31,
+            },
+            0,
+            Bound::Dynamic,
+            1,
+            CmpOp::Lt,
+        );
+        func.insert_inst(
+            body,
+            1,
+            InstKind::Call {
+                name: "opaque_work".to_string(),
+                args: Vec::new(),
+            },
+            Some(Type::I32),
+        );
+
+        assert!(func.verify().is_ok());
+        strength_reduce_function(&mut func);
+        assert!(!is_nop(&func, target));
+        assert_eq!(pointer_phi_count(&func), 0);
         assert!(func.verify().is_ok());
     }
 
