@@ -1,4 +1,5 @@
 use super::dominators::{ControlFlowGraph, Dominators};
+use super::loop_analysis::{analyze_i32_induction, LoopInfo, NaturalLoop};
 use super::ModulePass;
 use crate::ir::{
     BinaryOp, BlockId, CmpOp, Const, Function, Inst, InstKind, Module, Terminator, Type, ValueId,
@@ -54,8 +55,11 @@ fn unroll_simple_loops(func: &mut Function) {
 
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
-    let candidates = (0..func.blocks.len())
-        .filter_map(|header| match_candidate(func, &cfg, &dom, BlockId(header)))
+    let loop_info = LoopInfo::new(&cfg, &dom);
+    let candidates = loop_info
+        .loops()
+        .iter()
+        .filter_map(|natural_loop| match_candidate(func, &cfg, &dom, natural_loop))
         .collect::<Vec<_>>();
 
     let mut cloned_insts = 0usize;
@@ -84,8 +88,11 @@ fn match_candidate(
     func: &Function,
     cfg: &ControlFlowGraph,
     dom: &Dominators,
-    header_id: BlockId,
+    natural_loop: &NaturalLoop,
 ) -> Option<UnrollCandidate> {
+    let header_id = natural_loop.header;
+    let preheader_id = natural_loop.dedicated_preheader?;
+    let latch = natural_loop.unique_latch()?;
     let header = func.blocks.get(header_id.0)?;
     let Terminator::Branch {
         cond,
@@ -95,7 +102,12 @@ fn match_candidate(
     else {
         return None;
     };
-    if body_id == &header_id || exit_id == &header_id || body_id == exit_id {
+    if *body_id != latch
+        || body_id == &header_id
+        || exit_id == &header_id
+        || body_id == exit_id
+        || natural_loop.unique_exit() != Some(*exit_id)
+    {
         return None;
     }
 
@@ -107,11 +119,11 @@ fn match_candidate(
     }
 
     let header_preds = cfg.preds.get(header_id.0)?;
-    if header_preds.len() != 2 || !header_preds.contains(body_id) {
-        return None;
-    }
-    let preheader_id = *header_preds.iter().find(|pred| **pred != *body_id)?;
-    if func.blocks.get(preheader_id.0)?.terminator != Some(Terminator::Jump(header_id)) {
+    if header_preds.len() != 2
+        || !header_preds.contains(body_id)
+        || !header_preds.contains(&preheader_id)
+        || func.blocks.get(preheader_id.0)?.terminator != Some(Terminator::Jump(header_id))
+    {
         return None;
     }
 
@@ -139,24 +151,28 @@ fn match_candidate(
         }
     }
 
-    let (header_phi_inst, counter, incomings) = phi?;
+    let (header_phi_inst, counter, _) = phi?;
     let (condition_counter, bound) = condition?;
     if counter != condition_counter
         || func.values.get(counter.0)?.ty != Type::I32
         || func.values.get(bound.0)?.ty != Type::I32
         || func.values.get(cond.0)?.ty != Type::I1
-        || incomings.len() != 2
     {
         return None;
     }
-    let counter_initial = incoming_from(incomings, preheader_id)?;
-    let counter_next = incoming_from(incomings, *body_id)?;
-    if !is_const_i32(func, counter_initial, 0)
-        || !is_add_one_in_block(func, counter_next, counter, *body_id)
+    let induction = analyze_i32_induction(func, natural_loop, counter)?;
+    if !is_const_i32(func, induction.initial, 0)
+        || induction.step != 1
+        || !matches!(
+            func.values.get(induction.next.0)?.kind,
+            ValueKind::Inst(owner, _) if owner == *body_id
+        )
         || !value_available_at_preheader(func, dom, bound, preheader_id)
     {
         return None;
     }
+    let counter_initial = induction.initial;
+    let counter_next = induction.next;
 
     let active_body_insts = body
         .insts
@@ -208,14 +224,6 @@ fn match_candidate(
     })
 }
 
-fn incoming_from(incomings: &[(BlockId, ValueId)], pred: BlockId) -> Option<ValueId> {
-    let mut values = incomings
-        .iter()
-        .filter_map(|(incoming_pred, value)| (*incoming_pred == pred).then_some(*value));
-    let value = values.next()?;
-    values.next().is_none().then_some(value)
-}
-
 fn is_const_i32(func: &Function, value: ValueId, expected: i32) -> bool {
     matches!(
         func.values.get(value.0),
@@ -224,29 +232,6 @@ fn is_const_i32(func: &Function, value: ValueId, expected: i32) -> bool {
             kind: ValueKind::Const(Const::Int(actual)),
             ..
         }) if *actual == expected
-    )
-}
-
-fn is_add_one_in_block(func: &Function, value: ValueId, counter: ValueId, body: BlockId) -> bool {
-    let Some(crate::ir::Value {
-        ty: Type::I32,
-        kind: ValueKind::Inst(owner, inst_idx),
-        ..
-    }) = func.values.get(value.0)
-    else {
-        return false;
-    };
-    if *owner != body {
-        return false;
-    }
-    matches!(
-        func.blocks.get(owner.0).and_then(|block| block.insts.get(*inst_idx)),
-        Some(Inst {
-            result: Some(result),
-            kind: InstKind::Binary { op: BinaryOp::Iadd, lhs, rhs },
-        }) if *result == value
-            && ((*lhs == counter && is_const_i32(func, *rhs, 1))
-                || (*rhs == counter && is_const_i32(func, *lhs, 1)))
     )
 }
 

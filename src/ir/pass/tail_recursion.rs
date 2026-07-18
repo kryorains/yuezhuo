@@ -350,37 +350,14 @@ fn rewrite_tail_call(
         .iter()
         .copied()
         .zip(site.args)
-        .map(|(ptr, value)| Inst {
-            result: None,
-            kind: InstKind::Store { ptr, value },
-        })
+        .map(|(ptr, value)| InstKind::Store { ptr, value })
         .collect::<Vec<_>>();
 
     let insert_pos = site.call_idx + 1;
     func.blocks[site.block.0].insts[site.call_idx].result = None;
     func.blocks[site.block.0].insts[site.call_idx].kind = InstKind::Nop;
-    func.blocks[site.block.0]
-        .insts
-        .splice(insert_pos..insert_pos, stores);
-    shift_value_locations_after_insert(func, site.block, site.call_idx, param_slots.len());
+    for (offset, store) in stores.into_iter().enumerate() {
+        func.insert_inst(site.block, insert_pos + offset, store, None);
+    }
     func.blocks[site.block.0].terminator = Some(Terminator::Jump(loop_entry));
-}
-
-fn shift_value_locations_after_insert(
-    func: &mut Function,
-    block: BlockId,
-    after_idx: usize,
-    inserted_len: usize,
-) {
-    if inserted_len == 0 {
-        return;
-    }
-    for value in &mut func.values {
-        let ValueKind::Inst(value_block, inst_idx) = value.kind else {
-            continue;
-        };
-        if value_block == block && inst_idx > after_idx {
-            value.kind = ValueKind::Inst(value_block, inst_idx + inserted_len);
-        }
-    }
 }

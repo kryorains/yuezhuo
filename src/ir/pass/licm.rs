@@ -1,7 +1,8 @@
 use super::dominators::{ControlFlowGraph, Dominators};
+use super::loop_analysis::{LoopInfo, NaturalLoop};
 use super::ModulePass;
 use crate::ir::{BinaryOp, BlockId, Function, Inst, InstKind, Module, ValueId, ValueKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 
 pub(super) struct LicmPass;
 
@@ -26,7 +27,8 @@ fn licm_function(func: &mut Function) {
 
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
-    let loops = find_natural_loops(func, &cfg, &dom);
+    let loop_info = LoopInfo::new(&cfg, &dom);
+    let loops = loop_info.loops().to_vec();
     if loops.is_empty() {
         return;
     }
@@ -43,131 +45,105 @@ fn licm_function(func: &mut Function) {
     }
 }
 
-#[derive(Debug, Clone)]
-struct NaturalLoop {
-    header: BlockId,
-    preheader: BlockId,
-    blocks: HashSet<BlockId>,
+fn hoist_loop(func: &mut Function, dom: &Dominators, natural_loop: &NaturalLoop) -> bool {
+    let Some(preheader) = natural_loop.dedicated_preheader else {
+        // Creating a dedicated preheader requires a separate CFG transformation.
+        return false;
+    };
+    let order = collect_hoist_order(func, dom, natural_loop, preheader);
+    for (block, inst_idx) in &order {
+        let inst = func.blocks[block.0].insts[*inst_idx].clone();
+        move_inst_to_preheader(func, *block, *inst_idx, preheader, inst);
+    }
+    !order.is_empty()
 }
 
-fn find_natural_loops(
-    func: &Function,
-    cfg: &ControlFlowGraph,
-    dom: &Dominators,
-) -> Vec<NaturalLoop> {
-    let mut loops = Vec::new();
+struct HoistCandidate {
+    block: BlockId,
+    inst_idx: usize,
+    pending_dependencies: usize,
+    blocked: bool,
+}
 
-    for tail_idx in 0..func.blocks.len() {
-        let tail = BlockId(tail_idx);
-        for header in &cfg.succs[tail_idx] {
-            if !dom.dominates(*header, tail) {
-                continue;
-            }
-            let blocks = collect_loop_blocks(cfg, *header, tail);
-            let outside_preds = cfg.preds[header.0]
-                .iter()
-                .copied()
-                .filter(|pred| !blocks.contains(pred))
-                .collect::<Vec<_>>();
-            // 先只处理有唯一 preheader 的循环；没有 preheader 时需要改 CFG，留给后续 pass。
-            let [preheader] = outside_preds.as_slice() else {
+fn collect_hoist_order(
+    func: &Function,
+    dom: &Dominators,
+    natural_loop: &NaturalLoop,
+    preheader: BlockId,
+) -> Vec<(BlockId, usize)> {
+    let mut candidates = Vec::<HoistCandidate>::new();
+    let mut candidate_for_value = HashMap::<ValueId, usize>::new();
+    for block in sorted_loop_blocks(natural_loop) {
+        for (inst_idx, inst) in func.blocks[block.0].insts.iter().enumerate() {
+            let Some(result) = inst.result else {
                 continue;
             };
-            loops.push(NaturalLoop {
-                header: *header,
-                preheader: *preheader,
-                blocks,
+            if !is_safe_to_hoist(&inst.kind) {
+                continue;
+            }
+            candidate_for_value.insert(result, candidates.len());
+            candidates.push(HoistCandidate {
+                block,
+                inst_idx,
+                pending_dependencies: 0,
+                blocked: false,
             });
         }
     }
 
-    loops
-}
-
-fn collect_loop_blocks(cfg: &ControlFlowGraph, header: BlockId, tail: BlockId) -> HashSet<BlockId> {
-    let mut blocks = HashSet::from([header, tail]);
-    let mut stack = vec![tail];
-
-    while let Some(block) = stack.pop() {
-        for pred in &cfg.preds[block.0] {
-            if blocks.insert(*pred) {
-                stack.push(*pred);
-            }
-        }
-    }
-
-    blocks
-}
-
-fn hoist_loop(func: &mut Function, dom: &Dominators, natural_loop: &NaturalLoop) -> bool {
-    let mut changed = false;
-
-    loop {
-        let invariant_values = collect_invariant_values(func, dom, natural_loop);
-        let candidates = collect_hoist_candidates(func, natural_loop, &invariant_values);
-        if candidates.is_empty() {
-            break;
-        }
-
-        for (block, inst_idx) in candidates {
-            let inst = func.blocks[block.0].insts[inst_idx].clone();
-            move_inst_to_preheader(func, block, inst_idx, natural_loop.preheader, inst);
-            changed = true;
-        }
-    }
-
-    changed
-}
-
-fn collect_invariant_values(
-    func: &Function,
-    dom: &Dominators,
-    natural_loop: &NaturalLoop,
-) -> HashSet<ValueId> {
-    let mut invariant = HashSet::new();
-
-    loop {
-        let mut changed = false;
-        for block in sorted_loop_blocks(natural_loop) {
-            for inst in &func.blocks[block.0].insts {
-                let Some(result) = inst.result else {
-                    continue;
-                };
-                if invariant.contains(&result) || !is_safe_to_hoist(&inst.kind) {
-                    continue;
+    let mut dependents = vec![Vec::<usize>::new(); candidates.len()];
+    let candidate_locations = candidates
+        .iter()
+        .map(|candidate| (candidate.block, candidate.inst_idx))
+        .collect::<Vec<_>>();
+    for (candidate_idx, (block, inst_idx)) in candidate_locations.into_iter().enumerate() {
+        let kind = &func.blocks[block.0].insts[inst_idx].kind;
+        let mut dependencies = Vec::new();
+        for operand in operands(kind) {
+            match &func.value(operand).kind {
+                ValueKind::Param | ValueKind::Const(_) | ValueKind::Global(_) => {}
+                ValueKind::Inst(block, _) if natural_loop.blocks.contains(block) => {
+                    let Some(dependency) = candidate_for_value.get(&operand).copied() else {
+                        candidates[candidate_idx].blocked = true;
+                        continue;
+                    };
+                    if !dependencies.contains(&dependency) {
+                        dependencies.push(dependency);
+                    }
                 }
-                if operands_are_invariant(func, dom, natural_loop, &inst.kind, &invariant) {
-                    invariant.insert(result);
-                    changed = true;
+                ValueKind::Inst(block, _) => {
+                    if *block != preheader && !dom.dominates(*block, preheader) {
+                        candidates[candidate_idx].blocked = true;
+                    }
                 }
             }
         }
-        if !changed {
-            break;
+        candidates[candidate_idx].pending_dependencies = dependencies.len();
+        for dependency in dependencies {
+            dependents[dependency].push(candidate_idx);
         }
     }
 
-    invariant
-}
-
-fn collect_hoist_candidates(
-    func: &Function,
-    natural_loop: &NaturalLoop,
-    invariant_values: &HashSet<ValueId>,
-) -> Vec<(BlockId, usize)> {
-    let mut candidates = Vec::new();
-    for block in sorted_loop_blocks(natural_loop) {
-        // Phi 必须留在循环头；其它 Nop/非纯指令也不会出现在 invariant_values 里。
-        for (inst_idx, inst) in func.blocks[block.0].insts.iter().enumerate() {
-            if inst
-                .result
-                .is_some_and(|result| invariant_values.contains(&result))
-            {
-                candidates.push((block, inst_idx));
+    // Kahn-style dependency scheduling makes the move order independent of
+    // BlockId allocation and appends every definition before its users in one
+    // pass. Cyclic or unsafe dependency groups simply never become ready.
+    let mut ready = (0..candidates.len())
+        .filter(|candidate| {
+            !candidates[*candidate].blocked && candidates[*candidate].pending_dependencies == 0
+        })
+        .collect::<VecDeque<_>>();
+    let mut order = Vec::new();
+    while let Some(candidate_idx) = ready.pop_front() {
+        let candidate = &candidates[candidate_idx];
+        order.push((candidate.block, candidate.inst_idx));
+        for dependent in &dependents[candidate_idx] {
+            candidates[*dependent].pending_dependencies -= 1;
+            if !candidates[*dependent].blocked && candidates[*dependent].pending_dependencies == 0 {
+                ready.push_back(*dependent);
             }
         }
     }
-    candidates
+    order
 }
 
 fn move_inst_to_preheader(
@@ -187,50 +163,6 @@ fn move_inst_to_preheader(
     let new_idx = func.blocks[preheader.0].insts.len();
     func.blocks[preheader.0].insts.push(inst);
     func.values[result.0].kind = ValueKind::Inst(preheader, new_idx);
-
-    reindex_block(func, block);
-    if block != preheader {
-        reindex_block(func, preheader);
-    }
-}
-
-fn reindex_block(func: &mut Function, block: BlockId) {
-    for inst_idx in 0..func.blocks[block.0].insts.len() {
-        let Some(result) = func.blocks[block.0].insts[inst_idx].result else {
-            continue;
-        };
-        func.values[result.0].kind = ValueKind::Inst(block, inst_idx);
-    }
-}
-
-fn operands_are_invariant(
-    func: &Function,
-    dom: &Dominators,
-    natural_loop: &NaturalLoop,
-    kind: &InstKind,
-    invariant: &HashSet<ValueId>,
-) -> bool {
-    operands(kind)
-        .into_iter()
-        .all(|value| value_available_in_preheader(func, dom, natural_loop, value, invariant))
-}
-
-fn value_available_in_preheader(
-    func: &Function,
-    dom: &Dominators,
-    natural_loop: &NaturalLoop,
-    value: ValueId,
-    invariant: &HashSet<ValueId>,
-) -> bool {
-    match &func.value(value).kind {
-        ValueKind::Param | ValueKind::Const(_) | ValueKind::Global(_) => true,
-        ValueKind::Inst(block, _) if natural_loop.blocks.contains(block) => {
-            invariant.contains(&value)
-        }
-        ValueKind::Inst(block, _) => {
-            *block == natural_loop.preheader || dom.dominates(*block, natural_loop.preheader)
-        }
-    }
 }
 
 fn operands(kind: &InstKind) -> Vec<ValueId> {
@@ -279,4 +211,174 @@ fn sorted_loop_blocks(natural_loop: &NaturalLoop) -> Vec<BlockId> {
     let mut blocks = natural_loop.blocks.iter().copied().collect::<Vec<_>>();
     blocks.sort_by_key(|block| (*block != natural_loop.header, block.0));
     blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Const, Terminator, Type};
+
+    #[test]
+    fn hoists_dependencies_before_uses_when_block_storage_order_differs() {
+        let mut func = Function::new("licm_order", Type::Void);
+        let header = func.add_block("header");
+        let use_block = func.add_block("use");
+        let def_block = func.add_block("def");
+        let latch = func.add_block("latch");
+        let exit = func.add_block("exit");
+        let condition = func.add_const(Const::Bool(true));
+        let one = func.add_const(Const::Int(1));
+
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: def_block,
+                else_target: exit,
+            },
+        );
+        let definition = func
+            .append_inst(
+                def_block,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: one,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(def_block, Terminator::Jump(use_block));
+        let usage = func
+            .append_inst(
+                use_block,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: definition,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(use_block, Terminator::Jump(latch));
+        func.set_terminator(latch, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+        assert!(func.verify().is_ok());
+
+        licm_function(&mut func);
+
+        assert!(func.verify().is_ok());
+        assert_eq!(
+            func.values[definition.0].kind,
+            ValueKind::Inst(func.entry, 0)
+        );
+        assert_eq!(func.values[usage.0].kind, ValueKind::Inst(func.entry, 1));
+    }
+
+    #[test]
+    fn does_not_hoist_from_unreachable_loop_predecessor() {
+        let mut func = Function::new("licm_dead_predecessor", Type::Void);
+        let header = func.add_block("header");
+        let body = func.add_block("body");
+        let exit = func.add_block("exit");
+        let dead = func.add_block("dead");
+        let condition = func.add_const(Const::Bool(true));
+        let one = func.add_const(Const::Int(1));
+
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: body,
+                else_target: exit,
+            },
+        );
+        func.set_terminator(body, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+        let dead_value = func
+            .append_inst(
+                dead,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: one,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(dead, Terminator::Jump(body));
+        assert!(func.verify().is_ok());
+
+        licm_function(&mut func);
+
+        assert!(func.verify().is_ok());
+        assert_eq!(func.values[dead_value.0].kind, ValueKind::Inst(dead, 0));
+        assert!(func.blocks[func.entry.0].insts.is_empty());
+    }
+
+    #[test]
+    fn hoists_long_reverse_block_id_dependency_chain_in_one_order() {
+        const CHAIN_LEN: usize = 256;
+
+        let mut func = Function::new("licm_reverse_chain", Type::Void);
+        let header = func.add_block("header");
+        // Allocate the chain in use-to-definition order. CFG dominance and
+        // value dependencies therefore run opposite to BlockId order.
+        let reverse_blocks = (0..CHAIN_LEN)
+            .map(|index| func.add_block(format!("chain.{index}")))
+            .collect::<Vec<_>>();
+        let latch = func.add_block("latch");
+        let exit = func.add_block("exit");
+        let condition = func.add_const(Const::Bool(true));
+        let one = func.add_const(Const::Int(1));
+
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: reverse_blocks[CHAIN_LEN - 1],
+                else_target: exit,
+            },
+        );
+        let mut dependency = one;
+        let mut values = Vec::new();
+        for block in reverse_blocks.iter().rev() {
+            dependency = func
+                .append_inst(
+                    *block,
+                    InstKind::Binary {
+                        op: BinaryOp::Iadd,
+                        lhs: dependency,
+                        rhs: one,
+                    },
+                    Some(Type::I32),
+                )
+                .unwrap();
+            values.push(dependency);
+        }
+        for index in (1..CHAIN_LEN).rev() {
+            func.set_terminator(
+                reverse_blocks[index],
+                Terminator::Jump(reverse_blocks[index - 1]),
+            );
+        }
+        func.set_terminator(reverse_blocks[0], Terminator::Jump(latch));
+        func.set_terminator(latch, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+        assert!(func.verify().is_ok());
+
+        licm_function(&mut func);
+
+        assert!(func.verify().is_ok());
+        assert_eq!(func.blocks[func.entry.0].insts.len(), CHAIN_LEN);
+        for (inst_idx, value) in values.into_iter().enumerate() {
+            assert_eq!(
+                func.values[value.0].kind,
+                ValueKind::Inst(func.entry, inst_idx)
+            );
+        }
+    }
 }
