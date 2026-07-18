@@ -24,16 +24,17 @@
   9. `LicmPass`
   10. `InvariantLoadForwardPass`
   11. `DcePass`
-  12. `RepeatReductionPass`
-  13. `SimpleLoopUnrollPass`（按目标收益门控）
-  14. `InstCombinePass`
-  15. `ConstFoldPass`
-  16. `LoopIdiomPass`
-  17. `ConstFoldPass`
-  18. `SimplifyCfgPass`
-  19. `DcePass`
+  12. `PiecewiseExprPass`
+  13. `RepeatReductionPass`
+  14. `SimpleLoopUnrollPass`（按目标收益门控）
+  15. `InstCombinePass`
+  16. `ConstFoldPass`
+  17. `LoopIdiomPass`
+  18. `ConstFoldPass`
+  19. `SimplifyCfgPass`
+  20. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `LoopIdiomPass`、`InstCombinePass`、常量折叠、CSE、LICM 等主动优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾先由 InstCombine 和 ConstFold 把局部整数算术规范化，再让 LoopIdiom 识别循环区域，最后由 ConstFold、SimplifyCfg 和 DCE 清理新暴露的常量、控制流及死指令。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `PiecewiseExprPass`、`LoopIdiomPass`、`InstCombinePass`、常量折叠、CSE、LICM 等主动优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾先由 InstCombine 和 ConstFold 把局部整数算术规范化，再让 LoopIdiom 识别循环区域，最后由 ConstFold、SimplifyCfg 和 DCE 清理新暴露的常量、控制流及死指令。
 
 ## Pass 列表
 
@@ -146,7 +147,13 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 
 证明边界是保守的：必须有唯一专用 preheader、唯一 latch、唯一 exiting edge 和唯一 exit，不能有返回、内存访问、调用等 side exit/副作用；fast operands 必须在 preheader 可用；除 accumulator 外不能有 loop-defined live-out。exit 的已有 phi 只有在 fast edge 能复用其原 incoming 时才会补边，否则拒绝。变换后 preheader 不再是原循环的专用 preheader，因此重复运行幂等。
 
-旧 `PiecewiseExprPass` 已连同模块和专属测试移除，不再做 selector 决策树匹配。局部常量二次幂乘除保持普通 IR，由现有后端的局部指令选择处理。
+当循环结果所在的 exit 块只包含 Nop 并直接返回 accumulator 时，fast block 会直接返回综合结果，避免为未改写的 fallback 循环增加合并 phi 和寄存器压力；其它区域仍使用 exit phi 合并 live-out。
+
+### `PiecewiseExprPass` (`piecewise_expr.rs`)
+
+解释无环纯函数中的 selector 等值决策树。当连续的 selector 范围分别返回 `x * 2^selector` 或 `x / 2^selector`，范围外返回 `x` 时，将整条决策树版本化为范围检查和动态移位快速路径。比较顺序、`if` 组织方式、参数顺序及范围端点均不固定。
+
+左移在通过 `0..31` 范围检查后可直接使用；有符号除法只在 `x >= 0` 时使用算术右移，负数和范围外输入继续执行原函数，保持向零截断语义。非连续映射、混合乘除、额外副作用或未知分支都会让 pass 保守退出。
 
 ### `RepeatReductionPass` (`repeat_reduction.rs`)
 

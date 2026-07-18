@@ -134,7 +134,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         }
     }
 
-    fn emit_phi_copies(&mut self, pred_idx: usize, target_idx: usize) {
+    pub(super) fn emit_phi_copies(&mut self, pred_idx: usize, target_idx: usize) {
         let copies = self
             .func
             .block(BlockId(target_idx))

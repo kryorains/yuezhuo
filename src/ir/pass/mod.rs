@@ -10,6 +10,7 @@ mod invariant_load;
 mod licm;
 mod local_forward;
 mod loop_analysis;
+mod piecewise_expr;
 mod repeat_reduction;
 mod scalar_promote;
 mod simple_loop_unroll;
@@ -28,6 +29,7 @@ use inst_combine::InstCombinePass;
 use invariant_load::InvariantLoadForwardPass;
 use licm::LicmPass;
 use local_forward::LocalForwardPass;
+use piecewise_expr::PiecewiseExprPass;
 use repeat_reduction::RepeatReductionPass;
 use scalar_promote::ScalarPromotePass;
 use simple_loop_unroll::SimpleLoopUnrollPass;
@@ -69,6 +71,7 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(LicmPass::new());
             pipeline.add(InvariantLoadForwardPass::new());
             pipeline.add(DcePass::new());
+            pipeline.add(PiecewiseExprPass::new());
             pipeline.add(RepeatReductionPass::new());
             if options.enable_simple_loop_unroll {
                 pipeline.add(SimpleLoopUnrollPass::new());
