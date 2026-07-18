@@ -1,7 +1,8 @@
 use super::regalloc::Riscv64RegAlloc;
 use super::{Riscv64IrEmitter, Riscv64IrFuncEmitter};
 use crate::codegen::common::{
-    emit_ir_data_section, entry_early_return, ir_align_to, IrFuncLayout, IrModuleCtx,
+    emit_ir_data_section, entry_early_return, ir_align_to, loop_rotated_block_order, IrFuncLayout,
+    IrModuleCtx,
 };
 use crate::ir::{Function, Module};
 
@@ -58,19 +59,27 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 .push_str(&format!("  j {}\n", self.block_label(plan.slow_block.0)));
         }
         let setup_end = self.body.len();
-        for (block_idx, block) in self.func.blocks.iter().enumerate() {
-            if early_return.as_ref().is_some_and(|(plan, _)| {
-                block_idx == self.func.entry.0 || block_idx == plan.fast_block.0
-            }) {
-                continue;
-            }
+        let block_order = loop_rotated_block_order(self.func)
+            .into_iter()
+            .filter(|block_idx| {
+                !early_return.as_ref().is_some_and(|(plan, _)| {
+                    *block_idx == self.func.entry.0 || *block_idx == plan.fast_block.0
+                })
+            })
+            .collect::<Vec<_>>();
+        for (order_idx, block_idx) in block_order.iter().copied().enumerate() {
+            let block = &self.func.blocks[block_idx];
             self.body
                 .push_str(&format!("{}:\n", self.block_label(block_idx)));
             for inst in &block.insts {
                 self.emit_inst(inst);
             }
             if let Some(terminator) = &block.terminator {
-                self.emit_terminator(block_idx, terminator);
+                self.emit_terminator(
+                    block_idx,
+                    terminator,
+                    block_order.get(order_idx + 1).copied(),
+                );
             }
         }
         let setup = self.body[..setup_end].to_string();

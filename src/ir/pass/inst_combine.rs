@@ -1,6 +1,6 @@
 use super::util::{const_i32, defining_inst, get_or_add_i32_const};
 use super::ModulePass;
-use crate::ir::{BinaryOp, CmpOp, Function, InstKind, Module, ValueId};
+use crate::ir::{BinaryOp, CmpOp, Function, InstKind, Module, Terminator, ValueId};
 
 /// Canonicalizes and combines local integer instructions.
 ///
@@ -24,6 +24,8 @@ impl ModulePass for InstCombinePass {
 }
 
 fn combine_function(func: &mut Function) {
+    combine_divisibility_remainders(func);
+
     // Reassociation can expose another constant-bearing definition, so keep
     // scanning until every local expression reaches its canonical form.
     loop {
@@ -48,6 +50,105 @@ fn combine_function(func: &mut Function) {
             "instruction combining produced invalid IR in {}: {:?}",
             func.name, errors
         );
+    }
+}
+
+/// Rewrites a signed remainder to a mask only when every observation asks
+/// whether that remainder is zero. For a power-of-two divisor this preserves
+/// divisibility for positive and negative dividends without changing the
+/// remainder value in contexts where its sign would matter.
+fn combine_divisibility_remainders(func: &mut Function) {
+    let mut candidates = Vec::new();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.insts.iter().enumerate() {
+            let (
+                Some(result),
+                InstKind::Binary {
+                    op: BinaryOp::Imod,
+                    lhs,
+                    rhs,
+                },
+            ) = (inst.result, &inst.kind)
+            else {
+                continue;
+            };
+            let Some(divisor) = const_i32(func, *rhs) else {
+                continue;
+            };
+            if divisor == 0 {
+                continue;
+            }
+            let magnitude = divisor.wrapping_abs() as u32;
+            if magnitude.is_power_of_two() && remainder_has_only_zero_tests(func, result) {
+                candidates.push((block_idx, inst_idx, *lhs, magnitude.wrapping_sub(1) as i32));
+            }
+        }
+    }
+
+    for (block_idx, inst_idx, dividend, mask) in candidates {
+        let mask = get_or_add_i32_const(func, mask);
+        func.blocks[block_idx].insts[inst_idx].kind = InstKind::Binary {
+            op: BinaryOp::Iand,
+            lhs: dividend,
+            rhs: mask,
+        };
+    }
+}
+
+fn remainder_has_only_zero_tests(func: &Function, remainder: ValueId) -> bool {
+    let mut found_use = false;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if !inst_operands(&inst.kind).contains(&remainder) {
+                continue;
+            }
+            found_use = true;
+            let InstKind::Icmp { op, lhs, rhs } = &inst.kind else {
+                return false;
+            };
+            if !matches!(*op, CmpOp::Eq | CmpOp::Ne)
+                || !((*lhs == remainder && const_i32(func, *rhs) == Some(0))
+                    || (*rhs == remainder && const_i32(func, *lhs) == Some(0)))
+            {
+                return false;
+            }
+        }
+        if block
+            .terminator
+            .as_ref()
+            .is_some_and(|terminator| terminator_operands(terminator).contains(&remainder))
+        {
+            return false;
+        }
+    }
+    found_use
+}
+
+fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
+    match kind {
+        InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::Store { ptr, value } => vec![*ptr, *value],
+        InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
+        InstKind::Binary { lhs, rhs, .. }
+        | InstKind::Icmp { lhs, rhs, .. }
+        | InstKind::Fcmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+        InstKind::Gep { base, indices } => {
+            let mut operands = vec![*base];
+            operands.extend(indices.iter().copied());
+            operands
+        }
+        InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
+        InstKind::Call { args, .. } => args.clone(),
+        InstKind::MemZero { ptr, .. } => vec![*ptr],
+    }
+}
+
+fn terminator_operands(terminator: &Terminator) -> Vec<ValueId> {
+    match terminator {
+        Terminator::Return(Some(value)) => vec![*value],
+        Terminator::Branch { cond, .. } => vec![*cond],
+        Terminator::Return(None) | Terminator::Jump(_) => Vec::new(),
     }
 }
 
@@ -223,5 +324,117 @@ fn reverse_cmp(op: CmpOp) -> CmpOp {
         CmpOp::Le => CmpOp::Ge,
         CmpOp::Gt => CmpOp::Lt,
         CmpOp::Ge => CmpOp::Le,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Const, Type, ValueKind};
+
+    #[test]
+    fn masks_power_of_two_remainders_observed_only_for_divisibility() {
+        let mut func = Function::new("divisibility", Type::I1);
+        let dividend = func.add_param("value", Type::I32);
+        let divisor = func.add_const(Const::Int(-4));
+        let zero = func.add_const(Const::Int(0));
+        let remainder = func
+            .append_inst(
+                func.entry,
+                InstKind::Binary {
+                    op: BinaryOp::Imod,
+                    lhs: dividend,
+                    rhs: divisor,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let test = func
+            .append_inst(
+                func.entry,
+                InstKind::Icmp {
+                    op: CmpOp::Eq,
+                    lhs: remainder,
+                    rhs: zero,
+                },
+                Some(Type::I1),
+            )
+            .unwrap();
+        func.set_terminator(func.entry, Terminator::Return(Some(test)));
+
+        combine_function(&mut func);
+
+        let ValueKind::Inst(block, inst_idx) = func.value(remainder).kind else {
+            panic!("remainder must remain instruction-backed");
+        };
+        assert!(matches!(
+            func.blocks[block.0].insts[inst_idx].kind,
+            InstKind::Binary {
+                op: BinaryOp::Iand,
+                lhs,
+                rhs,
+            } if lhs == dividend && const_i32(&func, rhs) == Some(3)
+        ));
+        assert!(func.verify().is_ok());
+    }
+
+    #[test]
+    fn keeps_remainders_with_value_users_or_non_power_of_two_divisors() {
+        for (divisor, return_remainder) in [(2, true), (3, false)] {
+            let mut func = Function::new("remainder_value", Type::I32);
+            let dividend = func.add_param("value", Type::I32);
+            let divisor = func.add_const(Const::Int(divisor));
+            let zero = func.add_const(Const::Int(0));
+            let remainder = func
+                .append_inst(
+                    func.entry,
+                    InstKind::Binary {
+                        op: BinaryOp::Imod,
+                        lhs: dividend,
+                        rhs: divisor,
+                    },
+                    Some(Type::I32),
+                )
+                .unwrap();
+            if return_remainder {
+                func.set_terminator(func.entry, Terminator::Return(Some(remainder)));
+            } else {
+                let test = func
+                    .append_inst(
+                        func.entry,
+                        InstKind::Icmp {
+                            op: CmpOp::Eq,
+                            lhs: remainder,
+                            rhs: zero,
+                        },
+                        Some(Type::I1),
+                    )
+                    .unwrap();
+                let as_i32 = func
+                    .append_inst(
+                        func.entry,
+                        InstKind::Cast {
+                            op: crate::ir::CastOp::BoolToI32,
+                            value: test,
+                        },
+                        Some(Type::I32),
+                    )
+                    .unwrap();
+                func.set_terminator(func.entry, Terminator::Return(Some(as_i32)));
+            }
+
+            combine_function(&mut func);
+            let ValueKind::Inst(block, inst_idx) = func.value(remainder).kind else {
+                panic!("remainder must remain instruction-backed");
+            };
+            assert!(matches!(
+                func.blocks[block.0].insts[inst_idx].kind,
+                InstKind::Binary {
+                    op: BinaryOp::Imod,
+                    ..
+                }
+            ));
+            assert!(func.verify().is_ok());
+        }
     }
 }

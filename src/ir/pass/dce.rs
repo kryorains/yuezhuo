@@ -1,5 +1,5 @@
 use super::ModulePass;
-use crate::ir::{Function, Inst, InstKind, Module, Terminator, ValueId};
+use crate::ir::{Function, Inst, InstKind, Module, Terminator, ValueId, ValueKind};
 use std::collections::HashSet;
 
 pub(super) struct DcePass;
@@ -19,47 +19,63 @@ impl ModulePass for DcePass {
 }
 
 fn eliminate_dead_code(func: &mut Function) {
-    // 删除一批死指令后，依赖它们的值也可能继续变死，所以循环到没有变化。
-    loop {
-        let used = collect_used_values(func);
-        let mut changed = false;
-
-        for block in &mut func.blocks {
-            for inst in &mut block.insts {
-                let Some(result) = inst.result else {
-                    continue;
-                };
-                if used.contains(&result) || !is_removable(inst) {
-                    continue;
-                }
-
-                // 只移除无副作用指令：清掉结果并保留一个 Nop 占位，避免立刻重排索引。
-                inst.result = None;
-                inst.kind = InstKind::Nop;
-                changed = true;
+    let live = collect_live_values(func);
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            let Some(result) = inst.result else {
+                continue;
+            };
+            if live.contains(&result) || !is_removable(inst) {
+                continue;
             }
-        }
 
-        if !changed {
-            break;
+            // Keep instruction indices stable for ValueKind::Inst references.
+            inst.result = None;
+            inst.kind = InstKind::Nop;
         }
     }
 }
 
-fn collect_used_values(func: &Function) -> HashSet<ValueId> {
-    // 从所有指令操作数和 terminator 操作数里收集“还活着”的 ValueId。
-    let mut used = HashSet::new();
-
+/// Marks values reachable from observable side effects and terminators.
+///
+/// A plain use-count DCE cannot remove a dead SCC such as `phi -> add -> phi`:
+/// every member appears used by another dead member. Walking backwards only
+/// from observable roots removes those cycles while preserving the complete
+/// dependency chain of every live instruction.
+fn collect_live_values(func: &Function) -> HashSet<ValueId> {
+    let mut roots = HashSet::new();
     for block in &func.blocks {
         for inst in &block.insts {
-            collect_inst_operands(inst, &mut used);
+            if !is_removable(inst) {
+                collect_inst_operands(inst, &mut roots);
+            }
         }
         if let Some(terminator) = &block.terminator {
-            collect_terminator_operands(terminator, &mut used);
+            collect_terminator_operands(terminator, &mut roots);
         }
     }
 
-    used
+    let mut live = HashSet::new();
+    let mut worklist = roots.into_iter().collect::<Vec<_>>();
+    while let Some(value) = worklist.pop() {
+        if !live.insert(value) {
+            continue;
+        }
+        let ValueKind::Inst(block, inst_idx) = func.value(value).kind else {
+            continue;
+        };
+        let Some(inst) = func
+            .blocks
+            .get(block.0)
+            .and_then(|block| block.insts.get(inst_idx))
+        else {
+            continue;
+        };
+        let mut operands = HashSet::new();
+        collect_inst_operands(inst, &mut operands);
+        worklist.extend(operands);
+    }
+    live
 }
 
 fn collect_inst_operands(inst: &Inst, used: &mut HashSet<ValueId>) {
@@ -128,4 +144,72 @@ fn is_removable(inst: &Inst) -> bool {
             | InstKind::Cast { .. }
             | InstKind::Gep { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{BinaryOp, Const, Function, Type};
+
+    #[test]
+    fn removes_an_unobservable_phi_cycle() {
+        let mut func = Function::new("dead_cycle", Type::Void);
+        let keep_looping = func.add_param("continue", Type::I1);
+        let header = func.add_block("header");
+        let body = func.add_block("body");
+        let exit = func.add_block("exit");
+        let zero = func.add_const(Const::Int(0));
+        let one = func.add_const(Const::Int(1));
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        let phi = func
+            .append_inst(
+                header,
+                InstKind::Phi {
+                    incomings: vec![(func.entry, zero), (body, zero)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: keep_looping,
+                then_target: body,
+                else_target: exit,
+            },
+        );
+        let next = func
+            .append_inst(
+                body,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: phi,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let ValueKind::Inst(phi_block, phi_idx) = func.value(phi).kind else {
+            unreachable!();
+        };
+        let InstKind::Phi { incomings } = &mut func.blocks[phi_block.0].insts[phi_idx].kind else {
+            unreachable!();
+        };
+        incomings[1].1 = next;
+        func.set_terminator(body, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+
+        assert!(func.verify().is_ok());
+        eliminate_dead_code(&mut func);
+        for value in [phi, next] {
+            let ValueKind::Inst(block, inst_idx) = func.value(value).kind else {
+                unreachable!();
+            };
+            assert!(matches!(
+                func.blocks[block.0].insts[inst_idx].kind,
+                InstKind::Nop
+            ));
+        }
+        assert!(func.verify().is_ok());
+    }
 }

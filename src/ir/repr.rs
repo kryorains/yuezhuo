@@ -58,6 +58,7 @@ pub struct Function {
     pub blocks: Vec<Block>,
     pub entry: BlockId,
     recursive_cfg_inline_decided: bool,
+    reduction_jammed: bool,
 }
 
 impl PartialEq for Function {
@@ -95,6 +96,7 @@ impl Function {
             blocks: Vec::new(),
             entry: BlockId(0),
             recursive_cfg_inline_decided: false,
+            reduction_jammed: false,
         };
         func.entry = func.add_block("entry");
         func
@@ -228,6 +230,14 @@ impl Function {
 
     pub(crate) fn mark_recursive_cfg_inline_decision(&mut self) {
         self.recursive_cfg_inline_decided = true;
+    }
+
+    pub(crate) fn has_reduction_jam(&self) -> bool {
+        self.reduction_jammed
+    }
+
+    pub(crate) fn mark_reduction_jammed(&mut self) {
+        self.reduction_jammed = true;
     }
 }
 

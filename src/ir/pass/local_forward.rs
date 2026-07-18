@@ -27,11 +27,15 @@ fn forward_function(func: &mut Function) {
         for block in &func.blocks {
             // 只在单个基本块内追踪内存状态，跨块交给更强的 SSA/phi 逻辑处理。
             let mut known_memory = HashMap::<ValueId, ValueId>::new();
+            let mut known_loads = HashMap::<ValueId, ValueId>::new();
             for inst in &block.insts {
                 match &inst.kind {
                     InstKind::Nop | InstKind::Alloca { .. } => {}
                     InstKind::Store { ptr, value } => {
-                        // 记录“这个指针当前存着哪个值”；如果指针不可安全追踪，就清空已知内存。
+                        // Any store may alias a previous general load. Scalar
+                        // alloca forwarding remains precise, while redundant
+                        // load forwarding restarts after the clobber.
+                        known_loads.clear();
                         let ptr = resolve(*ptr, &replacements);
                         let value = resolve(*value, &replacements);
                         if tracked_pointer(func, ptr) {
@@ -46,15 +50,22 @@ fn forward_function(func: &mut Function) {
                             continue;
                         };
                         let ptr = resolve(*ptr, &replacements);
-                        if let Some(value) = known_memory.get(&ptr).copied() {
+                        if let Some(value) = known_memory
+                            .get(&ptr)
+                            .or_else(|| known_loads.get(&ptr))
+                            .copied()
+                        {
                             if func.value(value).ty == func.value(result).ty {
                                 replacements.insert(result, value);
                             }
+                        } else {
+                            known_loads.insert(ptr, result);
                         }
                     }
                     InstKind::Call { .. } | InstKind::MemZero { .. } => {
                         // 调用和批量清零都可能改写内存，保守地丢弃本块内已知信息。
                         known_memory.clear();
+                        known_loads.clear();
                     }
                     InstKind::Gep { .. } => {}
                     _ => {}
