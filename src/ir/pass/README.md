@@ -18,21 +18,22 @@
   3. `TailRecursionPass`
   4. `GlobalScalarLocalizePass`
   5. `ScalarPromotePass`
-  6. `InlineSmallExprPass`
-  7. `LocalForwardPass`
-  8. `CsePass`
-  9. `LicmPass`
-  10. `InvariantLoadForwardPass`
-  11. `DcePass`
-  12. `PiecewiseExprPass`
-  13. `RepeatReductionPass`
-  14. `SimpleLoopUnrollPass`（按目标收益门控）
-  15. `InstCombinePass`
-  16. `ConstFoldPass`
-  17. `LoopIdiomPass`
-  18. `ConstFoldPass`
-  19. `SimplifyCfgPass`
-  20. `DcePass`
+  6. `RecursiveInlinePass`
+  7. `InlineSmallExprPass`
+  8. `LocalForwardPass`
+  9. `CsePass`
+  10. `LicmPass`
+  11. `InvariantLoadForwardPass`
+  12. `DcePass`
+  13. `PiecewiseExprPass`
+  14. `RepeatReductionPass`
+  15. `SimpleLoopUnrollPass`（按目标收益门控）
+  16. `InstCombinePass`
+  17. `ConstFoldPass`
+  18. `LoopIdiomPass`
+  19. `ConstFoldPass`
+  20. `SimplifyCfgPass`
+  21. `DcePass`
 
 O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `PiecewiseExprPass`、`LoopIdiomPass`、`InstCombinePass`、常量折叠、CSE、LICM 等主动优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾先由 InstCombine 和 ConstFold 把局部整数算术规范化，再让 LoopIdiom 识别循环区域，最后由 ConstFold、SimplifyCfg 和 DCE 清理新暴露的常量、控制流及死指令。
 
@@ -114,6 +115,14 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
   - 被提升掉的 `alloca`/`load`/`store` 改成 `Nop`。
 
 这个 pass 会跳过过大的函数，避免朴素算法在大 IR 上耗时过高。
+
+### `RecursiveInlinePass` (`recursive_inline.rs`)
+
+对小型自递归函数的非尾调用做一层标准 CFG 内联。IR 的直接调用目标目前用符号表示，pass 仅用符号的精确相等关系解析唯一调用目标，不依赖函数名的具体拼写，也不读取值名、块名、固定块编号或源码信息；每个候选、调用点、调用方及整个模块都有显式的指令/基本块增长上限。
+
+变换在调用处拆出 continuation，克隆 pass 开始时快照中的全部 callee CFG、SSA 值、phi 和 terminator，把形参映射到实参，并让所有克隆 return 跳到 continuation。非 void 返回统一用 phi 合并，因此多个返回路径保持原 edge 语义。原后继 phi 的前驱边会从调用块改到 continuation。每个调用点完成后立即执行 IR verifier；函数级标记保证重复运行不会再增加递归深度。
+
+当前证明边界有意保守：只接受 i1/i32 返回，入口不可达的死 CFG 不参与调用点、指令增长和克隆，但函数总块上限及禁用类型检查仍覆盖整个 IR；拒绝 f32、void/result-less call、active `alloca`、`memzero`、歧义调用目标和签名不一致的自调用。普通整数、指针、load/store/GEP、phi 及有结果的调用会按原控制流与副作用顺序克隆。pass 放在 `ScalarPromotePass` 之后，使已安全提升的标量栈槽不会阻挡候选；只接入 O1。
 
 ### `InlineSmallExprPass` (`inline.rs`)
 

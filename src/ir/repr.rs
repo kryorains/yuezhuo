@@ -49,7 +49,7 @@ pub struct Global {
     pub init: Option<Const>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Function {
     pub name: String,
     pub ret: Type,
@@ -57,6 +57,32 @@ pub struct Function {
     pub values: Vec<Value>,
     pub blocks: Vec<Block>,
     pub entry: BlockId,
+    recursive_cfg_inline_decided: bool,
+}
+
+impl PartialEq for Function {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.ret == other.ret
+            && self.params == other.params
+            && self.values == other.values
+            && self.blocks == other.blocks
+            && self.entry == other.entry
+    }
+}
+
+impl fmt::Debug for Function {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Function")
+            .field("name", &self.name)
+            .field("ret", &self.ret)
+            .field("params", &self.params)
+            .field("values", &self.values)
+            .field("blocks", &self.blocks)
+            .field("entry", &self.entry)
+            .finish()
+    }
 }
 
 impl Function {
@@ -68,6 +94,7 @@ impl Function {
             values: Vec::new(),
             blocks: Vec::new(),
             entry: BlockId(0),
+            recursive_cfg_inline_decided: false,
         };
         func.entry = func.add_block("entry");
         func
@@ -193,6 +220,14 @@ impl Function {
 
     pub fn verify(&self) -> Result<(), Vec<VerifyError>> {
         verify_function(self)
+    }
+
+    pub(crate) fn has_recursive_cfg_inline_decision(&self) -> bool {
+        self.recursive_cfg_inline_decided
+    }
+
+    pub(crate) fn mark_recursive_cfg_inline_decision(&mut self) {
+        self.recursive_cfg_inline_decided = true;
     }
 }
 
