@@ -41,19 +41,24 @@ impl AArch64PhiRegs {
             .enumerate()
             .filter_map(|(idx, value)| {
                 let value_id = ValueId(idx);
+                let is_phi = match value.kind {
+                    ValueKind::Inst(block, inst_idx) => {
+                        let inst = func.blocks.get(block.0)?.insts.get(inst_idx)?;
+                        if inst.result != Some(value_id) || matches!(inst.kind, InstKind::Nop) {
+                            return None;
+                        }
+                        matches!(inst.kind, InstKind::Phi { .. })
+                    }
+                    _ => false,
+                };
                 if !is_register_type(&value.ty)
                     || matches!(value.kind, ValueKind::Const(_) | ValueKind::Global(_))
-                    || scores[idx] < 2
-                    || block_local_values.contains(&value_id)
+                    || scores[idx] == 0
+                    || (scores[idx] < 2 && !is_phi)
+                    || (block_local_values.contains(&value_id) && !is_phi)
                     || direct_branch_conditions.contains(&value_id)
                 {
                     return None;
-                }
-                if let ValueKind::Inst(block, inst_idx) = value.kind {
-                    let inst = func.blocks.get(block.0)?.insts.get(inst_idx)?;
-                    if inst.result != Some(value_id) || matches!(inst.kind, InstKind::Nop) {
-                        return None;
-                    }
                 }
                 Some((value_id, scores[idx]))
             })

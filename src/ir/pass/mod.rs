@@ -1,4 +1,5 @@
 mod const_fold;
+mod const_specialize;
 mod cse;
 mod dce;
 pub(crate) mod dominators;
@@ -23,6 +24,7 @@ mod util;
 
 use super::Module;
 use const_fold::ConstFoldPass;
+use const_specialize::ConstSpecializePass;
 use cse::CsePass;
 use dce::DcePass;
 use gep_induction::GepInductionPass;
@@ -33,7 +35,7 @@ use inst_combine::InstCombinePass;
 use invariant_load::InvariantLoadForwardPass;
 use licm::LicmPass;
 use local_forward::LocalForwardPass;
-use recursive_inline::RecursiveInlinePass;
+use recursive_inline::{CfgInlinePass, RecursiveInlinePass};
 use reduction_jam::ReductionJamPass;
 use repeat_reduction::RepeatReductionPass;
 use scalar_promote::ScalarPromotePass;
@@ -72,8 +74,15 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(TailRecursionPass::new());
             pipeline.add(GlobalScalarLocalizePass::new());
             pipeline.add(ScalarPromotePass::new());
+            pipeline.add(GlobalScalarLocalizePass::new_across_no_memory_calls());
+            pipeline.add(ScalarPromotePass::new());
+            pipeline.add(ConstSpecializePass::new());
+            pipeline.add(ConstFoldPass::new());
+            pipeline.add(SimplifyCfgPass::new());
+            pipeline.add(DcePass::new());
             pipeline.add(RecursiveInlinePass::new());
             pipeline.add(InlineSmallExprPass::new());
+            pipeline.add(CfgInlinePass::new());
             pipeline.add(LocalForwardPass::new());
             pipeline.add(CsePass::new());
             pipeline.add(LicmPass::new());

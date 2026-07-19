@@ -12,6 +12,10 @@ use std::collections::HashMap;
 // also carries a cost because its terminator and phi-edge copies affect codegen.
 const MAX_SOURCE_BLOCKS: usize = 16;
 const MAX_SOURCE_INSTS: usize = 80;
+const MAX_GENERAL_SOURCE_BLOCKS: usize = 32;
+const MAX_GENERAL_SOURCE_INST_SLOTS: usize = 512;
+const MAX_GENERAL_FUNCTION_GROWTH_INSTS: usize = 512;
+const MAX_GENERAL_FUNCTION_GROWTH_BLOCKS: usize = 128;
 const BLOCK_COST: usize = 2;
 const MAX_CALLSITE_COST: usize = 120;
 const MAX_FUNCTION_GROWTH_INSTS: usize = 192;
@@ -20,8 +24,15 @@ const MAX_MODULE_GROWTH_INSTS: usize = 1024;
 const MAX_MODULE_GROWTH_BLOCKS: usize = 256;
 
 pub(super) struct RecursiveInlinePass;
+pub(super) struct CfgInlinePass;
 
 impl RecursiveInlinePass {
+    pub(super) fn new() -> Self {
+        Self
+    }
+}
+
+impl CfgInlinePass {
     pub(super) fn new() -> Self {
         Self
     }
@@ -85,6 +96,204 @@ impl ModulePass for RecursiveInlinePass {
             module.funcs[func_idx].mark_recursive_cfg_inline_decision();
         }
     }
+}
+
+impl ModulePass for CfgInlinePass {
+    fn run(&mut self, module: &mut Module) {
+        let snapshots = module.funcs.clone();
+        let targets = CallGraphTargets::new(&snapshots);
+        let candidates = snapshots
+            .iter()
+            .map(GeneralCallee::analyze)
+            .collect::<Vec<_>>();
+        let mut plans = vec![Vec::new(); snapshots.len()];
+        let mut module_growth = Growth::default();
+
+        for (caller_idx, caller) in snapshots.iter().enumerate() {
+            let reachable = reachable_blocks(caller);
+            let has_unreachable_blocks = reachable.iter().any(|block| !block);
+            let mut growth = Growth::default();
+            let mut sites = Vec::new();
+            for (block_idx, block) in caller.blocks.iter().enumerate() {
+                if !reachable[block_idx] {
+                    continue;
+                }
+                for (inst_idx, inst) in block.insts.iter().enumerate() {
+                    let (Some(result), InstKind::Call { name, args }) = (inst.result, &inst.kind)
+                    else {
+                        continue;
+                    };
+                    let Some(callee_id) = targets.resolve(name) else {
+                        continue;
+                    };
+                    if callee_id.0 == caller_idx {
+                        continue;
+                    }
+                    let Some(candidate) = candidates[callee_id.0].as_ref() else {
+                        continue;
+                    };
+                    let callee = &snapshots[callee_id.0];
+                    if !call_types_match(caller, result, callee, args)
+                        || (block_idx == caller.entry.0 && has_unreachable_blocks)
+                        || !candidate.callsite_fits()
+                    {
+                        continue;
+                    }
+                    growth.add(candidate.growth);
+                    sites.push(GeneralCallSite {
+                        site: CallSite {
+                            block: BlockId(block_idx),
+                            inst_idx,
+                            result,
+                        },
+                        callee: callee_id,
+                    });
+                }
+            }
+            if sites.is_empty()
+                || !Growth::default().fits_with(
+                    growth,
+                    MAX_GENERAL_FUNCTION_GROWTH_INSTS,
+                    MAX_GENERAL_FUNCTION_GROWTH_BLOCKS,
+                )
+            {
+                continue;
+            }
+            module_growth.add(growth);
+            plans[caller_idx] = sites;
+        }
+
+        if !Growth::default().fits_with(
+            module_growth,
+            MAX_MODULE_GROWTH_INSTS,
+            MAX_MODULE_GROWTH_BLOCKS,
+        ) {
+            return;
+        }
+
+        for (caller_idx, sites) in plans.iter_mut().enumerate() {
+            sites.sort_by_key(|site| (site.site.block.0, site.site.inst_idx));
+            for planned in sites.iter().rev() {
+                let source = &snapshots[planned.callee.0];
+                let candidate = candidates[planned.callee.0]
+                    .as_ref()
+                    .expect("planned callee must remain eligible");
+                if !inline_call_site(
+                    &mut module.funcs[caller_idx],
+                    source,
+                    &candidate.reachable,
+                    &planned.site,
+                ) {
+                    continue;
+                }
+                if let Err(errors) = module.funcs[caller_idx].verify() {
+                    panic!(
+                        "CFG inlining produced invalid IR in {}: {:?}",
+                        module.funcs[caller_idx].name, errors
+                    );
+                }
+            }
+        }
+    }
+}
+
+struct GeneralCallee {
+    reachable: Vec<bool>,
+    growth: Growth,
+}
+
+impl GeneralCallee {
+    fn analyze(func: &Function) -> Option<Self> {
+        if !matches!(func.ret, Type::I1 | Type::I32)
+            || func.blocks.is_empty()
+            || func.blocks.len() > MAX_GENERAL_SOURCE_BLOCKS
+            || func.verify().is_err()
+            || func
+                .params
+                .iter()
+                .any(|param| !matches!(func.value(*param).ty, Type::I1 | Type::I32))
+        {
+            return None;
+        }
+        let reachable = reachable_blocks(func);
+        let reachable_block_count = reachable.iter().filter(|block| **block).count();
+        let reachable_insts = func
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(block_idx, _)| reachable[*block_idx])
+            .flat_map(|(_, block)| &block.insts)
+            .collect::<Vec<_>>();
+        let active_insts = reachable_insts
+            .iter()
+            .filter(|inst| !matches!(inst.kind, InstKind::Nop))
+            .count();
+        let has_return = func.blocks.iter().enumerate().any(|(block_idx, block)| {
+            reachable[block_idx] && matches!(block.terminator, Some(Terminator::Return(Some(_))))
+        });
+        if !has_return
+            || active_insts > MAX_SOURCE_INSTS
+            || reachable_insts.len() > MAX_GENERAL_SOURCE_INST_SLOTS
+            || !func.blocks.iter().enumerate().all(|(block_idx, block)| {
+                !reachable[block_idx]
+                    || (block.insts.iter().all(is_pure_scalar_inline_inst)
+                        && !matches!(block.terminator, Some(Terminator::Return(None))))
+            })
+        {
+            return None;
+        }
+        let growth = Growth {
+            insts: active_insts.checked_add(1)?,
+            blocks: reachable_block_count.checked_add(1)?,
+        };
+        Some(Self { reachable, growth })
+    }
+
+    fn callsite_fits(&self) -> bool {
+        self.growth
+            .blocks
+            .checked_mul(BLOCK_COST)
+            .and_then(|block_cost| self.growth.insts.checked_add(block_cost))
+            .is_some_and(|cost| cost <= MAX_CALLSITE_COST)
+    }
+}
+
+fn is_pure_scalar_inline_inst(inst: &Inst) -> bool {
+    matches!(
+        inst.kind,
+        InstKind::Nop
+            | InstKind::Phi { .. }
+            | InstKind::Unary {
+                op: UnaryOp::Ineg | UnaryOp::Not,
+                ..
+            }
+            | InstKind::Binary {
+                op: BinaryOp::Iadd
+                    | BinaryOp::Isub
+                    | BinaryOp::Imul
+                    | BinaryOp::Idiv
+                    | BinaryOp::Imod
+                    | BinaryOp::Iand
+                    | BinaryOp::Ior
+                    | BinaryOp::Ixor
+                    | BinaryOp::Ishl
+                    | BinaryOp::Iashr
+                    | BinaryOp::And
+                    | BinaryOp::Or,
+                ..
+            }
+            | InstKind::Icmp { .. }
+            | InstKind::Cast {
+                op: CastOp::BoolToI32 | CastOp::I32ToBool,
+                ..
+            }
+    )
+}
+
+#[derive(Debug, Clone)]
+struct GeneralCallSite {
+    site: CallSite,
+    callee: FunctionId,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -193,7 +402,7 @@ impl Candidate {
                     continue;
                 }
                 let result = inst.result?;
-                if !self_call_types_match(func, result, args) {
+                if !call_types_match(func, result, func, args) {
                     return None;
                 }
                 if !is_tail_position(func, BlockId(block_idx), inst_idx, result) {
@@ -294,16 +503,22 @@ fn instructions_are_cloneable(func: &Function, reachable: &[bool]) -> bool {
     })
 }
 
-fn self_call_types_match(func: &Function, result: ValueId, args: &[ValueId]) -> bool {
-    args.len() == func.params.len()
-        && func
+fn call_types_match(
+    caller: &Function,
+    result: ValueId,
+    callee: &Function,
+    args: &[ValueId],
+) -> bool {
+    args.len() == callee.params.len()
+        && caller
             .values
             .get(result.0)
-            .is_some_and(|value| value.ty == func.ret)
-        && args.iter().zip(&func.params).all(|(arg, param)| {
-            func.values
+            .is_some_and(|value| value.ty == callee.ret)
+        && args.iter().zip(&callee.params).all(|(arg, param)| {
+            caller
+                .values
                 .get(arg.0)
-                .zip(func.values.get(param.0))
+                .zip(callee.values.get(param.0))
                 .is_some_and(|(arg, param)| arg.ty == param.ty)
         })
 }
@@ -335,7 +550,7 @@ fn inline_call_site(
     else {
         return false;
     };
-    if result != site.result || !self_call_types_match(func, result, &args) {
+    if result != site.result || !call_types_match(func, result, source, &args) {
         return false;
     }
 
@@ -350,6 +565,16 @@ fn inline_call_site(
         .copied()
         .zip(args)
         .collect::<HashMap<_, _>>();
+    for (value_idx, value) in source.values.iter().enumerate() {
+        let mapped = match &value.kind {
+            ValueKind::Const(constant) => Some(get_or_add_const(func, constant)),
+            ValueKind::Global(name) => Some(get_or_add_global(func, name, &value.ty)),
+            _ => None,
+        };
+        if let Some(mapped) = mapped {
+            values.insert(ValueId(value_idx), mapped);
+        }
+    }
     let mut cloned_insts = Vec::new();
 
     // Allocate all result IDs before cloning operands so loop-carried phi
@@ -551,15 +776,31 @@ fn clone_inst_kind(
     }
 }
 
-fn map_value(source: &Function, value: ValueId, values: &HashMap<ValueId, ValueId>) -> ValueId {
+fn get_or_add_global(func: &mut Function, name: &str, ty: &Type) -> ValueId {
+    func.values
+        .iter()
+        .position(|value| {
+            value.ty == *ty
+                && matches!(&value.kind, ValueKind::Global(existing) if existing == name)
+        })
+        .map(ValueId)
+        .unwrap_or_else(|| func.add_global_ref(name, ty.clone()))
+}
+
+fn get_or_add_const(func: &mut Function, constant: &crate::ir::Const) -> ValueId {
+    func.values
+        .iter()
+        .position(|value| {
+            value.ty == constant.ty()
+                && matches!(&value.kind, ValueKind::Const(existing) if existing == constant)
+        })
+        .map(ValueId)
+        .unwrap_or_else(|| func.add_const(constant.clone()))
+}
+
+fn map_value(_source: &Function, value: ValueId, values: &HashMap<ValueId, ValueId>) -> ValueId {
     if let Some(mapped) = values.get(&value) {
         return *mapped;
-    }
-    if matches!(
-        source.values.get(value.0).map(|value| &value.kind),
-        Some(ValueKind::Const(_) | ValueKind::Global(_))
-    ) {
-        return value;
     }
     panic!("verified clone operand must have a value mapping");
 }
