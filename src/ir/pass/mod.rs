@@ -1,9 +1,10 @@
-mod bit_idiom;
 mod const_fold;
 mod cse;
 mod dce;
 pub(crate) mod dominators;
+mod function_effects;
 mod gep_induction;
+mod global_const_prop;
 mod global_scalar_localize;
 mod inline;
 mod inst_combine;
@@ -11,7 +12,6 @@ mod invariant_load;
 mod licm;
 mod local_forward;
 mod loop_analysis;
-mod piecewise_expr;
 mod recursive_inline;
 mod reduction_jam;
 mod repeat_reduction;
@@ -22,18 +22,17 @@ mod tail_recursion;
 mod util;
 
 use super::Module;
-use bit_idiom::LoopIdiomPass;
 use const_fold::ConstFoldPass;
 use cse::CsePass;
 use dce::DcePass;
 use gep_induction::GepInductionPass;
+use global_const_prop::GlobalConstPropPass;
 use global_scalar_localize::GlobalScalarLocalizePass;
 use inline::InlineSmallExprPass;
 use inst_combine::InstCombinePass;
 use invariant_load::InvariantLoadForwardPass;
 use licm::LicmPass;
 use local_forward::LocalForwardPass;
-use piecewise_expr::PiecewiseExprPass;
 use recursive_inline::RecursiveInlinePass;
 use reduction_jam::ReductionJamPass;
 use repeat_reduction::RepeatReductionPass;
@@ -65,8 +64,10 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(DcePass::new());
         }
         OptLevel::O1 => {
-            // 先折叠常量和死分支，再做标量提升/局部转发，最后再清一次新产生的机会。
+            // 先传播只读全局常量、折叠常量和清理死代码，再做标量提升/局部转发。
+            pipeline.add(GlobalConstPropPass::new());
             pipeline.add(ConstFoldPass::new());
+            pipeline.add(DcePass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(TailRecursionPass::new());
             pipeline.add(GlobalScalarLocalizePass::new());
@@ -83,14 +84,11 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(LocalForwardPass::new());
             pipeline.add(InvariantLoadForwardPass::new());
             pipeline.add(DcePass::new());
-            pipeline.add(PiecewiseExprPass::new());
             pipeline.add(RepeatReductionPass::new());
             if options.enable_simple_loop_unroll {
                 pipeline.add(SimpleLoopUnrollPass::new());
             }
             pipeline.add(InstCombinePass::new());
-            pipeline.add(ConstFoldPass::new());
-            pipeline.add(LoopIdiomPass::new());
             pipeline.add(ConstFoldPass::new());
             // Run address strength reduction after transforms whose matching
             // intentionally expects the source loop-phi set. In particular,

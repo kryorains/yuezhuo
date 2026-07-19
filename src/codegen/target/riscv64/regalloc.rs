@@ -6,15 +6,20 @@ const INT_REGS: [&str; 11] = [
     "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
 ];
 const LEAF_CROSS_REGS: [&str; 6] = ["a2", "a3", "a4", "a5", "a6", "a7"];
+const MAX_INTERFERENCE_BLOCKS: usize = 1024;
+const MAX_INTERFERENCE_VALUES: usize = 8192;
+const MAX_INTERFERENCE_CANDIDATES: usize = 512;
+const MAX_LIVENESS_CELLS: usize = 262_144;
+const MAX_LIVENESS_ITERATIONS: usize = 128;
 
 /// RISC-V64 的简化整数寄存器分配。
 ///
 /// 这里先不引入机器 IR，而是直接给 IR value 分配 callee-saved `s` 寄存器：
 /// - `s1..s11` 跨 call 保持，所以 non-leaf function 也能安全使用；
 /// - 只分配 i1/i32/ptr，不碰 f32；
-/// - 普通 phi 函数保持热点 phi 独占策略；reduction-jam 函数用 CFG liveness、phi-edge interference 与 copy affinity 安全复用寄存器；
-/// - 叶函数还可把 `a2..a7` 用作无需保存的跨块寄存器；
-/// - 无 phi 时用线性位置估算 live interval，不重叠的区间可以复用寄存器；
+/// - 在固定编译预算内用 CFG liveness、phi-edge interference 与 copy affinity 安全复用寄存器；
+/// - 超出预算时只让热点 phi 与少量唯一跨块值独占寄存器，不执行不精确的区间复用；
+/// - 叶函数的非参数值还可把 `a2..a7` 用作无需保存的跨块寄存器；
 /// - 没有寄存器时回退到原来的栈槽路径。
 pub(super) struct Riscv64RegAlloc {
     regs: HashMap<ValueId, &'static str>,
@@ -23,86 +28,66 @@ pub(super) struct Riscv64RegAlloc {
 
 impl Riscv64RegAlloc {
     pub(super) fn new(func: &Function) -> Self {
-        if !func.has_reduction_jam() {
+        if func.blocks.len() > MAX_INTERFERENCE_BLOCKS
+            || func.values.len() > MAX_INTERFERENCE_VALUES
+        {
             return Self::new_conservative(func);
         }
-        if has_phi(func) {
-            let leaf = is_leaf(func);
-            let mut available = Vec::new();
-            if leaf {
-                available.extend(LEAF_CROSS_REGS);
-            }
-            available.extend(INT_REGS);
 
-            let scores = weighted_use_scores(func);
-            let mut candidate_set = cross_block_candidates(func);
-            candidate_set.extend(call_crossing_candidates(func, &HashMap::new()));
-            let interference = interference_graph(func, &candidate_set);
-            let affinities = phi_affinities(func, &candidate_set, &interference);
-            let mut candidates = candidate_set
-                .into_iter()
-                .filter(|value| {
-                    matches!(func.value(*value).ty, Type::I1 | Type::I32 | Type::Ptr(_))
-                })
-                .map(|value| (value, scores[value.0]))
-                .collect::<Vec<_>>();
-            candidates.sort_by_key(|(value, score)| (std::cmp::Reverse(*score), value.0));
-
-            let mut regs = HashMap::new();
-            for (value, _) in candidates {
-                let unavailable = interference[value.0]
-                    .iter()
-                    .filter_map(|neighbor| regs.get(neighbor).copied())
-                    .collect::<HashSet<_>>();
-                let preferred = affinities[value.0]
-                    .iter()
-                    .find_map(|neighbor| regs.get(neighbor).copied())
-                    .filter(|reg| !unavailable.contains(reg));
-                if let Some(reg) = preferred.or_else(|| {
-                    available
-                        .iter()
-                        .copied()
-                        .find(|reg| !unavailable.contains(reg))
-                }) {
-                    regs.insert(value, reg);
-                }
-            }
-            let occupied = regs.values().copied().collect::<HashSet<_>>();
-            let used_regs = INT_REGS
-                .iter()
-                .copied()
-                .filter(|reg| occupied.contains(reg))
-                .collect();
-            return Self { regs, used_regs };
+        let mut candidate_set = cross_block_candidates(func);
+        candidate_set.extend(call_crossing_candidates(func, &HashMap::new()));
+        candidate_set
+            .retain(|value| matches!(func.value(*value).ty, Type::I1 | Type::I32 | Type::Ptr(_)));
+        if candidate_set.len() > MAX_INTERFERENCE_CANDIDATES
+            || func.blocks.len().saturating_mul(candidate_set.len()) > MAX_LIVENESS_CELLS
+        {
+            return Self::new_conservative(func);
         }
 
-        let intervals = collect_intervals(func);
-        let mut active = Vec::<ActiveInterval>::new();
-        let mut free_regs = INT_REGS.to_vec();
-        let mut regs = HashMap::new();
+        let leaf = is_leaf(func);
+        let mut available = Vec::new();
+        if leaf {
+            available.extend(LEAF_CROSS_REGS);
+        }
+        available.extend(INT_REGS);
 
-        for interval in intervals {
-            expire_old_intervals(interval.start, &mut active, &mut free_regs);
-            let Some(reg) = free_regs.pop() else {
-                continue;
-            };
-            regs.insert(interval.value, reg);
-            active.push(ActiveInterval {
-                end: interval.end,
-                reg,
+        let scores = weighted_use_scores(func);
+        let Some(interference) = interference_graph(func, &candidate_set) else {
+            return Self::new_conservative(func);
+        };
+        let affinities = phi_affinities(func, &candidate_set, &interference);
+        let mut candidates = candidate_set
+            .into_iter()
+            .map(|value| (value, scores[value.0]))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(value, score)| (std::cmp::Reverse(*score), value.0));
+
+        let mut regs = HashMap::<ValueId, &'static str>::new();
+        for (value, _) in candidates {
+            let unavailable = interference[value.0]
+                .iter()
+                .filter_map(|neighbor| regs.get(neighbor).copied())
+                .collect::<HashSet<_>>();
+            let preferred = affinities[value.0].iter().find_map(|neighbor| {
+                regs.get(neighbor)
+                    .copied()
+                    .filter(|reg| !unavailable.contains(reg) && register_allowed(func, value, reg))
             });
-            active.sort_by_key(|interval| interval.end);
+            if let Some(reg) = preferred.or_else(|| {
+                available
+                    .iter()
+                    .copied()
+                    .find(|reg| !unavailable.contains(reg) && register_allowed(func, value, reg))
+            }) {
+                regs.insert(value, reg);
+            }
         }
-
-        let mut used_regs = regs.values().copied().collect::<Vec<_>>();
-        used_regs.sort_by_key(|reg| {
-            INT_REGS
-                .iter()
-                .position(|candidate| candidate == reg)
-                .unwrap()
-        });
-        used_regs.dedup();
-
+        let occupied = regs.values().copied().collect::<HashSet<_>>();
+        let used_regs = INT_REGS
+            .iter()
+            .copied()
+            .filter(|reg| occupied.contains(reg))
+            .collect();
         Self { regs, used_regs }
     }
 
@@ -114,7 +99,7 @@ impl Riscv64RegAlloc {
                 available.extend(LEAF_CROSS_REGS);
             }
             available.extend(INT_REGS);
-            let scores = weighted_use_scores(func);
+            let scores = ir_value_use_counts(func);
             let mut phi_candidates = func
                 .blocks
                 .iter()
@@ -133,8 +118,6 @@ impl Riscv64RegAlloc {
             for ((phi, _), reg) in phi_candidates.into_iter().zip(available.iter().copied()) {
                 regs.insert(phi, reg);
             }
-            let use_counts = ir_value_use_counts(func);
-            coalesce_phi_incomings(func, &mut regs, &use_counts);
             let occupied = regs.values().copied().collect::<HashSet<_>>();
             let cross_regs = available
                 .into_iter()
@@ -159,31 +142,10 @@ impl Riscv64RegAlloc {
             return Self { regs, used_regs };
         }
 
-        let intervals = collect_intervals(func);
-        let mut active = Vec::<ActiveInterval>::new();
-        let mut free_regs = INT_REGS.to_vec();
-        let mut regs = HashMap::new();
-        for interval in intervals {
-            expire_old_intervals(interval.start, &mut active, &mut free_regs);
-            let Some(reg) = free_regs.pop() else {
-                continue;
-            };
-            regs.insert(interval.value, reg);
-            active.push(ActiveInterval {
-                end: interval.end,
-                reg,
-            });
-            active.sort_by_key(|interval| interval.end);
+        Self {
+            regs: HashMap::new(),
+            used_regs: Vec::new(),
         }
-        let mut used_regs = regs.values().copied().collect::<Vec<_>>();
-        used_regs.sort_by_key(|reg| {
-            INT_REGS
-                .iter()
-                .position(|candidate| candidate == reg)
-                .unwrap()
-        });
-        used_regs.dedup();
-        Self { regs, used_regs }
     }
 
     pub(super) fn reg(&self, value: ValueId) -> Option<&'static str> {
@@ -199,18 +161,8 @@ impl Riscv64RegAlloc {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LiveInterval {
-    value: ValueId,
-    start: usize,
-    end: usize,
-    use_count: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ActiveInterval {
-    end: usize,
-    reg: &'static str,
+fn register_allowed(func: &Function, value: ValueId, reg: &'static str) -> bool {
+    !matches!(func.value(value).kind, ValueKind::Param) || !LEAF_CROSS_REGS.contains(&reg)
 }
 
 fn is_leaf(func: &Function) -> bool {
@@ -229,128 +181,6 @@ fn has_phi(func: &Function) -> bool {
             .iter()
             .any(|inst| matches!(inst.kind, InstKind::Phi { .. }))
     })
-}
-
-fn collect_intervals(func: &Function) -> Vec<LiveInterval> {
-    let block_stride = func
-        .blocks
-        .iter()
-        .map(|block| block.insts.len())
-        .max()
-        .unwrap_or(0)
-        .saturating_add(2)
-        .saturating_mul(2);
-    let mut starts = vec![0usize; func.values.len()];
-    let mut ends = vec![0usize; func.values.len()];
-    let mut use_counts = vec![0usize; func.values.len()];
-
-    for (idx, value) in func.values.iter().enumerate() {
-        starts[idx] = value_def_pos(value, block_stride);
-        ends[idx] = starts[idx];
-    }
-
-    for block_idx in 0..func.blocks.len() {
-        for inst_idx in 0..func.blocks[block_idx].insts.len() {
-            let inst = &func.blocks[block_idx].insts[inst_idx];
-            if let InstKind::Phi { incomings } = &inst.kind {
-                // Phi 的每个 incoming 实际发生在对应前驱边上，不能按 header 位置计，
-                // 否则循环回边上的定义会被误判成很短的 live range。
-                for (pred, value) in incomings {
-                    use_counts[value.0] += 1;
-                    ends[value.0] = ends[value.0].max(term_pos(pred.0, block_stride));
-                }
-                continue;
-            }
-
-            let pos = inst_pos(block_idx, inst_idx, block_stride);
-            for value in inst_uses(&inst.kind) {
-                use_counts[value.0] += 1;
-                ends[value.0] = ends[value.0].max(pos);
-            }
-        }
-        if let Some(terminator) = &func.blocks[block_idx].terminator {
-            let pos = term_pos(block_idx, block_stride);
-            for value in terminator_uses(terminator) {
-                use_counts[value.0] += 1;
-                ends[value.0] = ends[value.0].max(pos);
-            }
-        }
-    }
-
-    let mut intervals = func
-        .values
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, value)| {
-            let value_id = ValueId(idx);
-            let use_count = use_counts[idx];
-            (use_count >= 2 && is_int_reg_candidate(func, value, value_id)).then_some(
-                LiveInterval {
-                    value: value_id,
-                    start: starts[idx],
-                    end: ends[idx],
-                    use_count,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-
-    // 同一起点时先分配更热、生命周期更短的值，提高循环变量/累加器拿到寄存器的概率。
-    intervals.sort_by_key(|interval| {
-        (
-            interval.start,
-            std::cmp::Reverse(interval.use_count),
-            interval.end - interval.start,
-            interval.value.0,
-        )
-    });
-    intervals
-}
-
-fn expire_old_intervals(
-    current_start: usize,
-    active: &mut Vec<ActiveInterval>,
-    free_regs: &mut Vec<&'static str>,
-) {
-    let mut idx = 0;
-    while idx < active.len() {
-        if active[idx].end < current_start {
-            free_regs.push(active[idx].reg);
-            active.remove(idx);
-        } else {
-            idx += 1;
-        }
-    }
-}
-
-fn is_int_reg_candidate(func: &Function, value_info: &crate::ir::Value, value: ValueId) -> bool {
-    if matches!(value_info.kind, ValueKind::Const(_) | ValueKind::Global(_)) {
-        return false;
-    }
-    if matches!(value_info.ty, Type::F32 | Type::Void | Type::Array { .. }) {
-        return false;
-    }
-    if let ValueKind::Inst(block, inst_idx) = value_info.kind {
-        !matches!(func.block(block).insts[inst_idx].kind, InstKind::Nop)
-    } else {
-        let _ = value;
-        true
-    }
-}
-
-fn value_def_pos(value: &crate::ir::Value, block_stride: usize) -> usize {
-    match value.kind {
-        ValueKind::Param | ValueKind::Const(_) | ValueKind::Global(_) => 0,
-        ValueKind::Inst(block, inst_idx) => inst_pos(block.0, inst_idx, block_stride),
-    }
-}
-
-fn inst_pos(block_idx: usize, inst_idx: usize, block_stride: usize) -> usize {
-    block_idx * block_stride + inst_idx * 2 + 1
-}
-
-fn term_pos(block_idx: usize, block_stride: usize) -> usize {
-    (block_idx + 1) * block_stride - 1
 }
 
 fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
@@ -434,7 +264,10 @@ fn value_owner_block(func: &Function, value: ValueId) -> Option<usize> {
     }
 }
 
-fn interference_graph(func: &Function, candidates: &HashSet<ValueId>) -> Vec<HashSet<ValueId>> {
+fn interference_graph(
+    func: &Function,
+    candidates: &HashSet<ValueId>,
+) -> Option<Vec<HashSet<ValueId>>> {
     let block_count = func.blocks.len();
     let mut defs = vec![HashSet::new(); block_count];
     let mut uses = vec![HashSet::new(); block_count];
@@ -444,11 +277,14 @@ fn interference_graph(func: &Function, candidates: &HashSet<ValueId>) -> Vec<Has
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for inst in &block.insts {
             if let InstKind::Phi { incomings } = &inst.kind {
-                if let Some(result) = inst.result {
+                if let Some(result) = inst.result.filter(|result| candidates.contains(result)) {
                     defs[block_idx].insert(result);
                     phi_defs[block_idx].insert(result);
                 }
-                for (pred, incoming) in incomings {
+                for (pred, incoming) in incomings
+                    .iter()
+                    .filter(|(_, incoming)| candidates.contains(incoming))
+                {
                     edge_phi_uses
                         .entry((pred.0, block_idx))
                         .or_default()
@@ -456,17 +292,23 @@ fn interference_graph(func: &Function, candidates: &HashSet<ValueId>) -> Vec<Has
                 }
                 continue;
             }
-            for operand in inst_uses(&inst.kind) {
+            for operand in inst_uses(&inst.kind)
+                .into_iter()
+                .filter(|operand| candidates.contains(operand))
+            {
                 if !defs[block_idx].contains(&operand) {
                     uses[block_idx].insert(operand);
                 }
             }
-            if let Some(result) = inst.result {
+            if let Some(result) = inst.result.filter(|result| candidates.contains(result)) {
                 defs[block_idx].insert(result);
             }
         }
         if let Some(terminator) = &block.terminator {
-            for operand in terminator_uses(terminator) {
+            for operand in terminator_uses(terminator)
+                .into_iter()
+                .filter(|operand| candidates.contains(operand))
+            {
                 if !defs[block_idx].contains(&operand) {
                     uses[block_idx].insert(operand);
                 }
@@ -494,7 +336,8 @@ fn interference_graph(func: &Function, candidates: &HashSet<ValueId>) -> Vec<Has
         .collect::<Vec<_>>();
     let mut live_in = vec![HashSet::new(); block_count];
     let mut live_out = vec![HashSet::new(); block_count];
-    loop {
+    let mut converged = false;
+    for _ in 0..MAX_LIVENESS_ITERATIONS {
         let mut changed = false;
         for block_idx in (0..block_count).rev() {
             let mut next_out = HashSet::new();
@@ -523,15 +366,23 @@ fn interference_graph(func: &Function, candidates: &HashSet<ValueId>) -> Vec<Has
             }
         }
         if !changed {
+            converged = true;
             break;
         }
+    }
+    if !converged {
+        return None;
     }
 
     let mut graph = vec![HashSet::new(); func.values.len()];
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let mut live = live_out[block_idx].clone();
         if let Some(terminator) = &block.terminator {
-            live.extend(terminator_uses(terminator));
+            live.extend(
+                terminator_uses(terminator)
+                    .into_iter()
+                    .filter(|value| candidates.contains(value)),
+            );
         }
         for inst in block.insts.iter().rev() {
             if let Some(result) = inst.result {
@@ -550,7 +401,11 @@ fn interference_graph(func: &Function, candidates: &HashSet<ValueId>) -> Vec<Has
                 live.remove(&result);
             }
             if !matches!(inst.kind, InstKind::Phi { .. }) {
-                live.extend(inst_uses(&inst.kind));
+                live.extend(
+                    inst_uses(&inst.kind)
+                        .into_iter()
+                        .filter(|value| candidates.contains(value)),
+                );
             }
         }
     }
@@ -566,7 +421,7 @@ fn interference_graph(func: &Function, candidates: &HashSet<ValueId>) -> Vec<Has
             graph[rhs.0].insert(lhs);
         }
     }
-    graph
+    Some(graph)
 }
 
 fn phi_affinities(
@@ -737,116 +592,6 @@ fn cross_block_memory_candidates(
     candidates
         .sort_by_key(|(value, score)| (std::cmp::Reverse(*score), std::cmp::Reverse(value.0)));
     candidates.into_iter().map(|(value, _)| value).collect()
-}
-
-fn coalesce_phi_incomings(
-    func: &Function,
-    regs: &mut HashMap<ValueId, &'static str>,
-    use_counts: &[usize],
-) {
-    let local_last_uses = local_last_uses(func);
-    let edge_phi_uses = edge_phi_uses(func);
-    let phis = func
-        .blocks
-        .iter()
-        .flat_map(|block| &block.insts)
-        .filter_map(|inst| {
-            let InstKind::Phi { incomings } = &inst.kind else {
-                return None;
-            };
-            let result = inst.result?;
-            let reg = regs.get(&result).copied()?;
-            Some((result, reg, incomings.clone()))
-        })
-        .collect::<Vec<_>>();
-
-    for (phi, reg, incomings) in phis {
-        for (pred, incoming) in incomings {
-            if regs.contains_key(&incoming)
-                || use_counts.get(incoming.0) != Some(&1)
-                || func.value(incoming).ty != func.value(phi).ty
-            {
-                continue;
-            }
-            match func.value(incoming).kind {
-                ValueKind::Param => {
-                    // A parameter can share the phi register only on an entry edge. On a
-                    // later edge, the phi register may already have been overwritten before
-                    // the original parameter is consumed (for example by a nested loop).
-                    if pred == func.entry && !LEAF_CROSS_REGS.contains(&reg) {
-                        regs.insert(incoming, reg);
-                    }
-                }
-                ValueKind::Inst(owner, inst_idx) => {
-                    if owner != pred
-                        || !matches!(
-                            func.blocks
-                                .get(owner.0)
-                                .and_then(|block| block.insts.get(inst_idx)),
-                            Some(crate::ir::Inst {
-                                result: Some(result),
-                                ..
-                            }) if *result == incoming
-                        )
-                        || phi_used_after(pred, inst_idx, phi, &local_last_uses, &edge_phi_uses)
-                    {
-                        continue;
-                    }
-                    regs.insert(incoming, reg);
-                }
-                ValueKind::Const(_) | ValueKind::Global(_) => {}
-            }
-        }
-    }
-}
-
-fn local_last_uses(func: &Function) -> HashMap<(usize, usize), usize> {
-    let mut last_uses = HashMap::new();
-    for (block_idx, block) in func.blocks.iter().enumerate() {
-        for (inst_idx, inst) in block.insts.iter().enumerate() {
-            if matches!(inst.kind, InstKind::Phi { .. }) {
-                continue;
-            }
-            for operand in inst_uses(&inst.kind) {
-                last_uses.insert((block_idx, operand.0), inst_idx);
-            }
-        }
-        if let Some(terminator) = &block.terminator {
-            for operand in terminator_uses(terminator) {
-                last_uses.insert((block_idx, operand.0), block.insts.len());
-            }
-        }
-    }
-    last_uses
-}
-
-fn edge_phi_uses(func: &Function) -> HashSet<(usize, usize)> {
-    func.blocks
-        .iter()
-        .flat_map(|block| &block.insts)
-        .filter_map(|inst| match &inst.kind {
-            InstKind::Phi { incomings } => Some(incomings),
-            _ => None,
-        })
-        .flat_map(|incomings| {
-            incomings
-                .iter()
-                .map(|(pred, incoming)| (pred.0, incoming.0))
-        })
-        .collect()
-}
-
-fn phi_used_after(
-    block: crate::ir::BlockId,
-    inst_idx: usize,
-    phi: ValueId,
-    local_last_uses: &HashMap<(usize, usize), usize>,
-    edge_phi_uses: &HashSet<(usize, usize)>,
-) -> bool {
-    local_last_uses
-        .get(&(block.0, phi.0))
-        .is_some_and(|last_use| *last_use > inst_idx)
-        || edge_phi_uses.contains(&(block.0, phi.0))
 }
 
 fn align_to(value: i32, align: i32) -> i32 {

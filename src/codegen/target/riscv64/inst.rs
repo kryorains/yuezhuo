@@ -4,6 +4,55 @@ use crate::ir::{
     ValueKind,
 };
 
+const PHI_CYCLE_SCRATCH: &str = "t2";
+const PHI_MOVE_SCRATCHES: [&str; 4] = ["a0", "t0", "t1", PHI_CYCLE_SCRATCH];
+const MAX_PARALLEL_PHI_COPIES: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhiLocation {
+    Reg(&'static str),
+    StackSlot(i32),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PhiSource {
+    Location(PhiLocation),
+    Rematerialize(ValueId),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PhiCopyWidth {
+    Word,
+    Doubleword,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhiCopy {
+    destination: PhiLocation,
+    source: PhiSource,
+    width: PhiCopyWidth,
+}
+
+enum PhiCopyPlan {
+    Parallel(Vec<PhiCopy>),
+    Snapshot(Vec<(ValueId, ValueId)>),
+}
+
+impl PhiCopyPlan {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Parallel(copies) => copies.is_empty(),
+            Self::Snapshot(copies) => copies.is_empty(),
+        }
+    }
+}
+
+enum NormalizedPhiCopy {
+    Noop,
+    Copy(PhiCopy),
+    Unsupported,
+}
+
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     pub(super) fn emit_inst(&mut self, inst: &Inst) {
         match &inst.kind {
@@ -155,43 +204,189 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn emit_phi_copies(&mut self, pred_idx: usize, target_idx: usize) {
-        let copies = self
-            .func
-            .block(BlockId(target_idx))
-            .insts
-            .iter()
-            .filter_map(|inst| {
-                let incomings = match &inst.kind {
-                    InstKind::Nop => return None,
-                    InstKind::Phi { incomings } => incomings,
-                    _ => return None,
-                };
-                let result = inst.result.unwrap();
-                incomings
-                    .iter()
-                    .find(|(pred, _)| pred.0 == pred_idx)
-                    .map(|(_, value)| (result, *value))
-                    .filter(|(result, value)| {
-                        self.regalloc.reg(*result) != self.regalloc.reg(*value)
-                            || self.regalloc.reg(*result).is_none()
-                    })
-            })
-            .collect::<Vec<_>>();
+        match self.collect_phi_copies(pred_idx, target_idx) {
+            PhiCopyPlan::Parallel(copies) => self.emit_parallel_phi_copies(copies),
+            PhiCopyPlan::Snapshot(copies) => self.emit_snapshot_phi_copies(&copies),
+        }
+    }
 
-        if let [(result, value)] = copies.as_slice() {
-            if let (Some(destination), Some(source)) =
-                (self.assigned_reg(*result), self.assigned_reg(*value))
-            {
-                self.body
-                    .push_str(&format!("  mv {}, {}\n", destination, source));
-            } else {
-                self.load_value(*value);
-                self.store_result(*result);
+    fn edge_has_phi_copy(&self, pred_idx: usize, target_idx: usize) -> bool {
+        !self.collect_phi_copies(pred_idx, target_idx).is_empty()
+    }
+
+    fn collect_phi_copies(&self, pred_idx: usize, target_idx: usize) -> PhiCopyPlan {
+        let mut raw_copies = Vec::new();
+        let mut copies = Vec::new();
+        let mut unsupported = false;
+
+        for inst in &self.func.block(BlockId(target_idx)).insts {
+            let (Some(result), InstKind::Phi { incomings }) = (inst.result, &inst.kind) else {
+                continue;
+            };
+            let Some((_, incoming)) = incomings.iter().find(|(pred, _)| pred.0 == pred_idx) else {
+                continue;
+            };
+            match self.normalize_phi_copy(result, *incoming) {
+                NormalizedPhiCopy::Noop => {}
+                NormalizedPhiCopy::Copy(copy) => {
+                    raw_copies.push((result, *incoming));
+                    copies.push(copy);
+                }
+                NormalizedPhiCopy::Unsupported => {
+                    raw_copies.push((result, *incoming));
+                    unsupported = true;
+                }
             }
-            return;
         }
 
-        for (_, value) in &copies {
+        if unsupported
+            || raw_copies.len() > MAX_PARALLEL_PHI_COPIES
+            || !parallel_phi_invariants_hold(&copies)
+        {
+            PhiCopyPlan::Snapshot(raw_copies)
+        } else {
+            PhiCopyPlan::Parallel(copies)
+        }
+    }
+
+    fn normalize_phi_copy(&self, result: ValueId, incoming: ValueId) -> NormalizedPhiCopy {
+        if result == incoming
+            || matches!(
+                (self.regalloc.reg(result), self.regalloc.reg(incoming)),
+                (Some(destination), Some(source)) if destination == source
+            )
+        {
+            return NormalizedPhiCopy::Noop;
+        }
+
+        let result_ty = &self.func.value(result).ty;
+        if self.func.value(incoming).ty != *result_ty {
+            return NormalizedPhiCopy::Unsupported;
+        }
+        let width = match result_ty {
+            Type::I1 | Type::I32 | Type::F32 => PhiCopyWidth::Word,
+            Type::Ptr(_) => PhiCopyWidth::Doubleword,
+            Type::Void | Type::Array { .. } => return NormalizedPhiCopy::Unsupported,
+        };
+
+        // Local registers are deliberately not physical edge locations. Their
+        // allocator normally rejects phi uses; keep the old snapshot path if
+        // that invariant ever changes.
+        if self.local_regs.reg(result).is_some()
+            || (self.regalloc.reg(incoming).is_none() && self.local_regs.reg(incoming).is_some())
+        {
+            return NormalizedPhiCopy::Unsupported;
+        }
+
+        let destination = self
+            .regalloc
+            .reg(result)
+            .map(PhiLocation::Reg)
+            .unwrap_or_else(|| PhiLocation::StackSlot(self.layout.offset(result)));
+        let source = if let Some(reg) = self.regalloc.reg(incoming) {
+            PhiSource::Location(PhiLocation::Reg(reg))
+        } else if matches!(
+            self.func.value(incoming).kind,
+            ValueKind::Const(_) | ValueKind::Global(_)
+        ) {
+            PhiSource::Rematerialize(incoming)
+        } else {
+            PhiSource::Location(PhiLocation::StackSlot(self.layout.offset(incoming)))
+        };
+
+        if matches!(source, PhiSource::Location(location) if location == destination) {
+            NormalizedPhiCopy::Noop
+        } else {
+            NormalizedPhiCopy::Copy(PhiCopy {
+                destination,
+                source,
+                width,
+            })
+        }
+    }
+
+    fn emit_parallel_phi_copies(&mut self, mut copies: Vec<PhiCopy>) {
+        while !copies.is_empty() {
+            if let Some(ready) = copies.iter().position(|copy| {
+                !copies.iter().any(|remaining| {
+                    matches!(remaining.source, PhiSource::Location(source) if source == copy.destination)
+                })
+            }) {
+                let copy = copies.remove(ready);
+                self.emit_phi_copy(copy);
+                continue;
+            }
+
+            // Every blocked destination is still a source. Preserve one such
+            // old value in the reserved scratch, then schedule the opened cycle.
+            let location = copies[0].destination;
+            let width = copies
+                .iter()
+                .find_map(|copy| match copy.source {
+                    PhiSource::Location(source) if source == location => Some(copy.width),
+                    PhiSource::Location(_) | PhiSource::Rematerialize(_) => None,
+                })
+                .expect("blocked phi destination must be a remaining source");
+            self.save_phi_cycle_location(location, width);
+            for copy in &mut copies {
+                if matches!(copy.source, PhiSource::Location(source) if source == location) {
+                    copy.source = PhiSource::Location(PhiLocation::Reg(PHI_CYCLE_SCRATCH));
+                }
+            }
+        }
+    }
+
+    fn emit_phi_copy(&mut self, copy: PhiCopy) {
+        match copy.source {
+            PhiSource::Rematerialize(value) => {
+                self.load_value_into(value, "a0");
+                self.store_phi_location(copy.destination, "a0", copy.width);
+            }
+            PhiSource::Location(PhiLocation::Reg(source)) => {
+                self.store_phi_location(copy.destination, source, copy.width);
+            }
+            PhiSource::Location(PhiLocation::StackSlot(offset)) => match copy.destination {
+                PhiLocation::Reg(destination) => match copy.width {
+                    PhiCopyWidth::Word => self.load_frame_w(destination, offset),
+                    PhiCopyWidth::Doubleword => self.load_frame_x(destination, offset),
+                },
+                PhiLocation::StackSlot(_) => {
+                    match copy.width {
+                        PhiCopyWidth::Word => self.load_frame_w("a0", offset),
+                        PhiCopyWidth::Doubleword => self.load_frame_x("a0", offset),
+                    }
+                    self.store_phi_location(copy.destination, "a0", copy.width);
+                }
+            },
+        }
+    }
+
+    fn store_phi_location(&mut self, destination: PhiLocation, source: &str, width: PhiCopyWidth) {
+        match destination {
+            PhiLocation::Reg(destination) => self
+                .body
+                .push_str(&format!("  mv {}, {}\n", destination, source)),
+            PhiLocation::StackSlot(offset) => match width {
+                PhiCopyWidth::Word => self.store_frame_w(source, offset),
+                PhiCopyWidth::Doubleword => self.store_frame_x(source, offset),
+            },
+        }
+    }
+
+    fn save_phi_cycle_location(&mut self, location: PhiLocation, width: PhiCopyWidth) {
+        match location {
+            PhiLocation::Reg(source) => self
+                .body
+                .push_str(&format!("  mv {}, {}\n", PHI_CYCLE_SCRATCH, source)),
+            PhiLocation::StackSlot(offset) => match width {
+                PhiCopyWidth::Word => self.load_frame_w(PHI_CYCLE_SCRATCH, offset),
+                PhiCopyWidth::Doubleword => self.load_frame_x(PHI_CYCLE_SCRATCH, offset),
+            },
+        }
+    }
+
+    fn emit_snapshot_phi_copies(&mut self, copies: &[(ValueId, ValueId)]) {
+        for (_, value) in copies {
             self.load_value(*value);
             self.push_x0();
         }
@@ -200,26 +395,6 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             self.body.push_str("  mv a0, a1\n");
             self.store_result(*result);
         }
-    }
-
-    fn edge_has_phi_copy(&self, pred_idx: usize, target_idx: usize) -> bool {
-        self.func
-            .block(BlockId(target_idx))
-            .insts
-            .iter()
-            .filter_map(|inst| {
-                let (Some(result), InstKind::Phi { incomings }) = (inst.result, &inst.kind) else {
-                    return None;
-                };
-                incomings
-                    .iter()
-                    .find(|(pred, _)| pred.0 == pred_idx)
-                    .map(|(_, incoming)| (result, *incoming))
-            })
-            .any(|(result, incoming)| {
-                self.regalloc.reg(result) != self.regalloc.reg(incoming)
-                    || self.regalloc.reg(result).is_none()
-            })
     }
 
     fn emit_branch_if_false(&mut self, cond: ValueId, target: String) {
@@ -727,6 +902,24 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             }
         }
     }
+}
+
+fn parallel_phi_invariants_hold(copies: &[PhiCopy]) -> bool {
+    for (idx, copy) in copies.iter().enumerate() {
+        if copies[..idx]
+            .iter()
+            .any(|previous| previous.destination == copy.destination)
+            || location_uses_move_scratch(copy.destination)
+            || matches!(copy.source, PhiSource::Location(location) if location_uses_move_scratch(location))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn location_uses_move_scratch(location: PhiLocation) -> bool {
+    matches!(location, PhiLocation::Reg(reg) if PHI_MOVE_SCRATCHES.contains(&reg))
 }
 
 fn const_i32(func: &crate::ir::Function, value: ValueId) -> Option<i32> {

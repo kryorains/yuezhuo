@@ -13,37 +13,42 @@
   4. `RepeatReductionPass`
   5. `DcePass`
 - `OptLevel::O1`：按下面顺序执行：
-  1. `ConstFoldPass`
-  2. `SimplifyCfgPass`
-  3. `TailRecursionPass`
-  4. `GlobalScalarLocalizePass`
-  5. `ScalarPromotePass`
-  6. `RecursiveInlinePass`
-  7. `InlineSmallExprPass`
-  8. `LocalForwardPass`
-  9. `CsePass`
-  10. `LicmPass`
-  11. `InvariantLoadForwardPass`
-  12. `DcePass`
-  13. `ReductionJamPass`
-  14. `CsePass`
-  15. `LocalForwardPass`
-  16. `InvariantLoadForwardPass`
-  17. `DcePass`
-  18. `PiecewiseExprPass`
-  19. `RepeatReductionPass`
-  20. `SimpleLoopUnrollPass`（按目标收益门控）
-  21. `InstCombinePass`
-  22. `ConstFoldPass`
-  23. `LoopIdiomPass`
-  24. `ConstFoldPass`
-  25. `GepInductionPass`
-  26. `SimplifyCfgPass`
-  27. `DcePass`
+  1. `GlobalConstPropPass`
+  2. `ConstFoldPass`
+  3. `DcePass`
+  4. `SimplifyCfgPass`
+  5. `TailRecursionPass`
+  6. `GlobalScalarLocalizePass`
+  7. `ScalarPromotePass`
+  8. `RecursiveInlinePass`
+  9. `InlineSmallExprPass`
+  10. `LocalForwardPass`
+  11. `CsePass`
+  12. `LicmPass`
+  13. `InvariantLoadForwardPass`
+  14. `DcePass`
+  15. `ReductionJamPass`
+  16. `CsePass`
+  17. `LocalForwardPass`
+  18. `InvariantLoadForwardPass`
+  19. `DcePass`
+  20. `RepeatReductionPass`
+  21. `SimpleLoopUnrollPass`（按目标收益门控）
+  22. `InstCombinePass`
+  23. `ConstFoldPass`
+  24. `GepInductionPass`
+  25. `SimplifyCfgPass`
+  26. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `PiecewiseExprPass`、`LoopIdiomPass`、`GepInductionPass`、`InstCombinePass`、常量折叠、CSE、LICM 等主动优化。流水线中的前置 DCE 会先清掉标量提升遗留的死 phi；O1 末尾先由 InstCombine 和 ConstFold 把局部整数算术规范化，再让 LoopIdiom 识别循环区域，随后执行 GEP 地址归纳强度削弱，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。GEP 变换放在 simple unroll 和其它依赖原始 loop-phi 集合的 matcher 之后，避免新增 pointer phi 屏蔽已有收益。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量折叠、CSE、LICM 等主动优化。O1 开头先传播只读标量全局常量，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；流水线中的其它前置 DCE 会清掉标量提升遗留的死 phi。O1 末尾由 InstCombine 和 ConstFold 规范化局部整数算术，再执行通用 GEP 地址归纳强度削弱，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。GEP 变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
 
 ## Pass 列表
+
+### `GlobalConstPropPass` (`global_const_prop.rs`)
+
+通用的只读标量全局常量传播，仅接入 O1。pass 通过模块符号解析取得唯一全局对象；只有对象带有 `is_const`、对象类型是 i1/i32/f32，且初始化常量的 IR 类型与对象类型完全一致时，才会成为候选。
+
+模块中对候选地址的唯一合法使用是直接读取完整对象的 `load`；一旦地址参与 `store`、`memzero`、GEP、phi、调用或其它逃逸，整个对象都会保守退出传播。只有指针类型和结果类型都与对象精确一致的直接 load 会被替换；其它 load 保持原样。数组对象、数组元素和任何派生地址都不会传播。满足证明时，pass 在函数内建立对应的 IR `Const`，用共享 rewrite 工具改写用户并删除原 load；随后由 ConstFold 和 DCE 清理新暴露的常量表达式。变换不读取符号拼写，不依赖目标架构，重复运行幂等，并在改写后运行 verifier。
 
 ### `ConstFoldPass` (`const_fold.rs`)
 
@@ -149,21 +154,19 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 
 跨块读写关系继续交给更强的 SSA 与 alias 分析，局部 load CSE 不越过任何未知写入。
 
+### `CsePass` (`cse.rs`)
+
+沿入口可达区域的支配树维护当前路径上可用的表达式，复用一元/二元运算、比较、cast、GEP，以及严格证明为 `NoMemory` 的有结果直接调用。调用 key 是模块快照中的唯一 `FunctionId` 和经过已有 replacement 链解析后的完整实参序列，不使用函数名拼写分类；调用签名必须与唯一目标完全一致。已有调用必须支配当前调用，块内还必须位于其之前，因此 pass 只删除第二次调用，不做移动、LICM 或推测外提；即使纯递归调用可能不终止或触发异常，也只会在第一次相同调用已经返回后复用结果。
+
+`NoMemory` 由 `function_effects.rs` 在闭世界模块上计算。函数全部块内都不能出现 `load`、`store` 或 `memzero`，每个 call 还必须通过精确符号相等唯一解析到同样被证明为 `NoMemory` 的模块函数；`alloca`、phi、纯算术/比较、cast、GEP 和控制流允许。分析从所有局部可接受函数出发做 greatest-fixed-point 反向淘汰，因此没有内存操作或未知调用的递归 SCC 可以保留证明；任一成员含内存访问、未知外部调用或歧义目标时，结论会传播到全部调用者。重复函数符号没有唯一 identity，readonly 函数因包含 load 也不满足此最严格摘要，两者的调用均不会被消除。
+
+函数数和调用边数受固定的通用预算约束；任一模块超预算时全部摘要保守为 `MayMemory`，不会保留部分、顺序相关的证明。CSE 还对 key 操作数总量和支配路径可用表达式比较工作量设置统一上限，超限函数保持不变。GEP key 包含结果指针类型，避免把相同 base/index 但元素步长或结果类型不同的地址计算合并。分析基于每次 pass 入口的不可变模块快照重建，CSE 只把被消除指令改成 Nop 并统一改写使用，重复运行幂等，变换后执行 verifier。
+
 ### `InvariantLoadForwardPass` (`invariant_load.rs`)
 
 转发支配当前位置且来自只读对象的重复加载。
 
 它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
-
-### `LoopIdiomPass` (`bit_idiom.rs`)
-
-循环区域级整数 idiom 变换，仅接入 O1。它通过共享的 `LoopInfo`、`NaturalLoop`、i32 归纳变量与精确常量 trip-count 分析，在任意函数中逐个识别两个输入每轮除以 2、位权每轮乘以 2、按输入低位更新 accumulator 的自然循环。单轮控制流会对四组输入位做符号求值，因此可以推导全部二输入布尔真值表；局部余数、倍增和乘法重关联只接受前置 InstCombine/ConstFold 产生的规范形式。
-
-变换只 version 目标 loop region：preheader 新增两个输入非负的 guard，fast block 合成整数位运算和不足 32 位时的掩码，负数继续进入完整原循环；唯一 exit 新增 accumulator 合并 phi，循环后的原有计算继续使用合并结果。函数返回类型、参数数量、输入是否直接来自参数、循环数量和结果是否直接返回都不参与匹配。
-
-证明边界是保守的：必须有唯一专用 preheader、唯一 latch、唯一 exiting edge 和唯一 exit，不能有返回、内存访问、调用等 side exit/副作用；fast operands 必须在 preheader 可用；除 accumulator 外不能有 loop-defined live-out。exit 的已有 phi 只有在 fast edge 能复用其原 incoming 时才会补边，否则拒绝。变换后 preheader 不再是原循环的专用 preheader，因此重复运行幂等。
-
-当循环结果所在的 exit 块只包含 Nop 并直接返回 accumulator 时，fast block 会直接返回综合结果，避免为未改写的 fallback 循环增加合并 phi 和寄存器压力；其它区域仍使用 exit phi 合并 live-out。
 
 ### `GepInductionPass` (`gep_induction.rs`)
 
@@ -172,12 +175,6 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 变换在 preheader 用 induction 初值重建完整地址，在 header 插入 pointer phi，在 latch 用单索引常量 GEP 生成固定步长 next pointer。只有全部使用都位于循环内且新 phi 支配普通使用及 phi edge 时才替换原 GEP；仅作为其它已选 nested GEP base 的中间地址不会单独生成死 recurrence。常量 trip-count 分析或 header signed comparison 还必须证明 i32 induction 在每个回边不 wrap，否则 sign extension 后的重算地址与 pointer increment 并不等价，pass 会拒绝。
 
 pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有 live-out 地址时，header pointer state 仍只沿唯一 backedge 更新。含调用的循环不会变换，因为跨调用 pointer recurrence 会占用 callee-saved 寄存器或增加 spill，而地址重算通常不是这类循环的主要成本。动态大步长、循环内变化的 offset、非 GEP 派生链、不能在 preheader 使用的定义、不可整除为最终 pointee stride 的步长及类型大小溢出都保守保留。变换后立即运行 verifier，重复执行不会再次匹配生成的 pointer recurrence。
-
-### `PiecewiseExprPass` (`piecewise_expr.rs`)
-
-解释无环纯函数中的 selector 等值决策树。当连续的 selector 范围分别返回 `x * 2^selector` 或 `x / 2^selector`，范围外返回 `x` 时，将整条决策树版本化为范围检查和动态移位快速路径。比较顺序、`if` 组织方式、参数顺序及范围端点均不固定。
-
-左移在通过 `0..31` 范围检查后可直接使用；有符号除法只在 `x >= 0` 时使用算术右移，负数和范围外输入继续执行原函数，保持向零截断语义。非连续映射、混合乘除、额外副作用或未知分支都会让 pass 保守退出。
 
 ### `ReductionJamPass` (`reduction_jam.rs`)
 
@@ -213,6 +210,10 @@ pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有
 
 ## 支撑模块
 
+### `function_effects.rs`
+
+构建闭世界模块的通用函数副作用摘要和唯一直接调用目标，不是独立变换 pass。当前只公开最严格的 `NoMemory / MayMemory` 边界；后续若增加 readonly 等层级，不会自动放宽 CSE 的合法性。
+
 ### `dominators.rs`
 
 构建控制流图和支配信息，不是一个独立 pass。
@@ -236,7 +237,7 @@ pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有
 - `analyze_i32_induction` 只需从 header phi 的唯一 entering predecessor/latch incoming 识别 `next = phi + constant` 形式，统一处理 `add` 两种操作数顺序及 `sub phi, constant`，支持任意非零 i32 环绕步长，并返回 phi、initial、next、step。
 - `analyze_const_i32_trip_count` 对常量初值、常量步长和 header 直接 signed `icmp` 计算精确迭代次数，统一比较操作数反转和 true/false continuation；依赖 i32 回绕才能终止、越界或不终止的情况会拒绝。
 
-LICM、`SimpleLoopUnrollPass` 和 `LoopIdiomPass` 的 CFG/区域改写要求 dedicated preheader；`RepeatReductionPass` 与归纳分析只要求 unique entering predecessor。各 pass 复用循环结构和归纳变量描述，再施加自身的严格变换门控。LICM 按 invariant use-def 拓扑一次把定义先于使用移入 preheader，避免 BlockId 逆序依赖链上的反复全循环扫描。因此该模块是普通循环优化的公共基础设施，不是某个整数 idiom 的私有 matcher。
+LICM 和 `SimpleLoopUnrollPass` 的 CFG/区域改写要求 dedicated preheader；`RepeatReductionPass` 与归纳分析只要求 unique entering predecessor。各 pass 复用循环结构和归纳变量描述，再施加自身的严格变换门控。LICM 按 invariant use-def 拓扑一次把定义先于使用移入 preheader，避免 BlockId 逆序依赖链上的反复全循环扫描。因此该模块是普通循环优化的公共基础设施。
 
 ### `util.rs`
 

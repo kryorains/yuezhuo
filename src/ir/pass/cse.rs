@@ -1,14 +1,21 @@
 use super::dominators::{ControlFlowGraph, Dominators};
+use super::function_effects::FunctionEffects;
 use super::util::{resolve_replacement, rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
-use crate::ir::{BinaryOp, CastOp, CmpOp, Function, InstKind, Module, UnaryOp, ValueId};
+use crate::ir::{
+    BinaryOp, CastOp, CmpOp, Function, FunctionId, InstKind, Module, Type, UnaryOp, ValueId,
+};
+
+const MAX_CSE_KEY_OPERANDS: usize = 262_144;
+const MAX_CSE_COMPARISON_WORK: usize = 4_194_304;
 
 /// 公共子表达式消除。
 ///
 /// 这是一个保守的全局 CSE：沿 dominator tree 维护“当前路径上可用的纯表达式”。
 /// 如果新指令的表达式 key 已经出现过，就把新结果替换成已有结果，并把新指令改成 Nop。
 ///
-/// 为了避免内存 alias 和副作用问题，当前只处理纯表达式，不处理 load/store/call。
+/// Load/store 不参与；有结果且模块摘要严格证明为 NoMemory 的直接调用也可参与，
+/// 但只复用已支配当前位置且实参完全相同的既有返回值。
 pub(super) struct CsePass;
 
 impl CsePass {
@@ -19,14 +26,15 @@ impl CsePass {
 
 impl ModulePass for CsePass {
     fn run(&mut self, module: &mut Module) {
+        let effects = FunctionEffects::analyze(module);
         for func in &mut module.funcs {
-            cse_function(func);
+            cse_function(func, &effects);
         }
     }
 }
 
-fn cse_function(func: &mut Function) {
-    if func.blocks.len() > 1024 || func.values.len() > 8192 {
+fn cse_function(func: &mut Function, effects: &FunctionEffects) {
+    if func.blocks.len() > 1024 || func.values.len() > 8192 || !cse_work_within_budget(func) {
         return;
     }
 
@@ -37,7 +45,14 @@ fn cse_function(func: &mut Function) {
     // 进入子节点前追加，离开基本块后 truncate 回原长度，天然满足支配关系约束。
     let mut available = Vec::<(ExprKey, ValueId)>::new();
 
-    visit_dom_tree(func, func.entry, &dom, &mut replacements, &mut available);
+    visit_dom_tree(
+        func,
+        func.entry,
+        &dom,
+        effects,
+        &mut replacements,
+        &mut available,
+    );
     rewrite_function_uses(func, &replacements);
 
     if let Err(errors) = func.verify() {
@@ -49,6 +64,7 @@ fn visit_dom_tree(
     func: &mut Function,
     block: crate::ir::BlockId,
     dom: &Dominators,
+    effects: &FunctionEffects,
     replacements: &mut ValueReplacements,
     available: &mut Vec<(ExprKey, ValueId)>,
 ) {
@@ -59,7 +75,7 @@ fn visit_dom_tree(
         let Some(result) = inst.result else {
             continue;
         };
-        let Some(key) = ExprKey::from_inst(&inst.kind, replacements) else {
+        let Some(key) = ExprKey::from_inst(&inst.kind, result, func, effects, replacements) else {
             continue;
         };
 
@@ -74,7 +90,7 @@ fn visit_dom_tree(
     }
 
     for child in &dom.children[block.0] {
-        visit_dom_tree(func, *child, dom, replacements, available);
+        visit_dom_tree(func, *child, dom, effects, replacements, available);
     }
 
     available.truncate(available_base);
@@ -94,11 +110,18 @@ enum ExprKey {
     Icmp(CmpOp, ValueId, ValueId),
     Fcmp(CmpOp, ValueId, ValueId),
     Cast(CastOp, ValueId),
-    Gep(ValueId, Vec<ValueId>),
+    Gep(Type, ValueId, Vec<ValueId>),
+    Call(FunctionId, Vec<ValueId>),
 }
 
 impl ExprKey {
-    fn from_inst(kind: &InstKind, replacements: &ValueReplacements) -> Option<Self> {
+    fn from_inst(
+        kind: &InstKind,
+        result: ValueId,
+        func: &Function,
+        effects: &FunctionEffects,
+        replacements: &ValueReplacements,
+    ) -> Option<Self> {
         match kind {
             InstKind::Unary { op, value } => {
                 Some(Self::Unary(*op, resolve_replacement(*value, replacements)))
@@ -124,19 +147,88 @@ impl ExprKey {
                 Some(Self::Cast(*op, resolve_replacement(*value, replacements)))
             }
             InstKind::Gep { base, indices } => Some(Self::Gep(
+                func.values.get(result.0)?.ty.clone(),
                 resolve_replacement(*base, replacements),
                 indices
                     .iter()
                     .map(|index| resolve_replacement(*index, replacements))
                     .collect(),
             )),
+            InstKind::Call { name, args } => {
+                let args = args
+                    .iter()
+                    .map(|arg| resolve_replacement(*arg, replacements))
+                    .collect::<Vec<_>>();
+                let callee = effects.resolve_no_memory_call(func, name, result, &args)?;
+                Some(Self::Call(callee, args))
+            }
             InstKind::Nop
             | InstKind::Phi { .. }
             | InstKind::Alloca { .. }
             | InstKind::Load { .. }
             | InstKind::Store { .. }
-            | InstKind::MemZero { .. }
-            | InstKind::Call { .. } => None,
+            | InstKind::MemZero { .. } => None,
+        }
+    }
+}
+
+/// Conservatively bounds the existing linear available-expression lookup.
+/// The estimate orders all candidate expressions as one path, so it is an
+/// upper bound for every dominator-tree path without first building that tree.
+fn cse_work_within_budget(func: &Function) -> bool {
+    let mut prior_keys = 0usize;
+    let mut key_operands = 0usize;
+    let mut comparison_work = 0usize;
+
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        if inst.result.is_none() {
+            continue;
+        }
+        let Some(operands) = potential_key_operands(func, inst.result.unwrap(), &inst.kind) else {
+            continue;
+        };
+        key_operands = key_operands.saturating_add(operands);
+        comparison_work =
+            comparison_work.saturating_add(prior_keys.saturating_mul(operands.saturating_add(1)));
+        if key_operands > MAX_CSE_KEY_OPERANDS || comparison_work > MAX_CSE_COMPARISON_WORK {
+            return false;
+        }
+        prior_keys = prior_keys.saturating_add(1);
+    }
+    true
+}
+
+fn potential_key_operands(func: &Function, result: ValueId, kind: &InstKind) -> Option<usize> {
+    match kind {
+        InstKind::Unary { .. } | InstKind::Cast { .. } => Some(1),
+        InstKind::Binary { .. } | InstKind::Icmp { .. } | InstKind::Fcmp { .. } => Some(2),
+        InstKind::Gep { indices, .. } => Some(
+            indices
+                .len()
+                .saturating_add(1)
+                .saturating_add(type_nodes(&func.values.get(result.0)?.ty)),
+        ),
+        InstKind::Call { args, .. } => Some(args.len().saturating_add(1)),
+        InstKind::Nop
+        | InstKind::Phi { .. }
+        | InstKind::Alloca { .. }
+        | InstKind::Load { .. }
+        | InstKind::Store { .. }
+        | InstKind::MemZero { .. } => None,
+    }
+}
+
+fn type_nodes(mut ty: &Type) -> usize {
+    let mut nodes = 0usize;
+    loop {
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_CSE_KEY_OPERANDS {
+            return nodes;
+        }
+        match ty {
+            Type::Ptr(inner) => ty = inner,
+            Type::Array { elem, .. } => ty = elem,
+            Type::Void | Type::I1 | Type::I32 | Type::F32 => return nodes,
         }
     }
 }
