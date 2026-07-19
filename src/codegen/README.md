@@ -25,7 +25,7 @@
   - `call.rs`：调用点参数搬运。
   - `memory.rs`：load/store、GEP、栈帧寻址等。
   - `inst.rs`：大多数 IR 指令和 terminator 的翻译。
-  - `phi_regs.rs` / `regalloc.rs`：保守寄存器分配、phi incoming 合并及保存区计算。
+  - `phi_regs.rs` / `regalloc.rs`：CFG 活跃性/干涉着色、保守回退及保存区计算。
 
 ## 关键约定
 
@@ -34,10 +34,10 @@
    - AArch64：整数/指针结果在 `x0/w0`，直接求值的左操作数在 `x1/w1`；浮点对应使用 `s0` 和 `s1`。GEP 也用 `x1` 保存地址累加器，避免与大偏移寻址使用的 `x16/x17` 临时寄存器冲突。
    - RISC-V64：整数/指针结果在 `a0`，直接求值的左操作数在 `a1`；浮点对应使用 `fa0` 和 `fa1`。
 2. 单基本块内、不跨调用的整数/指针值可使用 AArch64 `x3-x7` 或 RISC-V64 `t3-t6`；RISC-V64 还允许调用参数和不跨后续调用的调用结果直接使用这些局部寄存器，避免多余的栈往返。
-3. 普通函数继续让热点 phi 独占函数级寄存器，并安全合并单用途 entry 参数或 backedge incoming。经过 reduction jam、寄存器需求更高的函数会构造 CFG live-in/live-out 与 phi-edge interference graph；AArch64 `x19-x28`、RISC-V64 `s1-s11` 可在不干涉的顺序循环间复用，并优先按 phi affinity 共色，避免每次回边执行并行栈 copy。叶函数还可使用 caller-saved 跨块寄存器；无法着色的值仍回退到栈。
+3. AArch64 与 RISC-V64 在固定块数、值数量、候选数量、`block * candidate` 工作量和活跃性迭代预算内，对所有函数统一构造 CFG live-in/live-out、phi-edge interference graph 和 copy affinity，使物理寄存器可在不干涉的控制流区域间复用；不收敛或超预算时回退到不做生命周期复用的独占分配。AArch64 叶函数使用与参数 ABI `x0-x7` 分离的 `x9-x15`，需要更多寄存器时可使用并正确保存 `x19-x28`；non-leaf 只使用 `x19-x28`。RISC-V64 叶函数的非参数跨块值还可使用 `a2-a7`，参数则不分配到这些寄存器。无法着色的值仍回退到栈。
 4. 无法证明寄存器分配安全的 IR value 仍落到 `IrFuncLayout` 栈槽。`alloca` 的 value 栈槽保存对象地址，对象本体紧跟在地址槽之后。
 5. 普通二元运算、比较、store 和 GEP 直接从两个临时寄存器求值，不再借助运行时求值栈；已有寄存器分配时，load/store、GEP、整数运算、比较以及 AArch64 `madd` 会直接使用最终寄存器。单索引常量 GEP 会先按元素类型计算通用 byte offset；AArch64 在 add/sub immediate 编码范围内直接更新地址，RISC-V64 在 signed 12-bit 范围内选择 `addi`，范围外也只 materialize 最终 byte offset 后做一次寄存器 add/sub，不再重复生成 index scaling。
 6. 整数 `Iand/Ior/Ixor/Ishl/Iashr` 是普通 IR 指令，由各目标的 `inst.rs` 直接选择原生指令。只有当 use-def 精确形成单用途低位掩码比较时，AArch64 才进一步合成为 `tbz/tbnz`（多位掩码用 `tst`），RISC-V64 使用 `andi` 加零分支；不按函数 CFG 或源码变量形状注入整函数快速路径。
-7. Phi 在 terminator 边上生成并行 copy；同寄存器 incoming 不再生成 copy，多值环仍使用栈暂存保证并行语义。AArch64 与 RISC-V64 的规范化自然循环会采用 `body .. latch, header, exit` 汇编布局：preheader 保留零次检查，热点回边由 latch fallthrough 和一条反向条件分支完成。多 latch、非专用入口或不规范循环保持原顺序。
+7. Phi 在 terminator 边上生成并行 copy；同一物理位置的 incoming 不生成 copy。RISC-V64 以 regalloc 寄存器或唯一 layout 栈槽作为跨边位置，Const/Global 在需要时重新物化；预算内的无环 copy 按位置依赖顺序直接发射，环由保留的 `t2` 打断，不动态调整 `sp`；超出 copy 数量预算或无法证明位置/类型不变量时回退到全量快照。AArch64 与 RISC-V64 的规范化自然循环会采用 `body .. latch, header, exit` 汇编布局：preheader 保留零次检查，热点回边由 latch fallthrough 和一条反向条件分支完成。多 latch、非专用入口或不规范循环保持原顺序。
 8. AArch64 和 RISC-V64 会识别只依赖寄存器参数的入口守卫；当一侧是无副作用且只有入口前驱的短返回表达式时，该路径会在函数序言前执行，只有慢路径才建立栈帧。有帧路径先生成原入口到慢分支的 phi copy，再绕过已执行的守卫；不满足结构、类型、ABI 寄存器或规模证明时完全保留普通发射。
 9. RISC-V64 的少量纯整数/指针调用参数从后向前直接装入 `a0-a7`，零比较直接选择 `beqz`/`bnez` 等分支指令；递归或大 CFG 函数使用 128 字节函数对齐，降低热点代码跨取指边界造成的波动。
