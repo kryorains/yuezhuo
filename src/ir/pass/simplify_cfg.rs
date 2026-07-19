@@ -1,6 +1,10 @@
+mod structural;
+
+use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
 use crate::ir::{BlockId, Const, Function, InstKind, Module, Terminator, ValueKind};
 use std::collections::HashSet;
+use structural::{forward_empty_jump_block, merge_linear_block, remove_unreachable_blocks};
 
 pub(super) struct SimplifyCfgPass;
 
@@ -19,8 +23,33 @@ impl ModulePass for SimplifyCfgPass {
 }
 
 fn simplify_function(func: &mut Function) {
+    let mut changed = false;
+    loop {
+        let mut round_changed = remove_unreachable_blocks(func);
+        round_changed |= simplify_branches(func);
+        round_changed |= thread_boolean_phi_branches(func);
+        round_changed |= simplify_trivial_phis(func);
+        round_changed |= forward_empty_jump_block(func);
+        round_changed |= merge_linear_block(func);
+        changed |= round_changed;
+        if !round_changed {
+            break;
+        }
+    }
+    if changed {
+        if let Err(errors) = func.verify() {
+            panic!(
+                "simplify-cfg produced invalid IR in {}: {:?}",
+                func.name, errors
+            );
+        }
+    }
+}
+
+fn simplify_branches(func: &mut Function) -> bool {
     // 先替换 terminator，并记录被删除的 CFG 边；最后再统一修 phi incoming。
     let mut removed_edges = Vec::new();
+    let mut changed = false;
 
     for block_idx in 0..func.blocks.len() {
         let Some(terminator) = func.blocks[block_idx].terminator.clone() else {
@@ -55,15 +84,41 @@ fn simplify_function(func: &mut Function) {
 
         func.blocks[block_idx].terminator = Some(replacement);
         removed_edges.extend(removed);
+        changed = true;
     }
 
     for (pred, target) in removed_edges {
         remove_phi_incomings(func, pred, target);
     }
-    thread_boolean_phi_branches(func);
+    changed
 }
 
-fn thread_boolean_phi_branches(func: &mut Function) {
+fn simplify_trivial_phis(func: &mut Function) -> bool {
+    let mut replacements = ValueReplacements::new();
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            let InstKind::Phi { incomings } = &inst.kind else {
+                continue;
+            };
+            let Some(result) = inst.result else {
+                continue;
+            };
+            let Some(first) = incomings.first().map(|(_, value)| *value) else {
+                continue;
+            };
+            if incomings.iter().all(|(_, value)| *value == first) {
+                replacements.insert(result, first);
+                inst.result = None;
+                inst.kind = InstKind::Nop;
+            }
+        }
+    }
+    let changed = !replacements.is_empty();
+    rewrite_function_uses(func, &replacements);
+    changed
+}
+
+fn thread_boolean_phi_branches(func: &mut Function) -> bool {
     let use_counts = value_use_counts(func);
     let predecessor_sets = all_predecessors(func);
     let candidates = func
@@ -104,6 +159,7 @@ fn thread_boolean_phi_branches(func: &mut Function) {
         })
         .collect::<Vec<_>>();
 
+    let mut changed = false;
     for (block, condition, then_target, else_target, incomings) in candidates {
         if !matches!(
             func.blocks[block.0].terminator.as_ref(),
@@ -188,7 +244,9 @@ fn thread_boolean_phi_branches(func: &mut Function) {
             }
         }
         func.blocks[block.0].terminator = Some(Terminator::Jump(else_target));
+        changed = true;
     }
+    changed
 }
 
 fn all_predecessors(func: &Function) -> Vec<HashSet<BlockId>> {
@@ -289,3 +347,6 @@ fn const_bool(func: &Function, value: crate::ir::ValueId) -> Option<bool> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests;
