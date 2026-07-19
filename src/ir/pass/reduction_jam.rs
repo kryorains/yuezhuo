@@ -1,5 +1,7 @@
 use super::dominators::{ControlFlowGraph, Dominators};
-use super::loop_analysis::{analyze_i32_induction, InductionVariable, LoopInfo, NaturalLoop};
+use super::loop_analysis::{
+    analyze_const_i32_trip_count, analyze_i32_induction, InductionVariable, LoopInfo, NaturalLoop,
+};
 use super::util::{const_i32, defining_inst, get_or_add_i32_const};
 use super::ModulePass;
 use crate::ir::{
@@ -9,27 +11,47 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_SETUP_INSTRUCTIONS: usize = 16;
 const MAX_INNER_INSTRUCTIONS: usize = 32;
+const MAX_FACTOR_FOUR_ACTIVE_ACCUMULATORS: usize = 4;
+const MAX_FACTOR_FOUR_POINTER_VALUES: usize = 12;
+const MAX_FACTOR_FOUR_MAPPED_VALUES: usize = 96;
+const MAX_FACTOR_FOUR_REGISTER_CANDIDATES: usize = 96;
+const MAX_FACTOR_FOUR_CODE_GROWTH: usize = 128;
+const MAX_FACTOR_FOUR_GROWTH_MULTIPLIER: usize = 5;
+const MAX_FACTOR_FOUR_PEAK_LIVE_VALUES: usize = 20;
+const MAX_FACTOR_FOUR_CSE_WORK: usize = 4_194_304;
+const MAX_FUNCTION_BLOCKS: usize = 1024;
+const MAX_FUNCTION_VALUES: usize = 8192;
+const MAX_MEMORY_GEP_CHAIN_DEPTH: usize = 64;
+const MAX_MEMORY_GEP_INDICES: usize = 128;
+const MAX_MEMORY_TYPE_NODES: usize = 1024;
+const MAX_MEMORY_PROOF_WORK: usize = 4096;
+const MAX_FUNCTION_INSTRUCTIONS: usize = 65_536;
 
-/// Processes two adjacent outer-loop iterations in one shared scalar reduction.
+/// Processes two or four adjacent outer iterations in one scalar reduction.
 ///
 /// This is deliberately narrower than a general loop interchange: it accepts a
 /// canonical two-level loop whose inner loop is a single pure reduction block
-/// and whose only outer-iteration side effect is one store. The fast pair loop
-/// is followed by the complete original loop as a zero/one-iteration tail.
-/// Memory independence is proved from global-object identity and the final GEP
-/// index, rather than from source names or fixed dimensions.
-pub(super) struct ReductionJamPass;
+/// and whose only outer-iteration side effect is one store. A target-independent
+/// pressure and growth bound may select four lanes; otherwise the established
+/// two-lane fast path remains. The complete original loop handles every dynamic
+/// tail. Memory independence is proved from global-object identity and a
+/// checked typed byte-congruence model of complete GEP chains, rather than from
+/// source names or fixed dimensions.
+pub(super) struct ReductionJamPass {
+    max_factor: usize,
+}
 
 impl ReductionJamPass {
-    pub(super) fn new() -> Self {
-        Self
+    pub(super) fn new(max_factor: usize) -> Self {
+        debug_assert!(matches!(max_factor, 2 | 4));
+        Self { max_factor }
     }
 }
 
 impl ModulePass for ReductionJamPass {
     fn run(&mut self, module: &mut Module) {
         for func in &mut module.funcs {
-            jam_one_nest(func);
+            jam_one_nest_with_factor(func, self.max_factor);
         }
     }
 }
@@ -40,7 +62,9 @@ struct JamCandidate {
     outer_preheader: BlockId,
     outer_latch: BlockId,
     outer_induction: InductionVariable,
+    outer_initial: i32,
     outer_bound: ValueId,
+    outer_trip_count: Option<u32>,
     inner_header: BlockId,
     inner_preheader: BlockId,
     inner_body: BlockId,
@@ -53,8 +77,21 @@ struct JamCandidate {
     store_ptr: ValueId,
 }
 
+#[cfg(test)]
 fn jam_one_nest(func: &mut Function) {
-    if func.has_reduction_jam() || func.blocks.len() > 1024 || func.values.len() > 8192 {
+    jam_one_nest_with_factor(func, 2);
+}
+
+fn jam_one_nest_with_factor(func: &mut Function, max_factor: usize) {
+    if func.has_reduction_jam()
+        || func.blocks.len() > MAX_FUNCTION_BLOCKS
+        || func.values.len() > MAX_FUNCTION_VALUES
+        || func
+            .blocks
+            .iter()
+            .try_fold(0usize, |total, block| total.checked_add(block.insts.len()))
+            .is_none_or(|instructions| instructions > MAX_FUNCTION_INSTRUCTIONS)
+    {
         return;
     }
     let cfg = ControlFlowGraph::new(func);
@@ -63,7 +100,10 @@ fn jam_one_nest(func: &mut Function) {
     let Some(candidate) = find_candidate(func, &loops, &dom) else {
         return;
     };
-    apply_candidate(func, &candidate);
+    let Some(factor) = select_jam_factor(func, &candidate, max_factor) else {
+        return;
+    };
+    apply_candidate(func, &candidate, factor);
     if let Err(errors) = func.verify() {
         panic!(
             "reduction unroll-and-jam produced invalid IR in {}: {:?}",
@@ -99,6 +139,7 @@ fn find_candidate(
             )
             || executable_instruction_count(func, inner_preheader) > MAX_SETUP_INSTRUCTIONS
             || executable_instruction_count(func, inner_body) > MAX_INNER_INSTRUCTIONS
+            || !has_only_phi_and_branch_condition(func, inner.header)
             || !is_pure_setup_block(func, inner_preheader)
             || !is_pure_reduction_block(func, inner_body)
         {
@@ -165,6 +206,7 @@ fn find_candidate(
                 func.blocks[inner_exit.0].terminator,
                 Some(Terminator::Jump(target)) if target == outer.header
             )
+            || !has_only_phi_and_branch_condition(func, outer.header)
         {
             continue;
         }
@@ -186,6 +228,7 @@ fn find_candidate(
         let Some(outer_bound) = canonical_less_than_bound(func, outer, outer_induction.phi) else {
             continue;
         };
+        let outer_trip_count = analyze_const_i32_trip_count(func, outer, outer_induction);
         if !value_available_at(func, dom, outer_bound, outer_preheader)
             || !value_available_at(func, dom, inner_bound, outer_preheader)
             || !value_available_at(func, dom, inner_induction.initial, outer_preheader)
@@ -228,7 +271,14 @@ fn find_candidate(
                 outer_induction.phi,
                 &[inner_preheader, inner_exit],
             )
-            || !proves_lane_independence(func, *store_ptr, outer_induction.phi, inner_body)
+            || !proves_lane_independence(
+                func,
+                *store_ptr,
+                *store_value,
+                outer_induction.phi,
+                inner_body,
+                2,
+            )
         {
             continue;
         }
@@ -270,7 +320,9 @@ fn find_candidate(
             outer_preheader,
             outer_latch,
             outer_induction,
+            outer_initial,
             outer_bound,
+            outer_trip_count,
             inner_header: inner.header,
             inner_preheader,
             inner_body,
@@ -286,7 +338,327 @@ fn find_candidate(
     None
 }
 
-fn apply_candidate(func: &mut Function, candidate: &JamCandidate) {
+fn select_jam_factor(
+    func: &Function,
+    candidate: &JamCandidate,
+    max_factor: usize,
+) -> Option<usize> {
+    // A value congruent to zero modulo four is at most i32::MAX - 3. Every
+    // fast header can therefore form lanes 1..3 without signed wrap. If the
+    // lane-three guard succeeds, `iv + 3 < bound <= i32::MAX` also proves that
+    // the taken-path `iv + 4` is representable. The same argument with modulo
+    // two is established by candidate matching for the fallback path.
+    if candidate.outer_trip_count.is_some_and(|count| count < 2) {
+        return None;
+    }
+    let factor_two_cost = estimate_jam_cost(func, candidate, 2)?;
+    if !factor_is_within_hard_budgets(func, &factor_two_cost, 2) {
+        return None;
+    }
+    if max_factor < 4
+        || candidate.outer_trip_count.is_some_and(|count| count < 4)
+        || candidate.outer_initial & 3 != 0
+        || !factor_four_is_profitable(func, candidate)
+    {
+        return Some(2);
+    }
+    if !proves_lane_independence(
+        func,
+        candidate.store_ptr,
+        candidate.accumulator,
+        candidate.outer_induction.phi,
+        candidate.inner_body,
+        4,
+    ) {
+        return Some(2);
+    }
+    Some(4)
+}
+
+#[derive(Debug)]
+struct JamCost {
+    active_accumulators: usize,
+    pointer_values: usize,
+    shared_load_streams: usize,
+    setup_live_scalars: usize,
+    mapped_values: usize,
+    register_candidates: usize,
+    projected_cse_keys: usize,
+    projected_cse_operands: usize,
+    peak_live_values: usize,
+    code_growth: usize,
+    original_region: usize,
+}
+
+/// Bounds factor-four pressure using only target-independent SSA properties.
+/// Pointer state includes every output lane and distinct load stream, with
+/// lane-dependent streams replicated per lane. `mapped_values` bounds all
+/// per-lane map entries, while `register_candidates` bounds result-bearing
+/// fast-path IR.
+fn factor_four_is_profitable(func: &Function, candidate: &JamCandidate) -> bool {
+    let Some(cost) = estimate_jam_cost(func, candidate, 4) else {
+        return false;
+    };
+    let Some(relative_growth_budget) = cost
+        .original_region
+        .checked_mul(MAX_FACTOR_FOUR_GROWTH_MULTIPLIER)
+    else {
+        return false;
+    };
+    factor_is_within_hard_budgets(func, &cost, 4)
+        && cost.shared_load_streams > 0
+        && cost.active_accumulators <= MAX_FACTOR_FOUR_ACTIVE_ACCUMULATORS
+        && cost.pointer_values <= MAX_FACTOR_FOUR_POINTER_VALUES
+        && cost.mapped_values <= MAX_FACTOR_FOUR_MAPPED_VALUES
+        && cost.register_candidates <= MAX_FACTOR_FOUR_REGISTER_CANDIDATES
+        && cost.peak_live_values <= MAX_FACTOR_FOUR_PEAK_LIVE_VALUES
+        && cse_projection_within_budget(func, &cost)
+        && func
+            .values
+            .len()
+            .checked_add(cost.register_candidates)
+            .and_then(|values| values.checked_add(4))
+            .is_some_and(|values| {
+                values <= 512
+                    && func
+                        .blocks
+                        .len()
+                        .checked_add(5)
+                        .and_then(|blocks| blocks.checked_mul(values))
+                        .is_some_and(|work| work <= 262_144)
+            })
+        && cost.code_growth <= MAX_FACTOR_FOUR_CODE_GROWTH
+        && cost.code_growth <= relative_growth_budget
+}
+
+fn projected_cse_key_operands(func: &Function, inst: &crate::ir::Inst) -> Option<Option<usize>> {
+    let operands = match &inst.kind {
+        InstKind::Unary { .. } | InstKind::Cast { .. } => 1usize,
+        InstKind::Binary { .. } | InstKind::Icmp { .. } | InstKind::Fcmp { .. } => 2,
+        InstKind::Gep { indices, .. } => {
+            let result = inst.result?;
+            indices
+                .len()
+                .saturating_add(1)
+                .saturating_add(bounded_type_nodes(&func.values.get(result.0)?.ty)?)
+        }
+        InstKind::Call { args, .. } if inst.result.is_some() => args.len().saturating_add(1),
+        _ => return Some(None),
+    };
+    Some(Some(operands))
+}
+
+fn cse_projection_within_budget(func: &Function, cost: &JamCost) -> bool {
+    let mut keys = 0usize;
+    let mut operands = 0usize;
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let Some(key_operands) = (match &inst.kind {
+            InstKind::Unary { .. } | InstKind::Cast { .. } => Some(1usize),
+            InstKind::Binary { .. } | InstKind::Icmp { .. } | InstKind::Fcmp { .. } => Some(2),
+            InstKind::Gep { indices, .. } => {
+                let Some(result_ty) = inst
+                    .result
+                    .and_then(|result| func.values.get(result.0))
+                    .map(|value| &value.ty)
+                else {
+                    return false;
+                };
+                let Some(type_nodes) = bounded_type_nodes(result_ty) else {
+                    return false;
+                };
+                Some(indices.len().saturating_add(1).saturating_add(type_nodes))
+            }
+            InstKind::Call { args, .. } if inst.result.is_some() => {
+                Some(args.len().saturating_add(1))
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        keys = keys.saturating_add(1);
+        operands = operands.saturating_add(key_operands.saturating_add(1));
+    }
+    keys = keys.saturating_add(cost.projected_cse_keys);
+    operands = operands.saturating_add(cost.projected_cse_operands);
+    keys <= 512
+        && operands <= 4096
+        && keys
+            .checked_mul(operands)
+            .is_some_and(|work| work <= MAX_FACTOR_FOUR_CSE_WORK)
+}
+
+fn bounded_type_nodes(mut ty: &Type) -> Option<usize> {
+    let mut nodes = 0usize;
+    loop {
+        nodes = nodes.checked_add(1)?;
+        if nodes > 128 {
+            return None;
+        }
+        match ty {
+            Type::Ptr(inner) => ty = inner,
+            Type::Array { elem, .. } => ty = elem,
+            Type::Void | Type::I1 | Type::I32 | Type::F32 => return Some(nodes),
+        }
+    }
+}
+
+fn factor_is_within_hard_budgets(func: &Function, cost: &JamCost, factor: usize) -> bool {
+    let Some(function_instructions) = func
+        .blocks
+        .iter()
+        .try_fold(0usize, |total, block| total.checked_add(block.insts.len()))
+    else {
+        return false;
+    };
+    func.blocks
+        .len()
+        .checked_add(5)
+        .is_some_and(|blocks| blocks <= MAX_FUNCTION_BLOCKS)
+        && func
+            .values
+            .len()
+            .checked_add(cost.register_candidates)
+            .and_then(|values| values.checked_add(factor))
+            .is_some_and(|values| values <= MAX_FUNCTION_VALUES)
+        && function_instructions
+            .checked_add(cost.code_growth)
+            .is_some_and(|instructions| instructions <= MAX_FUNCTION_INSTRUCTIONS)
+}
+
+fn estimate_jam_cost(func: &Function, candidate: &JamCandidate, factor: usize) -> Option<JamCost> {
+    let mut cloned_instructions = 0usize;
+    let mut cloned_results = 0usize;
+    let mut setup_live_scalars = 0usize;
+    let mut projected_cse_keys = 0usize;
+    let mut projected_cse_operands = 0usize;
+    let mut external_invariant_scalars = HashSet::new();
+    let candidate_blocks = HashSet::from([
+        candidate.outer_header,
+        candidate.inner_preheader,
+        candidate.inner_header,
+        candidate.inner_body,
+        candidate.inner_exit,
+    ]);
+    let mut lane_dependent = HashSet::from([candidate.outer_induction.phi, candidate.accumulator]);
+    let mut load_pointers = HashSet::new();
+    for (block, is_exit) in [
+        (candidate.inner_preheader, false),
+        (candidate.inner_body, false),
+        (candidate.inner_exit, true),
+    ] {
+        for inst in &func.blocks.get(block.0)?.insts {
+            if block == candidate.inner_body {
+                for operand in instruction_operands(&inst.kind) {
+                    let Some(value) = func.values.get(operand.0) else {
+                        return None;
+                    };
+                    let external = matches!(value.kind, ValueKind::Param)
+                        || matches!(value.kind, ValueKind::Inst(owner, _) if !candidate_blocks.contains(&owner));
+                    if external && matches!(value.ty, Type::I1 | Type::I32 | Type::F32) {
+                        external_invariant_scalars.insert(operand);
+                    }
+                }
+            }
+            if let Some(key_operands) = projected_cse_key_operands(func, inst)? {
+                projected_cse_keys = projected_cse_keys.checked_add(factor)?;
+                projected_cse_operands = projected_cse_operands
+                    .checked_add(factor.checked_mul(key_operands.saturating_add(1))?)?;
+            }
+            if let InstKind::Load { ptr } = inst.kind {
+                load_pointers.insert(ptr);
+            }
+            if let Some(result) = inst.result {
+                if block == candidate.inner_preheader
+                    && !matches!(func.values.get(result.0)?.ty, Type::Ptr(_))
+                {
+                    setup_live_scalars = setup_live_scalars.checked_add(1)?;
+                }
+                if instruction_operands(&inst.kind)
+                    .iter()
+                    .any(|operand| lane_dependent.contains(operand))
+                {
+                    lane_dependent.insert(result);
+                }
+            }
+            if matches!(inst.kind, InstKind::Nop)
+                || (is_exit && matches!(inst.kind, InstKind::Store { .. }))
+            {
+                continue;
+            }
+            cloned_instructions = cloned_instructions.checked_add(1)?;
+            if inst.result.is_some() {
+                cloned_results = cloned_results.checked_add(1)?;
+            }
+        }
+    }
+    let mut shared_load_streams = 0usize;
+    let load_pointer_values = load_pointers.into_iter().try_fold(0usize, |total, ptr| {
+        let copies = if lane_dependent.contains(&ptr) {
+            factor
+        } else {
+            shared_load_streams = shared_load_streams.checked_add(1)?;
+            1
+        };
+        total.checked_add(copies)
+    })?;
+
+    let original_blocks = HashSet::from([
+        candidate.outer_header,
+        candidate.inner_preheader,
+        candidate.inner_header,
+        candidate.inner_body,
+        candidate.outer_latch,
+    ]);
+    let original_region = original_blocks
+        .into_iter()
+        .try_fold(0usize, |total, block| {
+            total.checked_add(executable_instruction_count(func, block))
+        })?;
+    let generated_keys = factor.checked_add(2)?;
+    projected_cse_keys = projected_cse_keys.checked_add(generated_keys)?;
+    projected_cse_operands = projected_cse_operands.checked_add(generated_keys.checked_mul(3)?)?;
+    let fixed_results = factor.checked_mul(2)?.checked_add(4)?;
+    Some(JamCost {
+        active_accumulators: factor,
+        // Keep one state value per output lane, one shared object base, and one
+        // load pointer stream per lane-independent address (or per lane when
+        // the address depends on a lane's outer index or accumulator). This
+        // anticipates the
+        // later generic GEP-induction pass without querying either backend.
+        pointer_values: factor.checked_add(1)?.checked_add(load_pointer_values)?,
+        shared_load_streams,
+        setup_live_scalars,
+        // Each lane map contains the outer induction, the shared inner
+        // induction, the accumulator, and every cloned result.
+        mapped_values: factor.checked_mul(cloned_results.checked_add(3)?)?,
+        register_candidates: factor
+            .checked_mul(cloned_results)?
+            .checked_add(fixed_results)?,
+        projected_cse_keys,
+        projected_cse_operands,
+        // Four accumulators, pointer state, and the shared outer induction,
+        // inner induction, and dynamic bound are simultaneously live around
+        // the hot inner loop. Local single-block temporaries remain available
+        // to the backend's separate t-register allocator.
+        peak_live_values: factor
+            .checked_add(factor.checked_add(1)?.checked_add(load_pointer_values)?)?
+            .checked_add(factor.checked_mul(setup_live_scalars)?)?
+            // outer/inner induction, distinct outer/inner bounds, and each
+            // shared load result that remains live while updating all lanes.
+            .checked_add(4usize.checked_add(shared_load_streams)?)?
+            .checked_add(external_invariant_scalars.len())?,
+        // Header indices/guard, inner phis/guard, stores, and the outer next
+        // account for `3 * factor + 4` instructions beyond cloned source IR.
+        code_growth: factor
+            .checked_mul(cloned_instructions)?
+            .checked_add(factor.checked_mul(3)?)?
+            .checked_add(4)?,
+        original_region,
+    })
+}
+
+fn apply_candidate(func: &mut Function, candidate: &JamCandidate, factor: usize) {
+    assert!(matches!(factor, 2 | 4));
     let fast_header = func.add_block("reduction.jam.header");
     let fast_setup = func.add_block("reduction.jam.setup");
     let fast_inner_header = func.add_block("reduction.jam.inner");
@@ -306,24 +678,33 @@ fn apply_candidate(func: &mut Function, candidate: &JamCandidate) {
         )
         .unwrap();
     let one = get_or_add_i32_const(func, 1);
-    let two = get_or_add_i32_const(func, 2);
-    let lane_one = func
-        .append_inst(
-            fast_header,
-            InstKind::Binary {
-                op: BinaryOp::Iadd,
-                lhs: fast_outer,
-                rhs: one,
-            },
-            Some(Type::I32),
-        )
-        .unwrap();
-    let pair_condition = func
+    let factor_value = get_or_add_i32_const(func, factor as i32);
+    let mut lane_indices = vec![fast_outer];
+    for lane in 1..factor {
+        let offset = if lane == 1 {
+            one
+        } else {
+            get_or_add_i32_const(func, lane as i32)
+        };
+        let index = func
+            .append_inst(
+                fast_header,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: fast_outer,
+                    rhs: offset,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        lane_indices.push(index);
+    }
+    let group_condition = func
         .append_inst(
             fast_header,
             InstKind::Icmp {
                 op: CmpOp::Lt,
-                lhs: lane_one,
+                lhs: *lane_indices.last().unwrap(),
                 rhs: candidate.outer_bound,
             },
             Some(Type::I1),
@@ -332,73 +713,50 @@ fn apply_candidate(func: &mut Function, candidate: &JamCandidate) {
     func.set_terminator(
         fast_header,
         Terminator::Branch {
-            cond: pair_condition,
+            cond: group_condition,
             then_target: fast_setup,
             else_target: candidate.outer_header,
         },
     );
 
-    let mut lane_zero = HashMap::from([(candidate.outer_induction.phi, fast_outer)]);
-    let mut lane_one_map = HashMap::from([(candidate.outer_induction.phi, lane_one)]);
-    clone_pure_block(func, candidate.inner_preheader, fast_setup, &mut lane_zero);
-    clone_pure_block(
-        func,
-        candidate.inner_preheader,
-        fast_setup,
-        &mut lane_one_map,
-    );
+    let mut lane_values = lane_indices
+        .iter()
+        .map(|index| HashMap::from([(candidate.outer_induction.phi, *index)]))
+        .collect::<Vec<_>>();
+    for values in &mut lane_values {
+        clone_pure_block(func, candidate.inner_preheader, fast_setup, values);
+    }
 
-    let inner_initial_zero = map_value(candidate.inner_induction.initial, &lane_zero);
-    let inner_initial_one = map_value(candidate.inner_induction.initial, &lane_one_map);
-    assert_eq!(inner_initial_zero, inner_initial_one);
+    let inner_initial = map_value(candidate.inner_induction.initial, &lane_values[0]);
+    assert!(lane_values
+        .iter()
+        .all(|values| map_value(candidate.inner_induction.initial, values) == inner_initial));
     let fast_inner = func
         .append_inst(
             fast_inner_header,
             InstKind::Phi {
                 incomings: vec![
-                    (fast_setup, inner_initial_zero),
-                    (fast_inner_body, inner_initial_zero),
+                    (fast_setup, inner_initial),
+                    (fast_inner_body, inner_initial),
                 ],
             },
             Some(Type::I32),
         )
         .unwrap();
-    let fast_accumulator_zero = func
-        .append_inst(
-            fast_inner_header,
-            InstKind::Phi {
-                incomings: vec![
-                    (
-                        fast_setup,
-                        map_value(candidate.accumulator_initial, &lane_zero),
-                    ),
-                    (
-                        fast_inner_body,
-                        map_value(candidate.accumulator_initial, &lane_zero),
-                    ),
-                ],
-            },
-            Some(Type::I32),
-        )
-        .unwrap();
-    let fast_accumulator_one = func
-        .append_inst(
-            fast_inner_header,
-            InstKind::Phi {
-                incomings: vec![
-                    (
-                        fast_setup,
-                        map_value(candidate.accumulator_initial, &lane_one_map),
-                    ),
-                    (
-                        fast_inner_body,
-                        map_value(candidate.accumulator_initial, &lane_one_map),
-                    ),
-                ],
-            },
-            Some(Type::I32),
-        )
-        .unwrap();
+    let mut fast_accumulators = Vec::with_capacity(factor);
+    for values in &lane_values {
+        let initial = map_value(candidate.accumulator_initial, values);
+        let accumulator = func
+            .append_inst(
+                fast_inner_header,
+                InstKind::Phi {
+                    incomings: vec![(fast_setup, initial), (fast_inner_body, initial)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        fast_accumulators.push(accumulator);
+    }
     let inner_condition = func
         .append_inst(
             fast_inner_header,
@@ -420,60 +778,45 @@ fn apply_candidate(func: &mut Function, candidate: &JamCandidate) {
     );
     func.set_terminator(fast_setup, Terminator::Jump(fast_inner_header));
 
-    lane_zero.insert(candidate.inner_induction.phi, fast_inner);
-    lane_zero.insert(candidate.accumulator, fast_accumulator_zero);
-    lane_one_map.insert(candidate.inner_induction.phi, fast_inner);
-    lane_one_map.insert(candidate.accumulator, fast_accumulator_one);
-    clone_pure_block(func, candidate.inner_body, fast_inner_body, &mut lane_zero);
-    clone_pure_block(
-        func,
-        candidate.inner_body,
-        fast_inner_body,
-        &mut lane_one_map,
-    );
-    let fast_inner_next = map_value(candidate.inner_induction.next, &lane_zero);
-    let fast_accumulator_zero_next = map_value(candidate.accumulator_next, &lane_zero);
-    let fast_accumulator_one_next = map_value(candidate.accumulator_next, &lane_one_map);
+    for (values, accumulator) in lane_values.iter_mut().zip(&fast_accumulators) {
+        values.insert(candidate.inner_induction.phi, fast_inner);
+        values.insert(candidate.accumulator, *accumulator);
+        clone_pure_block(func, candidate.inner_body, fast_inner_body, values);
+    }
+    let fast_inner_next = map_value(candidate.inner_induction.next, &lane_values[0]);
     set_phi_backedge(func, fast_inner, fast_inner_body, fast_inner_next);
-    set_phi_backedge(
-        func,
-        fast_accumulator_zero,
-        fast_inner_body,
-        fast_accumulator_zero_next,
-    );
-    set_phi_backedge(
-        func,
-        fast_accumulator_one,
-        fast_inner_body,
-        fast_accumulator_one_next,
-    );
+    for (values, accumulator) in lane_values.iter().zip(&fast_accumulators) {
+        set_phi_backedge(
+            func,
+            *accumulator,
+            fast_inner_body,
+            map_value(candidate.accumulator_next, values),
+        );
+    }
     func.set_terminator(fast_inner_body, Terminator::Jump(fast_inner_header));
 
-    clone_exit_pure_instructions(func, candidate.inner_exit, fast_exit, &mut lane_zero);
-    clone_exit_pure_instructions(func, candidate.inner_exit, fast_exit, &mut lane_one_map);
-    func.append_inst(
-        fast_exit,
-        InstKind::Store {
-            ptr: map_value(candidate.store_ptr, &lane_zero),
-            value: fast_accumulator_zero,
-        },
-        None,
-    );
-    func.append_inst(
-        fast_exit,
-        InstKind::Store {
-            ptr: map_value(candidate.store_ptr, &lane_one_map),
-            value: fast_accumulator_one,
-        },
-        None,
-    );
+    for values in &mut lane_values {
+        clone_exit_pure_instructions(func, candidate.inner_exit, fast_exit, values);
+    }
+    // Preserve original outer-iteration store order. The legality proof covers
+    // every earlier store against every load moved before it by lane jamming.
+    for (values, accumulator) in lane_values.iter().zip(&fast_accumulators) {
+        func.append_inst(
+            fast_exit,
+            InstKind::Store {
+                ptr: map_value(candidate.store_ptr, values),
+                value: *accumulator,
+            },
+            None,
+        );
+    }
     let fast_outer_next = func
         .append_inst(
             fast_exit,
             InstKind::Binary {
                 op: BinaryOp::Iadd,
                 lhs: fast_outer,
-                rhs: two,
+                rhs: factor_value,
             },
             Some(Type::I32),
         )
@@ -643,6 +986,9 @@ fn canonical_less_than_bound(
     natural_loop: &NaturalLoop,
     induction: ValueId,
 ) -> Option<ValueId> {
+    if func.values.get(induction.0)?.ty != Type::I32 {
+        return None;
+    }
     let Terminator::Branch {
         cond,
         then_target,
@@ -657,11 +1003,12 @@ fn canonical_less_than_bound(
     let InstKind::Icmp { op, lhs, rhs } = defining_inst(func, *cond)? else {
         return None;
     };
-    match (*op, *lhs == induction, *rhs == induction) {
-        (CmpOp::Lt, true, false) => Some(*rhs),
-        (CmpOp::Gt, false, true) => Some(*lhs),
-        _ => None,
-    }
+    let bound = match (*op, *lhs == induction, *rhs == induction) {
+        (CmpOp::Lt, true, false) => *rhs,
+        (CmpOp::Gt, false, true) => *lhs,
+        _ => return None,
+    };
+    (func.values.get(bound.0)?.ty == Type::I32).then_some(bound)
 }
 
 fn loop_inside_target(func: &Function, natural_loop: &NaturalLoop) -> Option<BlockId> {
@@ -683,35 +1030,59 @@ fn loop_inside_target(func: &Function, natural_loop: &NaturalLoop) -> Option<Blo
     }
 }
 
+/// Fast headers are rebuilt rather than cloned. Accept only the phis and the
+/// exact branch condition that the transform reconstructs; even a resultless
+/// call whose value was folded away must keep the loop on the original path.
+fn has_only_phi_and_branch_condition(func: &Function, block: BlockId) -> bool {
+    let Some(Terminator::Branch { cond, .. }) = func.blocks[block.0].terminator.as_ref() else {
+        return false;
+    };
+    func.blocks[block.0]
+        .insts
+        .iter()
+        .all(|inst| match &inst.kind {
+            InstKind::Nop | InstKind::Phi { .. } => true,
+            InstKind::Icmp { .. } => inst.result == Some(*cond),
+            _ => false,
+        })
+}
+
 fn is_pure_setup_block(func: &Function, block: BlockId) -> bool {
-    func.blocks[block.0].insts.iter().all(|inst| {
-        matches!(
-            inst.kind,
-            InstKind::Nop
-                | InstKind::Unary { .. }
-                | InstKind::Binary { .. }
-                | InstKind::Icmp { .. }
-                | InstKind::Fcmp { .. }
-                | InstKind::Cast { .. }
-                | InstKind::Gep { .. }
-        )
-    })
+    func.blocks[block.0]
+        .insts
+        .iter()
+        .all(|inst| is_reorderable_pure_kind(&inst.kind, false))
 }
 
 fn is_pure_reduction_block(func: &Function, block: BlockId) -> bool {
-    func.blocks[block.0].insts.iter().all(|inst| {
-        matches!(
-            inst.kind,
-            InstKind::Nop
-                | InstKind::Load { .. }
-                | InstKind::Unary { .. }
-                | InstKind::Binary { .. }
-                | InstKind::Icmp { .. }
-                | InstKind::Fcmp { .. }
-                | InstKind::Cast { .. }
-                | InstKind::Gep { .. }
-        )
-    })
+    func.blocks[block.0]
+        .insts
+        .iter()
+        .all(|inst| is_reorderable_pure_kind(&inst.kind, true))
+}
+
+fn is_reorderable_pure_kind(kind: &InstKind, allow_load: bool) -> bool {
+    match kind {
+        InstKind::Nop
+        | InstKind::Unary { .. }
+        | InstKind::Icmp { .. }
+        | InstKind::Fcmp { .. }
+        | InstKind::Cast { .. }
+        | InstKind::Gep { .. } => true,
+        // Defined IR memory accesses stay within their complete typed object;
+        // invalid/out-of-object accesses are undefined rather than observable
+        // exceptions. Under that contract a proven non-aliasing load may move
+        // across the lane-zero store. The IR has no volatile/atomic loads.
+        InstKind::Load { .. } => allow_load,
+        InstKind::Binary { op, .. } => {
+            !matches!(op, BinaryOp::Idiv | BinaryOp::Imod | BinaryOp::Fdiv)
+        }
+        InstKind::Phi { .. }
+        | InstKind::Alloca { .. }
+        | InstKind::Store { .. }
+        | InstKind::MemZero { .. }
+        | InstKind::Call { .. } => false,
+    }
 }
 
 fn has_only_one_store_side_effect(func: &Function, block: BlockId) -> bool {
@@ -719,10 +1090,20 @@ fn has_only_one_store_side_effect(func: &Function, block: BlockId) -> bool {
     for inst in &func.blocks[block.0].insts {
         match inst.kind {
             InstKind::Store { .. } => stores += 1,
-            InstKind::Call { .. } | InstKind::MemZero { .. } | InstKind::Load { .. } => {
-                return false;
-            }
-            _ => {}
+            InstKind::Nop
+            | InstKind::Unary { .. }
+            | InstKind::Icmp { .. }
+            | InstKind::Fcmp { .. }
+            | InstKind::Cast { .. }
+            | InstKind::Gep { .. } => {}
+            InstKind::Binary { op, .. }
+                if !matches!(op, BinaryOp::Idiv | BinaryOp::Imod | BinaryOp::Fdiv) => {}
+            InstKind::Phi { .. }
+            | InstKind::Alloca { .. }
+            | InstKind::Load { .. }
+            | InstKind::Binary { .. }
+            | InstKind::Call { .. }
+            | InstKind::MemZero { .. } => return false,
         }
     }
     stores == 1
@@ -731,49 +1112,383 @@ fn has_only_one_store_side_effect(func: &Function, block: BlockId) -> bool {
 fn proves_lane_independence(
     func: &Function,
     store_ptr: ValueId,
+    store_value: ValueId,
     outer_induction: ValueId,
     inner_body: BlockId,
+    factor: usize,
 ) -> bool {
-    let Some((store_global, store_final_index)) = global_and_final_index(func, store_ptr) else {
-        return false;
-    };
-    if store_final_index != outer_induction {
+    if !matches!(factor, 2 | 4) {
         return false;
     }
+    let mut budget = MemoryProofBudget::default();
+    let Some(store_ty) = func.values.get(store_value.0).map(|value| &value.ty) else {
+        return false;
+    };
+    let Some(store) = analyze_global_memory_access(func, store_ptr, store_ty, &mut budget) else {
+        return false;
+    };
+    if store.terminal_index != outer_induction {
+        return false;
+    }
+
+    let mut loads = Vec::new();
     for inst in &func.blocks[inner_body.0].insts {
         let InstKind::Load { ptr } = inst.kind else {
             continue;
         };
-        let Some((load_global, load_final_index)) = global_and_final_index(func, ptr) else {
+        let Some(result) = inst.result else {
             return false;
         };
-        if load_global == store_global && load_final_index != outer_induction {
+        let Some(load_ty) = func.values.get(result.0).map(|value| &value.ty) else {
             return false;
+        };
+        let Some(load) = analyze_global_memory_access(func, ptr, load_ty, &mut budget) else {
+            return false;
+        };
+        if load.global == store.global && load.terminal_index != outer_induction {
+            return false;
+        }
+        loads.push(load);
+    }
+
+    // Stores stay in original lane order. For every store that originally
+    // preceded a later lane, prove NoAlias against every load from each such
+    // lane before allowing those loads to move ahead of the store.
+    for store_lane in 0..factor - 1 {
+        for load_lane in store_lane + 1..factor {
+            for load in &loads {
+                if load.global != store.global {
+                    // Distinct global symbols denote distinct complete objects.
+                    // Spelling is ordinary identity, never classification.
+                    continue;
+                }
+                if !same_global_lane_store_load_no_alias(&store, store_lane, load, load_lane)
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+            }
         }
     }
     true
 }
 
-fn global_and_final_index(func: &Function, ptr: ValueId) -> Option<(String, ValueId)> {
-    let InstKind::Gep { base, indices } = defining_inst(func, ptr)? else {
+#[derive(Default)]
+struct MemoryProofBudget {
+    type_nodes: usize,
+    work: usize,
+}
+
+impl MemoryProofBudget {
+    fn spend_type_node(&mut self) -> Option<()> {
+        self.type_nodes = self.type_nodes.saturating_add(1);
+        (self.type_nodes <= MAX_MEMORY_TYPE_NODES).then_some(())
+    }
+
+    fn spend_work(&mut self, amount: usize) -> Option<()> {
+        self.work = self.work.saturating_add(amount);
+        (self.work <= MAX_MEMORY_PROOF_WORK).then_some(())
+    }
+}
+
+struct GlobalMemoryAccess {
+    global: String,
+    constant_offset: i64,
+    prefix_strides: Vec<i64>,
+    terminal_index: ValueId,
+    terminal_stride: i64,
+    width: i64,
+}
+
+/// Describes the complete nested GEP chain in the byte-address model used by
+/// code generation. The access itself is the terminal one-index GEP; earlier
+/// constant indices become a checked byte offset and every other prefix index
+/// contributes an independent unknown coefficient.
+fn analyze_global_memory_access(
+    func: &Function,
+    ptr: ValueId,
+    access_ty: &Type,
+    budget: &mut MemoryProofBudget,
+) -> Option<GlobalMemoryAccess> {
+    budget.spend_work(1)?;
+    let Type::Ptr(pointee) = &func.values.get(ptr.0)?.ty else {
         return None;
     };
-    let [final_index] = indices.as_slice() else {
+    if !types_equal_checked(pointee, access_ty, budget)? {
         return None;
-    };
-    let mut root = *base;
+    }
+    let width = checked_type_size(access_ty, budget)?;
+    if width <= 0 {
+        return None;
+    }
+
+    let mut current = ptr;
+    let mut chain_depth = 0usize;
+    let mut index_count = 0usize;
+    let mut constant_offset = 0i64;
+    let mut prefix_strides = Vec::new();
+    let mut terminal = None;
+
     loop {
-        match &func.value(root).kind {
-            ValueKind::Global(name) => return Some((name.clone(), *final_index)),
+        chain_depth = chain_depth.checked_add(1)?;
+        if chain_depth > MAX_MEMORY_GEP_CHAIN_DEPTH {
+            return None;
+        }
+        budget.spend_work(1)?;
+
+        let InstKind::Gep { base, indices } = defining_inst(func, current)? else {
+            return None;
+        };
+        if !matches!(func.values.get(current.0)?.ty, Type::Ptr(_))
+            || !matches!(func.values.get(base.0)?.ty, Type::Ptr(_))
+            || indices.is_empty()
+        {
+            return None;
+        }
+        index_count = index_count.checked_add(indices.len())?;
+        if index_count > MAX_MEMORY_GEP_INDICES {
+            return None;
+        }
+        budget.spend_work(indices.len())?;
+        if !indices.iter().all(|index| {
+            matches!(
+                func.values.get(index.0).map(|value| &value.ty),
+                Some(Type::I32)
+            )
+        }) {
+            return None;
+        }
+        let strides = typed_gep_byte_strides(func, *base, current, indices.len(), budget)?;
+
+        if terminal.is_none() {
+            let [index] = indices.as_slice() else {
+                return None;
+            };
+            terminal = Some((*index, strides[0]));
+        } else {
+            for (index, stride) in indices.iter().copied().zip(strides) {
+                if let Some(value) = constant_i32_index(func, index) {
+                    let byte_offset = i64::from(value).checked_mul(stride)?;
+                    constant_offset = constant_offset.checked_add(byte_offset)?;
+                } else {
+                    prefix_strides.push(stride);
+                }
+            }
+        }
+
+        current = *base;
+        match &func.values.get(current.0)?.kind {
+            ValueKind::Global(name) => {
+                budget.spend_work(1)?;
+                let (terminal_index, terminal_stride) = terminal?;
+                return Some(GlobalMemoryAccess {
+                    global: name.clone(),
+                    constant_offset,
+                    prefix_strides,
+                    terminal_index,
+                    terminal_stride,
+                    width,
+                });
+            }
             ValueKind::Inst(_, _) => {
-                let InstKind::Gep { base, .. } = defining_inst(func, root)? else {
+                if !matches!(defining_inst(func, current), Some(InstKind::Gep { .. })) {
                     return None;
-                };
-                root = *base;
+                }
             }
             ValueKind::Param | ValueKind::Const(_) => return None,
         }
     }
+}
+
+fn typed_gep_byte_strides(
+    func: &Function,
+    base: ValueId,
+    result: ValueId,
+    index_count: usize,
+    budget: &mut MemoryProofBudget,
+) -> Option<Vec<i64>> {
+    let Type::Ptr(_) = &func.values.get(base.0)?.ty else {
+        return None;
+    };
+    let Type::Ptr(result_pointee) = &func.values.get(result.0)?.ty else {
+        return None;
+    };
+    if index_count == 1 {
+        return Some(vec![checked_type_size(result_pointee, budget)?.max(1)]);
+    }
+
+    let mut current_ty = &func.values.get(base.0)?.ty;
+    let mut strides = Vec::with_capacity(index_count);
+    for _ in 0..index_count {
+        current_ty = match current_ty {
+            Type::Ptr(inner) => inner,
+            Type::Array { elem, .. } => elem,
+            Type::Void | Type::I1 | Type::I32 | Type::F32 => return None,
+        };
+        strides.push(checked_type_size(current_ty, budget)?.max(1));
+    }
+    Some(strides)
+}
+
+fn constant_i32_index(func: &Function, value: ValueId) -> Option<i32> {
+    match func.values.get(value.0).map(|value| &value.kind) {
+        Some(ValueKind::Const(crate::ir::Const::Int(value))) => Some(*value),
+        Some(ValueKind::Const(crate::ir::Const::Zero(Type::I32))) => Some(0),
+        _ => None,
+    }
+}
+
+fn types_equal_checked(
+    mut lhs: &Type,
+    mut rhs: &Type,
+    budget: &mut MemoryProofBudget,
+) -> Option<bool> {
+    loop {
+        budget.spend_type_node()?;
+        budget.spend_work(1)?;
+        match (lhs, rhs) {
+            (Type::Void, Type::Void)
+            | (Type::I1, Type::I1)
+            | (Type::I32, Type::I32)
+            | (Type::F32, Type::F32) => return Some(true),
+            (Type::Ptr(lhs_inner), Type::Ptr(rhs_inner)) => {
+                lhs = lhs_inner;
+                rhs = rhs_inner;
+            }
+            (
+                Type::Array {
+                    elem: lhs_elem,
+                    len: lhs_len,
+                },
+                Type::Array {
+                    elem: rhs_elem,
+                    len: rhs_len,
+                },
+            ) if lhs_len == rhs_len => {
+                lhs = lhs_elem;
+                rhs = rhs_elem;
+            }
+            _ => return Some(false),
+        }
+    }
+}
+
+fn checked_type_size(ty: &Type, budget: &mut MemoryProofBudget) -> Option<i64> {
+    let mut current = ty;
+    let mut elements = 1i64;
+    loop {
+        budget.spend_type_node()?;
+        budget.spend_work(1)?;
+        match current {
+            Type::Void => return Some(0),
+            Type::I1 | Type::I32 | Type::F32 => {
+                return elements
+                    .checked_mul(4)
+                    .filter(|size| *size <= i64::from(i32::MAX));
+            }
+            Type::Ptr(_) => {
+                return elements
+                    .checked_mul(8)
+                    .filter(|size| *size <= i64::from(i32::MAX));
+            }
+            Type::Array { elem, len } => {
+                let len = i64::try_from(*len).ok()?;
+                elements = elements
+                    .checked_mul(len)
+                    .filter(|size| *size <= i64::from(i32::MAX))?;
+                current = elem;
+            }
+        }
+    }
+}
+
+/// For a store in lane `s` and a later load in lane `l` on the same global,
+/// their byte-address difference is
+///
+/// `C + sum(prefix coefficients) + outer * (load stride - store stride)`,
+///
+/// where `C` includes `l * load_stride - s * store_stride`. Prefix SSA
+/// identities are deliberately ignored: every nonconstant prefix index is an
+/// independent arbitrary integer, so the possible differences are
+/// conservatively represented by one congruence class.
+fn same_global_lane_store_load_no_alias(
+    store: &GlobalMemoryAccess,
+    store_lane: usize,
+    load: &GlobalMemoryAccess,
+    load_lane: usize,
+) -> Option<bool> {
+    let store_lane = i64::try_from(store_lane).ok()?;
+    let load_lane = i64::try_from(load_lane).ok()?;
+    let store_lane_offset = store.terminal_stride.checked_mul(store_lane)?;
+    let load_lane_offset = load.terminal_stride.checked_mul(load_lane)?;
+    let constant = load
+        .constant_offset
+        .checked_sub(store.constant_offset)?
+        .checked_add(load_lane_offset)?
+        .checked_sub(store_lane_offset)?;
+    let terminal_difference = load.terminal_stride.checked_sub(store.terminal_stride)?;
+
+    // Machine address arithmetic is modulo 2^64. Include that modulus as a
+    // generator so an overlap reachable only through pointer wrap is also
+    // treated as possible, rather than relying on an implicit in-bounds rule.
+    let mut coefficient_gcd = 1u128 << 64;
+    for coefficient in store
+        .prefix_strides
+        .iter()
+        .chain(&load.prefix_strides)
+        .copied()
+        .chain(std::iter::once(terminal_difference))
+    {
+        coefficient_gcd =
+            nonnegative_gcd_u128(coefficient_gcd, u128::from(coefficient.unsigned_abs()));
+    }
+
+    let low = load.width.checked_sub(1)?.checked_neg()?;
+    let high = store.width.checked_sub(1)?;
+    Some(!interval_contains_congruent_modulo(
+        low,
+        high,
+        constant,
+        coefficient_gcd,
+    )?)
+}
+
+fn nonnegative_gcd_u128(mut lhs: u128, mut rhs: u128) -> u128 {
+    while rhs != 0 {
+        let remainder = lhs % rhs;
+        lhs = rhs;
+        rhs = remainder;
+    }
+    lhs
+}
+
+fn signed_residue(value: i64, modulus: u128) -> u128 {
+    debug_assert!(modulus > 0);
+    if value >= 0 {
+        (value as u128) % modulus
+    } else {
+        let magnitude = u128::from(value.unsigned_abs()) % modulus;
+        if magnitude == 0 {
+            0
+        } else {
+            modulus - magnitude
+        }
+    }
+}
+
+fn interval_contains_congruent_modulo(
+    low: i64,
+    high: i64,
+    value: i64,
+    modulus: u128,
+) -> Option<bool> {
+    debug_assert!(low <= high);
+    debug_assert!(modulus > 0);
+    let residue = signed_residue(value, modulus);
+    let low_residue = signed_residue(low, modulus);
+    let delta = (residue + modulus - low_residue) % modulus;
+    let interval_length = u128::from(high.checked_sub(low)?.unsigned_abs());
+    Some(delta <= interval_length)
 }
 
 fn value_mappable_from_blocks(

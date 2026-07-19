@@ -55,6 +55,16 @@ pub struct PassOptions {
 }
 
 pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptions) {
+    run_pipeline_with_reduction_jam_factor(module, opt_level, options, 2);
+}
+
+pub fn run_pipeline_with_reduction_jam_factor(
+    module: &mut Module,
+    opt_level: OptLevel,
+    options: PassOptions,
+    max_reduction_jam_factor: usize,
+) {
+    assert!(matches!(max_reduction_jam_factor, 2 | 4));
     // 所有优化 pass 都在这里排队，方便统一调整执行顺序。
     let mut pipeline = PassPipeline::new();
     match opt_level {
@@ -88,7 +98,7 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(LicmPass::new());
             pipeline.add(InvariantLoadForwardPass::new());
             pipeline.add(DcePass::new());
-            pipeline.add(ReductionJamPass::new());
+            pipeline.add(ReductionJamPass::new(max_reduction_jam_factor));
             pipeline.add(CsePass::new());
             pipeline.add(LocalForwardPass::new());
             pipeline.add(InvariantLoadForwardPass::new());
