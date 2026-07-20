@@ -16,16 +16,13 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 .iter()
                 .all(|arg| arg.is_pointer || arg.ty != Type::F32);
         if all_integer_register_args {
-            // load_value uses a0 as its scratch/result register, so fill the ABI
-            // registers backwards and leave a0 until last.
+            // Call operands are excluded from a2-a7 allocation, so filling ABI
+            // registers backwards cannot overwrite a later operand source.
             for idx in (0..args.len()).rev() {
                 let IrArgLocation::IntReg(reg_idx) = locations[idx] else {
                     unreachable!();
                 };
-                self.load_value(args[idx]);
-                if reg_idx != 0 {
-                    self.body.push_str(&format!("  mv a{}, a0\n", reg_idx));
-                }
+                self.load_value_into(args[idx], &format!("a{}", reg_idx));
             }
             self.body.push_str(&format!("  call {}\n", name));
             return sig.ret;

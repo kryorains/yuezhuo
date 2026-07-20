@@ -908,9 +908,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             return;
         }
 
-        self.load_value(value);
+        let source = self.load_or_assigned(value, "a0");
         if remainder {
-            self.body.push_str("  mv t2, a0\n");
+            self.body.push_str(&format!("  mv t2, {}\n", source));
         }
 
         let abs_divisor = divisor.unsigned_abs();
@@ -918,12 +918,16 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         if abs_divisor.is_power_of_two() {
             let shift = abs_divisor.trailing_zeros();
             if shift == 1 {
-                self.body
-                    .push_str("  srliw t0, a0, 31\n  addw t0, a0, t0\n  sraiw t0, t0, 1\n");
+                self.body.push_str(&format!(
+                    "  srliw t0, {}, 31\n  addw t0, {}, t0\n  sraiw t0, t0, 1\n",
+                    source, source
+                ));
             } else {
                 self.body.push_str(&format!(
-                    "  sraiw t0, a0, 31\n  srliw t0, t0, {}\n  addw t0, a0, t0\n  sraiw t0, t0, {}\n",
+                    "  sraiw t0, {}, 31\n  srliw t0, t0, {}\n  addw t0, {}, t0\n  sraiw t0, t0, {}\n",
+                    source,
                     32 - shift,
+                    source,
                     shift
                 ));
             }
@@ -932,11 +936,11 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             // lowering needs the high half of a signed 32x32 product.
             let magic = signed_magic_positive(abs_divisor);
             self.body.push_str(&format!(
-                "  li t0, {}\n  mul t0, a0, t0\n  srai t0, t0, 32\n",
-                magic.multiplier
+                "  li t0, {}\n  mul t0, {}, t0\n  srai t0, t0, 32\n",
+                magic.multiplier, source
             ));
             if magic.add_dividend {
-                self.body.push_str("  addw t0, t0, a0\n");
+                self.body.push_str(&format!("  addw t0, t0, {}\n", source));
             }
             if magic.shift != 0 {
                 self.body

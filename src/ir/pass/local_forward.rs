@@ -50,13 +50,20 @@ fn forward_function(func: &mut Function) {
     for _ in 0..iteration_limit {
         let dse_changed = dse_enabled && eliminate_redundant_writebacks(func);
         let mut replacements = ValueReplacements::new();
-        let load_entries = dse_enabled
-            .then(|| {
+        let pointer_roots = dse_enabled.then(|| {
+            func.values
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| typed_scalar_pointer_root(func, ValueId(idx)))
+                .collect::<Vec<_>>()
+        });
+        let load_entries = pointer_roots
+            .as_ref()
+            .and_then(|pointer_roots| {
                 let cfg = ControlFlowGraph::new(func);
                 let dom = Dominators::new(func, &cfg);
-                available_load_entries(func, &cfg, &dom)
+                available_load_entries(func, &cfg, &dom, pointer_roots)
             })
-            .flatten()
             .unwrap_or_else(|| vec![HashMap::new(); func.blocks.len()]);
 
         for (block_idx, block) in func.blocks.iter().enumerate() {
@@ -69,11 +76,19 @@ fn forward_function(func: &mut Function) {
                 match &inst.kind {
                     InstKind::Nop | InstKind::Alloca { .. } => {}
                     InstKind::Store { ptr, value } => {
-                        // Any store may alias a previous general load. Scalar
-                        // alloca forwarding remains precise, while redundant
-                        // load forwarding restarts after the clobber.
-                        known_loads.clear();
                         let ptr = resolve(*ptr, &replacements);
+                        if known_loads.len() <= MAX_EDGE_LOADS {
+                            known_loads.retain(|load_ptr, _| {
+                                pointers_proven_disjoint(
+                                    func,
+                                    pointer_roots.as_deref().unwrap_or(&[]),
+                                    *load_ptr,
+                                    ptr,
+                                )
+                            });
+                        } else {
+                            known_loads.clear();
+                        }
                         let value = resolve(*value, &replacements);
                         if tracked_pointer(func, ptr) {
                             known_memory.insert(ptr, value);
@@ -137,6 +152,7 @@ fn available_load_entries(
     func: &Function,
     cfg: &ControlFlowGraph,
     dom: &Dominators,
+    pointer_roots: &[Option<TypedScalarRoot>],
 ) -> Option<Vec<HashMap<ValueId, ValueId>>> {
     let mut entries = vec![HashMap::new(); func.blocks.len()];
     let mut exits = vec![HashMap::new(); func.blocks.len()];
@@ -156,7 +172,7 @@ fn available_load_entries(
                 entry.clear();
             }
             let mut exit = entry.clone();
-            transfer_load_state(func, block_idx, &mut exit, &mut work)?;
+            transfer_load_state(func, block_idx, &mut exit, pointer_roots, &mut work)?;
             if exit.len() > MAX_EDGE_LOADS {
                 exit.clear();
             }
@@ -194,6 +210,7 @@ fn transfer_load_state(
     func: &Function,
     block_idx: usize,
     state: &mut HashMap<ValueId, ValueId>,
+    pointer_roots: &[Option<TypedScalarRoot>],
     work: &mut usize,
 ) -> Option<()> {
     for inst in &func.blocks.get(block_idx)?.insts {
@@ -211,9 +228,17 @@ fn transfer_load_state(
                     }
                 }
             }
-            InstKind::Store { .. } | InstKind::Call { .. } | InstKind::MemZero { .. } => {
-                state.clear();
+            InstKind::Store { ptr, .. } => {
+                *work = work.checked_add(state.len())?;
+                if *work > MAX_LOAD_DATAFLOW_WORK || state.len() > MAX_EDGE_LOADS {
+                    state.clear();
+                } else {
+                    state.retain(|load_ptr, _| {
+                        pointers_proven_disjoint(func, pointer_roots, *load_ptr, *ptr)
+                    });
+                }
             }
+            InstKind::Call { .. } | InstKind::MemZero { .. } => state.clear(),
             _ => {}
         }
     }
@@ -368,6 +393,39 @@ fn typed_scalar_pointer_root(func: &Function, mut ptr: ValueId) -> Option<TypedS
         }
     }
     None
+}
+
+fn pointers_proven_disjoint(
+    func: &Function,
+    roots: &[Option<TypedScalarRoot>],
+    lhs: ValueId,
+    rhs: ValueId,
+) -> bool {
+    let (Some(lhs), Some(rhs)) = (
+        roots.get(lhs.0).copied().flatten(),
+        roots.get(rhs.0).copied().flatten(),
+    ) else {
+        return false;
+    };
+    if lhs.root == rhs.root {
+        return false;
+    }
+    is_alloca_root(func, lhs.root) || is_alloca_root(func, rhs.root)
+}
+
+fn is_alloca_root(func: &Function, root: ValueId) -> bool {
+    let Some(value) = func.values.get(root.0) else {
+        return false;
+    };
+    let ValueKind::Inst(block, inst_idx) = value.kind else {
+        return false;
+    };
+    func.blocks
+        .get(block.0)
+        .and_then(|owner| owner.insts.get(inst_idx))
+        .is_some_and(|inst| {
+            inst.result == Some(root) && matches!(inst.kind, InstKind::Alloca { .. })
+        })
 }
 
 fn within_budget(func: &Function) -> bool {

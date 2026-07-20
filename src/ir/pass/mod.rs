@@ -110,7 +110,7 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(DcePass::new());
             pipeline.add(RepeatReductionPass::new());
             if options.enable_simple_loop_unroll {
-                pipeline.add(SimpleLoopUnrollPass::new());
+                pipeline.add(SimpleLoopUnrollPass::new(max_reduction_jam_factor));
             }
             pipeline.add(InstCombinePass::new());
             pipeline.add(ConstFoldPass::new());

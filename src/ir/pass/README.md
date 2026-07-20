@@ -178,12 +178,12 @@ O1 在首轮及标量提升/常量特化后的中间清理阶段，仅保护 `Lo
 
 - 遇到 `store ptr, value` 时，记录 `ptr -> value`。
 - 遇到后续 `load ptr` 时，如果类型一致，就把 load 的结果替换成已知的 `value`；同一基本块内、没有 intervening clobber 的相同指针重复 load 也会复用第一次结果。
-- 遇到任意可能别名的 `store`、`call` 或 `memzero` 时，清空通用 load 记录；本地标量 `alloca` 的 store-to-load 转发仍保持精确。
+- 遇到 `call`、`memzero` 或可能别名的 `store` 时清空相应 load 记录；typed scalar pointer 若有一侧来自当前函数新建的 `alloca`、另一侧来自不同对象根，则按普通 C 对象生命周期证明不别名并保留 load。参数或全局不可能预先指向尚未存在的 callee-local allocation；无法追溯完整根时仍清空。本地标量 `alloca` 的 store-to-load 转发保持精确。
 - 对 exact SSA pointer 的重复 load，pass 还在 CFG 上计算前驱 OUT 状态的交集；只有每条进入路径都携带同一个、类型一致的支配 load 且路径内没有 clobber 时才跨块复用。状态项、迭代次数和总 transfer work 均有固定预算，超限回退块内逻辑。
 
 同一 pass 还执行严格局部的冗余回写 DSE：若 `v = load p` 之后出现精确相同 SSA 指针上的 `store p, v`，并且中间没有 `call`、`memzero` 或写入其它值的 `store`，则把最终 store 改成 `Nop`。中间的 `store q, v` 只有在 `p/q` 都能通过单索引、结果类型一致的 typed GEP 链追溯到同一对象根、访问相同四字节标量类型时才允许保留；此时两地址之差必为四字节倍数，等宽访问只能完全相同或互不重叠，写入相同值不会破坏原值。任何未知 provenance、部分重叠风险或写入其它 SSA 值的 store 都会保守终止候选，不依据名称、类型维度或跨块关系。
 
-跨块转发只处理 exact pointer 的 must-available 事实，不做 may-alias 猜测，也不越过任何未知写入。新 DSE 与数据流使用固定的块、值、指令、pointer-chain、状态、transfer-work 和 fixed-point 预算；超出 DSE 尺寸预算时原有转发仍会执行。两种局部变换运行到共同不动点；若在迭代预算内未收敛则恢复函数入口快照，因此重复运行幂等，发生改写后执行 verifier。
+跨块转发只处理 exact pointer 的 must-available 事实；对写入只使用上述 callee-local allocation NoAlias，不猜测参数间、全局间或同一对象内的 may-alias。新 DSE 与数据流使用固定的块、值、指令、pointer-chain、状态、transfer-work 和 fixed-point 预算；超出 DSE 尺寸预算时原有转发仍会执行。两种局部变换运行到共同不动点；若在迭代预算内未收敛则恢复函数入口快照，因此重复运行幂等，发生改写后执行 verifier。
 
 ### `CsePass` (`cse.rs`)
 
@@ -237,9 +237,9 @@ RISC-V64 的 `max_reduction_jam_factor >= 4` 成本入口还允许严格 canonic
 
 ### `SimpleLoopUnrollPass` (`simple_loop_unroll.rs`)
 
-对严格规范化的单基本块计数循环做二倍展开。
+对严格规范化的单基本块计数循环做目标成本驱动的二倍或四倍展开。
 
-候选循环通过共享的 `LoopInfo` 与 i32 归纳变量分析取得结构和计数器信息，但仍严格要求从 0 开始、每轮加 1、以动态上界做有符号小于比较，并且只有一个活跃 loop phi；含调用、`memzero`、侧出口或额外循环状态时不会展开。pass 在原标量循环前插入两路快速循环，原循环继续处理负数、小于 2 的次数和奇数尾项。两份循环体严格按迭代顺序克隆，因此即使相邻迭代的内存访问互相别名，也不会改变可观察顺序。代码增长受单循环和单函数预算限制。当前 AArch64 后端会让展开后的中间值产生额外栈流量，因此目标收益门控暂时只在 x86-64 和 RISC-V64 启用该 pass。
+候选循环通过共享的 `LoopInfo` 与 i32 归纳变量分析取得结构和计数器信息，但仍严格要求从 0 开始、每轮加 1、以动态上界做有符号小于比较，并且只有一个活跃 loop phi；含调用、`memzero`、侧出口或额外循环状态时不会展开。x86-64 使用二路快速循环；RV64GC 缺少 AArch64 的 scaled-address、整数 `madd` 和条件执行能力，因而只对不超过 8 条活跃指令且不含整数除法/余数或浮点除法的小循环使用四路快速循环，以减少循环控制和重复地址更新；更大或单指令机器成本很高的循环不展开，避免代码/I-cache 与寄存器压力抵消收益。原标量循环继续处理负数、小于 factor 的次数和 0..factor-1 动态尾项。各 lane 严格按迭代顺序克隆，因此即使相邻迭代的内存访问互相别名或先前 lane 发生同步 trap，也不会改变可观察顺序。clone、最终 block/value/instruction 和 checked-arithmetic 均有单循环及单函数预算；函数级 decision mark 让预算拒绝和成功变换都不会在重复运行时继续累积另一批候选。当前 AArch64 后端会让展开后的中间值产生额外栈流量，因此目标收益门控不启用该 pass。
 
 ### `DcePass` (`dce.rs`)
 

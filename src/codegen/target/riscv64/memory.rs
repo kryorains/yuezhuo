@@ -247,7 +247,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_value_into(&mut self, value: ValueId, destination: &str) {
-        debug_assert!(matches!(destination, "a0" | "a1"));
+        debug_assert!(matches!(
+            destination,
+            "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7"
+        ));
 
         if let Some(reg) = self.regalloc.reg(value) {
             self.body
