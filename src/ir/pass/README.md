@@ -33,23 +33,30 @@
   18. `CsePass`
   19. `LicmPass`
   20. `InvariantLoadForwardPass`
-  21. `DcePass`
-  22. `ReductionJamPass`
-  23. `CsePass`
-  24. `LocalForwardPass`
-  25. `InvariantLoadForwardPass`
-  26. `DcePass`
-  27. `RepeatReductionPass`
-  28. `SimpleLoopUnrollPass`（按目标收益门控）
-  29. `InstCombinePass`
-  30. `ConstFoldPass`
-  31. `GepInductionPass`
-  32. `PointerRecurrenceCoalescePass`
-  33. `DcePass`
-  34. `SimplifyCfgPass`
-  35. `DcePass`
+  21. `InstCombinePass`
+  22. `ConstFoldPass`
+  23. `DcePass`
+  24. `ReductionJamPass`
+  25. `CsePass`
+  26. `LocalForwardPass`
+  27. `CsePass`
+  28. `InvariantLoadForwardPass`
+  29. `DcePass`
+  30. `RepeatReductionPass`
+  31. `SimpleLoopUnrollPass`（按目标收益门控）
+  32. `InstCombinePass`
+  33. `ConstFoldPass`
+  34. `GepInductionPass`
+  35. `PointerRecurrenceCoalescePass`
+  36. `DcePass`
+  37. `CsePass`
+  38. `LocalForwardPass`
+  39. `CsePass`
+  40. `DcePass`
+  41. `SimplifyCfgPass`
+  42. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量特化、CFG 内联、常量折叠、CSE、LICM 等主动优化。O1 开头先传播只读全局常量，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；第一次标量提升会暴露 `NoMemory` 调用摘要，随后第二轮全局标量局部化和提升可安全跨纯调用保留状态。常量实参特化后立即折叠常量、清理 CFG 和死代码，再按统一成本模型执行递归及普通纯标量 CFG 内联。O1 末尾由 InstCombine 和 ConstFold 规范化局部整数算术，再执行通用 GEP 地址归纳强度削弱与 pointer recurrence 合并；第一轮 DCE 专门清掉被合并的 pointer `phi -> GEP -> phi` SCC，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。地址变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量特化、CFG 内联、常量折叠、CSE、LICM 等主动优化。O1 开头先传播只读全局常量，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；第一次标量提升会暴露 `NoMemory` 调用摘要，随后第二轮全局标量局部化和提升可安全跨纯调用保留状态。常量实参特化后立即折叠常量、清理 CFG 和死代码，再按统一成本模型执行递归及普通纯标量 CFG 内联。ReductionJam 前的一轮 InstCombine/ConstFold 会先把可证明安全的整除观察规范成无陷阱位运算，使严格 conditional reduction 可进入通用 loop matcher。O1 末尾再由 InstCombine 和 ConstFold 规范化局部整数算术，并执行通用 GEP 地址归纳强度削弱与 pointer recurrence 合并；第一轮 DCE 专门清掉被合并的 pointer `phi -> GEP -> phi` SCC，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。地址变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
 
 ## Pass 列表
 
@@ -165,17 +172,18 @@ O1 在首轮及标量提升/常量特化后的中间清理阶段，仅保护 `Lo
 
 ### `LocalForwardPass` (`local_forward.rs`)
 
-基本块内的局部前向传播。
+有预算的局部及 CFG available-load 前向传播。
 
-它在单个基本块内跟踪“某个可跟踪指针当前存着哪个值”：
+它在基本块内跟踪“某个可跟踪指针当前存着哪个值”：
 
 - 遇到 `store ptr, value` 时，记录 `ptr -> value`。
 - 遇到后续 `load ptr` 时，如果类型一致，就把 load 的结果替换成已知的 `value`；同一基本块内、没有 intervening clobber 的相同指针重复 load 也会复用第一次结果。
 - 遇到任意可能别名的 `store`、`call` 或 `memzero` 时，清空通用 load 记录；本地标量 `alloca` 的 store-to-load 转发仍保持精确。
+- 对 exact SSA pointer 的重复 load，pass 还在 CFG 上计算前驱 OUT 状态的交集；只有每条进入路径都携带同一个、类型一致的支配 load 且路径内没有 clobber 时才跨块复用。状态项、迭代次数和总 transfer work 均有固定预算，超限回退块内逻辑。
 
 同一 pass 还执行严格局部的冗余回写 DSE：若 `v = load p` 之后出现精确相同 SSA 指针上的 `store p, v`，并且中间没有 `call`、`memzero` 或写入其它值的 `store`，则把最终 store 改成 `Nop`。中间的 `store q, v` 只有在 `p/q` 都能通过单索引、结果类型一致的 typed GEP 链追溯到同一对象根、访问相同四字节标量类型时才允许保留；此时两地址之差必为四字节倍数，等宽访问只能完全相同或互不重叠，写入相同值不会破坏原值。任何未知 provenance、部分重叠风险或写入其它 SSA 值的 store 都会保守终止候选，不依据名称、类型维度或跨块关系。
 
-跨块读写关系继续交给更强的 SSA 与 alias 分析，局部 load CSE 不越过任何未知写入。新 DSE 使用固定的块、值、指令、pointer-chain 和 fixed-point 预算；超出 DSE 尺寸预算时原有转发仍会执行。两种局部变换运行到共同不动点；若在迭代预算内未收敛则恢复函数入口快照，因此重复运行幂等，发生改写后执行 verifier。
+跨块转发只处理 exact pointer 的 must-available 事实，不做 may-alias 猜测，也不越过任何未知写入。新 DSE 与数据流使用固定的块、值、指令、pointer-chain、状态、transfer-work 和 fixed-point 预算；超出 DSE 尺寸预算时原有转发仍会执行。两种局部变换运行到共同不动点；若在迭代预算内未收敛则恢复函数入口快照，因此重复运行幂等，发生改写后执行 verifier。
 
 ### `CsePass` (`cse.rs`)
 
@@ -189,15 +197,15 @@ O1 在首轮及标量提升/常量特化后的中间清理阶段，仅保护 `Lo
 
 转发支配当前位置且来自只读对象的重复加载。
 
-它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
+它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名；若某个指针形参在全部调用点都来自已知全局对象集合，则它还可与集合之外的唯一全局对象证明不别名。直接指向同一唯一全局 symbol 的不同 SSA 地址值会按对象 identity 统一 load key。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
 
 ### `GepInductionPass` (`gep_induction.rs`)
 
-对自然循环中的仿射 GEP 地址构造 pointer recurrence。候选循环必须有唯一 entering predecessor、唯一 latch 和专用 preheader；pass 从 header 的直接 i32 induction、GEP 类型大小、use-def 和支配关系证明地址为 `base + induction * constant stride + invariant offset`。循环内的 nested GEP chain 可以包含任意循环不变量索引，数组长度和正负 induction step 都不参与形状匹配。
+对自然循环中的仿射 GEP 地址构造 pointer recurrence。候选循环必须有唯一 entering predecessor、唯一 latch 和专用 preheader；pass 从 header 的直接 i32 induction、低深度 `iv ± constant` AddRec、GEP 类型大小、use-def 和支配关系证明地址为 `base + induction * constant stride + invariant offset`。derived index 只有在精确 trip endpoint（包含最终失败 header）或完整 modulo-`2^32` 同余类极值证明 signed 加减不回绕时才接受。循环内的 nested GEP chain 可以包含任意循环不变量索引，数组长度和正负 induction step 都不参与形状匹配。
 
 变换在 preheader 用 induction 初值重建完整地址，在 header 插入 pointer phi，在 latch 用单索引常量 GEP 生成固定步长 next pointer。只有全部使用都位于循环内且新 phi 支配普通使用及 phi edge 时才替换原 GEP；仅作为其它已选 nested GEP base 的中间地址不会单独生成死 recurrence。常量 trip-count 分析或 header signed comparison 还必须证明 i32 induction 在每个回边不 wrap，否则 sign extension 后的重算地址与 pointer increment 并不等价，pass 会拒绝。
 
-pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有 live-out 地址时，header pointer state 仍只沿唯一 backedge 更新。含调用的循环不会变换，因为跨调用 pointer recurrence 会占用 callee-saved 寄存器或增加 spill，而地址重算通常不是这类循环的主要成本。动态大步长、循环内变化的 offset、非 GEP 派生链、不能在 preheader 使用的定义、不可整除为最终 pointee stride 的步长及类型大小溢出都保守保留。变换后立即运行 verifier，重复执行不会再次匹配生成的 pointer recurrence。
+pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有 live-out 地址时，header pointer state 仍只沿唯一 backedge 更新。含调用的循环不会变换，因为跨调用 pointer recurrence 会占用 callee-saved 寄存器或增加 spill，而地址重算通常不是这类循环的主要成本。动态大步长、超过一层的标量 affine DAG、循环内变化的 offset、非 GEP 派生链、不能在 preheader 重建的定义、不可整除为最终 pointee stride 的步长及类型大小溢出都保守保留。函数指令、候选数、GEP chain/index、预计新增 values 和最终函数 values 均有硬预算，避免多个共享前缀候选产生二次方 IR 膨胀。变换后立即运行 verifier，重复执行不会再次匹配生成的 pointer recurrence。
 
 ### `PointerRecurrenceCoalescePass` (`pointer_recurrence_coalesce.rs`)
 
@@ -207,11 +215,13 @@ secondary pointer 除唯一 backedge update 外，只能作为循环内、pointe
 
 ### `ReductionJamPass` (`reduction_jam.rs`)
 
-对严格规范化的双层自然循环执行二路或四路 reduction unroll-and-jam。候选外层与内层都必须是从非负常量初值开始、步长为 1 的直接 signed `<` 归纳循环；内层只有一个 i32 accumulator、一个无副作用基本块，外层每轮唯一副作用必须是归约结果 store。已建立的二路路径要求外层初值模 2 对齐；只有额外合法性与收益证明全部成功才选择模 4 对齐的四路路径。fast header 直接形成 `iv+1..iv+factor-1` 并以最后一 lane 的 signed `< bound` 为动态 guard，taken exit 才形成 `iv+factor`：对齐性质证明每次失败的 header 求值也不回绕，成功 guard 又证明 next 不回绕且确实至少剩余 factor 次。完整原循环从 fast phi 接手所有动态 tail，四路时仍可执行 0..3 次，绝不假设输入次数能整除 factor；已知常量 trip count 小于 4 时保留二路，小于 2 时不增加 fast path。
+对严格规范化的双层自然循环执行二路或四路 reduction unroll-and-jam。候选外层与内层都必须是从非负常量初值开始、步长为 1 的直接 signed `<` 归纳循环；既有路径要求内层只有一个 i32 accumulator、一个无副作用基本块，外层每轮唯一副作用必须是归约结果 store。已建立的二路路径要求外层初值模 2 对齐；只有额外合法性与收益证明全部成功才选择模 4 对齐的四路路径。fast header 直接形成 `iv+1..iv+factor-1` 并以最后一 lane 的 signed `< bound` 为动态 guard，taken exit 才形成 `iv+factor`：对齐性质证明每次失败的 header 求值也不回绕，成功 guard 又证明 next 不回绕且确实至少剩余 factor 次。完整原循环从 fast phi 接手所有动态 tail，四路时仍可执行 0..3 次，绝不假设输入次数能整除 factor；已知常量 trip count 小于 4 时保留二路，小于 2 时不增加 fast path。
+
+RISC-V64 的 `max_reduction_jam_factor >= 4` 成本入口还允许严格 canonical conditional reduction 使用保守 factor 2：inner header 恰有共享 i32 induction 和 accumulator 两个 phi，循环 taken edge 进入纯 condition block；condition 按原方向分支到纯、无 trapping arithmetic 的 update block 或直接进入 merge；update 也只进入 merge；merge 恰有选择 old/new accumulator 的 phi 和原 induction next，再以唯一 backedge 返回 header。变换为两个 lane 建立独立 accumulator，按 lane 原指令顺序分别执行完整 diamond，绝不把 update-only load 提升到分支前；共享 inner induction 每两个 outer lane 只更新一次。fast guard 失败后原循环处理动态 0..1 tail。额外 phi、live-out、side exit、call/store/memzero、整数除法/余数、浮点除法及非唯一 final store 均拒绝。x86-64/AArch64 的 `max_factor == 2` 入口不启用该形状。
 
 内存证明采用普通 SysY/C 有效对象前提：实际执行的 load/store 必须位于其完整 typed allocation 内，越界或无效指针访问属于未定义行为；IR 也没有 volatile/atomic memory access。因此证明为不别名的有效 load 可以跨更早 lane 的 store 重排。证明不按符号拼写分类或匹配固定维度，只把完整全局 symbol identity 当作对象身份：所有访问都要有预算地展开完整 nested GEP 链，检查每层 base/result 指针类型、i32 index、load/store 与 pointee 的精确类型和 checked byte size；不同全局对象随后直接不别名。store 以及需要证明的同对象 load，其 terminal 必须是以外层 induction 为唯一索引的 GEP；prefix 常量折入 byte offset，所有非常量 prefix 即使 SSA 相同也分别视为任意整数。对 store lane `s` 与后续 load lane `l` 的地址差，常量项为 `C = load_offset - store_offset + l*load_stride - s*store_stride`，再以所有 prefix stride、terminal stride 差和机器地址模数 `2^64` 的绝对 gcd `G` 构造同余类；只有该同余类在可能重叠区间 `[-(load_width-1), store_width-1]` 内无解才证明不别名，因此即使只通过 64 位地址回绕才能重叠也会保守拒绝。四路会逐对证明 lane-0/1/2 store 与所有后续 lane load；store 本身仍按原 lane 顺序发出，因而不需要 store-store 不别名。
 
-四路当前只在 RISC-V64 目标成本模型中启用；x86-64/AArch64 继续使用既有二路路径。具体收益门控只读取目标无关 SSA/类型成本，不按后端指令形状、名称、维度或输入分类：必须至少有一条可由后续 CSE/LocalForward 共享的 lane-invariant load stream；最多 4 个活跃 accumulator；pointer-state 上限 12，包括每 lane 的输出地址/索引状态、一个共享对象 base，以及按 lane-dependence（outer index 或 accumulator）放大为四份的不同 load pointer stream；accumulator、pointer state、按 lane 复制的 setup 标量、直接供 inner body 使用的外部 invariant 标量、outer/inner induction、两个动态 bound 和共享 load 结果的保守峰值不超过 20；每 lane clone map 总项数不超过 96，预计结果寄存器候选不超过 96，投影后的整函数 key 数、GEP 结果 type nodes、操作数总量及 key×operand 工作量也必须落在保守 CSE 预算内；变换后值数量及 `block×value` 上界还必须保证不会跨过 RISC-V 精确 regalloc 的候选/工作量悬崖；新增 fast-path 指令不超过 128 且不超过原五块区域的 5 倍，加入 5 个块和保守估计的新常量/结果后也必须仍在函数级 block/value/instruction 预算内。二路 fallback 同样执行变换后硬预算检查。所有计数使用 checked arithmetic；任一上限、模 4 nowrap 或六组跨 lane 内存证明失败都无条件回退已有二路路径，不会关闭原收益。未知根、类型或算术溢出、超出 GEP chain/index/type/work 预算、循环内 store/call/memzero、多 latch/exit、额外 phi、非专用 preheader 或代码预算超限都会拒绝整个变换。fast path 会重建而非克隆 loop header，因此两个 header 还必须只包含 Nop、phi 和 terminator 使用的精确 i32 比较；inner exit 除唯一 store 外也只允许可直接 remap 的纯标量/GEP 指令。setup、inner body 和 exit 中会跨 store 重排的整数除法/余数及浮点除法全部拒绝，避免后续 lane trap 提前。lane cloning 统一使用 factor-sized value-map vector；克隆后重新运行 CSE、块内 load forwarding、只读 load forwarding 和 DCE，再由 verifier 检查，jam mark 保证重复运行幂等。
+四路当前只在 RISC-V64 目标成本模型中启用；x86-64/AArch64 继续使用既有二路路径。具体收益门控只读取目标无关 SSA/类型成本，不按后端指令形状、名称、维度或输入分类：必须至少有一条可由后续 CSE/LocalForward 共享的 lane-invariant load stream；最多 4 个活跃 accumulator；pointer-state 上限 12，包括每 lane 的输出地址/索引状态、一个共享对象 base，以及按 lane-dependence（outer index 或 accumulator）放大为四份的不同 load pointer stream；accumulator、pointer state、按 lane 复制的 setup 标量、直接供 inner body 使用的外部 invariant 标量、outer/inner induction、两个动态 bound 和共享 load 结果的保守峰值不超过 20；每 lane clone map 总项数不超过 96，预计结果寄存器候选不超过 96，投影后的整函数 key 数、GEP 结果 type nodes、操作数总量及 key×operand 工作量也必须落在保守 CSE 预算内；变换后值数量及 `block×value` 上界还必须保证不会跨过 RISC-V 精确 regalloc 的候选/工作量悬崖；新增 fast-path 指令不超过 128 且不超过原五块区域的 5 倍，加入 5 个块和保守估计的新常量/结果后也必须仍在函数级 block/value/instruction 预算内。conditional factor 2 另设更紧的 10 pointer、64 map、64 register candidate、20 peak-live、96 code-growth、原区域 4 倍和新增 10 blocks 上限；condition block 中每轮必执行的 load 只有在两 lane remap 后 pointer identity 精确相同时才直接复用 lane 0 结果，update-only load 始终保留在原分支并按两份 pointer/result pressure 计费。二路 fallback 同样执行变换后硬预算检查。所有计数使用 checked arithmetic；任一上限、模 4 nowrap 或六组跨 lane 内存证明失败都无条件回退已有二路路径，不会关闭原收益。未知根、类型或算术溢出、超出 GEP chain/index/type/work 预算、循环内 store/call/memzero、多 latch/exit、额外 phi、非专用 preheader 或代码预算超限都会拒绝整个变换。fast path 会重建而非克隆 loop header，因此两个 header 还必须只包含 Nop、phi 和 terminator 使用的精确 i32 比较；inner exit 除唯一 store 外也只允许可直接 remap 的纯标量/GEP 指令。setup、inner body 和 exit 中会跨 store 重排的整数除法/余数及浮点除法全部拒绝，避免后续 lane trap 提前。lane cloning 统一使用 factor-sized value-map vector；克隆后重新运行 CSE、块内 load forwarding、只读 load forwarding 和 DCE，再由 verifier 检查，jam mark 保证重复运行幂等。
 
 ### `RepeatReductionPass` (`repeat_reduction.rs`)
 

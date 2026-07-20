@@ -18,6 +18,8 @@ const MAX_GEP_INDICES: usize = 128;
 const MAX_AFFINE_DEPTH: usize = 32;
 const MAX_PROOF_WORK: usize = 262_144;
 const MAX_TYPE_NODES: usize = 4096;
+const MAX_GLOBALS: usize = 8192;
+const MAX_GLOBAL_NAME_BYTES: usize = 1_048_576;
 
 /// Reuses one pointer recurrence for streams separated by a proven constant
 /// distance. The analysis depends only on typed SSA, natural loops, and checked
@@ -33,8 +35,27 @@ impl PointerRecurrenceCoalescePass {
 
 impl ModulePass for PointerRecurrenceCoalescePass {
     fn run(&mut self, module: &mut Module) {
+        let global_name_bytes = module
+            .globals
+            .iter()
+            .try_fold(0usize, |total, global| total.checked_add(global.name.len()));
+        let unique_globals = if module.globals.len() <= MAX_GLOBALS
+            && global_name_bytes.is_some_and(|bytes| bytes <= MAX_GLOBAL_NAME_BYTES)
+        {
+            let mut global_counts = HashMap::<String, usize>::new();
+            for global in &module.globals {
+                *global_counts.entry(global.name.clone()).or_default() += 1;
+            }
+            global_counts
+                .into_iter()
+                .enumerate()
+                .filter_map(|(identity, (name, count))| (count == 1).then_some((name, identity)))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
         for func in &mut module.funcs {
-            coalesce_function(func);
+            coalesce_function(func, &unique_globals);
         }
     }
 }
@@ -49,8 +70,14 @@ struct PointerRecurrence {
     step: i32,
 }
 
+#[derive(PartialEq, Eq)]
+enum AddressRoot {
+    Value(ValueId),
+    Global(usize),
+}
+
 struct AddressExpr {
-    root: ValueId,
+    root: AddressRoot,
     dynamic_terms: HashMap<ValueId, i64>,
     constant_offset: i64,
 }
@@ -111,8 +138,8 @@ impl ProofBudget {
     }
 }
 
-fn coalesce_function(func: &mut Function) {
-    let Some(plans) = plan_coalescing(func) else {
+fn coalesce_function(func: &mut Function, unique_globals: &HashMap<String, usize>) {
+    let Some(plans) = plan_coalescing(func, unique_globals) else {
         return;
     };
     if plans.is_empty() {
@@ -130,7 +157,10 @@ fn coalesce_function(func: &mut Function) {
 
 /// Returns `None` for any function-wide size or proof-budget failure. No IR is
 /// mutated until every selected replacement has been proved and budgeted.
-fn plan_coalescing(func: &Function) -> Option<Vec<CoalescePlan>> {
+fn plan_coalescing(
+    func: &Function,
+    unique_globals: &HashMap<String, usize>,
+) -> Option<Vec<CoalescePlan>> {
     if func.blocks.len() > MAX_FUNCTION_BLOCKS || func.values.len() > MAX_FUNCTION_VALUES {
         return None;
     }
@@ -187,9 +217,13 @@ fn plan_coalescing(func: &Function) -> Option<Vec<CoalescePlan>> {
 
     let mut addresses = HashMap::new();
     for recurrence in &recurrences {
-        if let Some(address) =
-            analyze_initial_address(func, recurrence.initial, &induction_ranges, &mut budget)
-        {
+        if let Some(address) = analyze_initial_address(
+            func,
+            recurrence.initial,
+            &induction_ranges,
+            unique_globals,
+            &mut budget,
+        ) {
             addresses.insert(recurrence.phi, address);
         }
     }
@@ -362,6 +396,7 @@ fn analyze_initial_address(
     func: &Function,
     initial: ValueId,
     induction_ranges: &HashMap<ValueId, (i64, i64)>,
+    unique_globals: &HashMap<String, usize>,
     budget: &mut ProofBudget,
 ) -> Option<AddressExpr> {
     let mut current = initial;
@@ -398,11 +433,18 @@ fn analyze_initial_address(
         current = *base;
     }
 
-    if !matches!(func.values.get(current.0)?.ty, Type::Ptr(_)) {
+    let root_value = func.values.get(current.0)?;
+    if !matches!(root_value.ty, Type::Ptr(_)) {
         return None;
     }
+    let root = match &root_value.kind {
+        ValueKind::Global(name) if unique_globals.contains_key(name) => {
+            AddressRoot::Global(*unique_globals.get(name)?)
+        }
+        _ => AddressRoot::Value(current),
+    };
     Some(AddressExpr {
-        root: current,
+        root,
         dynamic_terms,
         constant_offset,
     })
@@ -715,8 +757,7 @@ fn apply_plans(func: &mut Function, plans: &[CoalescePlan]) {
     }
 
     // Replace only the proved memory-pointer observations. Keeping each old
-    // phi/update edge intact leaves a dead SCC for the immediately following
-    // mark-and-sweep DCE, rather than rewriting an unproved use category.
+    // phi/update edge intact leaves a dead SCC for mark-and-sweep DCE.
     for block in &mut func.blocks {
         for inst in &mut block.insts {
             match &mut inst.kind {

@@ -99,10 +99,13 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(CsePass::new());
             pipeline.add(LicmPass::new());
             pipeline.add(InvariantLoadForwardPass::new());
+            pipeline.add(InstCombinePass::divisibility_only());
+            pipeline.add(ConstFoldPass::new());
             pipeline.add(DcePass::new());
             pipeline.add(ReductionJamPass::new(max_reduction_jam_factor));
             pipeline.add(CsePass::new());
             pipeline.add(LocalForwardPass::new());
+            pipeline.add(CsePass::new());
             pipeline.add(InvariantLoadForwardPass::new());
             pipeline.add(DcePass::new());
             pipeline.add(RepeatReductionPass::new());
@@ -116,6 +119,10 @@ pub fn run_pipeline_with_reduction_jam_factor(
             // this preserves the existing simple-unroll profitability gate.
             pipeline.add(GepInductionPass::new());
             pipeline.add(PointerRecurrenceCoalescePass::new());
+            pipeline.add(DcePass::new());
+            pipeline.add(CsePass::new());
+            pipeline.add(LocalForwardPass::new());
+            pipeline.add(CsePass::new());
             pipeline.add(DcePass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());

@@ -1,3 +1,4 @@
+use super::dominators::{ControlFlowGraph, Dominators};
 use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
 use crate::ir::{Function, InstKind, Module, Type, ValueId, ValueKind};
@@ -14,6 +15,8 @@ const MAX_POINTER_PROOF_WORK: usize = 1_048_576;
 const MAX_OPERAND_EDGES: usize = 262_144;
 const MAX_CONST_NODES: usize = 262_144;
 const MAX_CONST_STRING_BYTES: usize = 1_048_576;
+const MAX_EDGE_LOADS: usize = 32;
+const MAX_LOAD_DATAFLOW_WORK: usize = 1_048_576;
 
 pub(super) struct LocalForwardPass;
 
@@ -47,11 +50,21 @@ fn forward_function(func: &mut Function) {
     for _ in 0..iteration_limit {
         let dse_changed = dse_enabled && eliminate_redundant_writebacks(func);
         let mut replacements = ValueReplacements::new();
+        let load_entries = dse_enabled
+            .then(|| {
+                let cfg = ControlFlowGraph::new(func);
+                let dom = Dominators::new(func, &cfg);
+                available_load_entries(func, &cfg, &dom)
+            })
+            .flatten()
+            .unwrap_or_else(|| vec![HashMap::new(); func.blocks.len()]);
 
-        for block in &func.blocks {
-            // 只在单个基本块内追踪内存状态，跨块交给更强的 SSA/phi 逻辑处理。
+        for (block_idx, block) in func.blocks.iter().enumerate() {
+            // Stores-to-alloca remain block-local. Exact typed loads may enter
+            // from every predecessor only when available-expression
+            // intersection proves the same dominating load on all paths.
             let mut known_memory = HashMap::<ValueId, ValueId>::new();
-            let mut known_loads = HashMap::<ValueId, ValueId>::new();
+            let mut known_loads = load_entries.get(block_idx).cloned().unwrap_or_default();
             for inst in &block.insts {
                 match &inst.kind {
                     InstKind::Nop | InstKind::Alloca { .. } => {}
@@ -120,10 +133,98 @@ fn forward_function(func: &mut Function) {
     }
 }
 
+fn available_load_entries(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dom: &Dominators,
+) -> Option<Vec<HashMap<ValueId, ValueId>>> {
+    let mut entries = vec![HashMap::new(); func.blocks.len()];
+    let mut exits = vec![HashMap::new(); func.blocks.len()];
+    let mut work = 0usize;
+    for _ in 0..MAX_FIXED_POINT_ITERATIONS {
+        let mut changed = false;
+        for block_idx in 0..func.blocks.len() {
+            if !dom.is_reachable(crate::ir::BlockId(block_idx)) {
+                continue;
+            }
+            let mut entry = if block_idx == func.entry.0 {
+                HashMap::new()
+            } else {
+                intersect_load_states(cfg.preds.get(block_idx)?, &exits)
+            };
+            if entry.len() > MAX_EDGE_LOADS {
+                entry.clear();
+            }
+            let mut exit = entry.clone();
+            transfer_load_state(func, block_idx, &mut exit, &mut work)?;
+            if exit.len() > MAX_EDGE_LOADS {
+                exit.clear();
+            }
+            if entries[block_idx] != entry || exits[block_idx] != exit {
+                entries[block_idx] = entry;
+                exits[block_idx] = exit;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Some(entries);
+        }
+    }
+    None
+}
+
+fn intersect_load_states(
+    predecessors: &[crate::ir::BlockId],
+    exits: &[HashMap<ValueId, ValueId>],
+) -> HashMap<ValueId, ValueId> {
+    let Some((first, rest)) = predecessors.split_first() else {
+        return HashMap::new();
+    };
+    let mut intersection = exits.get(first.0).cloned().unwrap_or_default();
+    for predecessor in rest {
+        let Some(state) = exits.get(predecessor.0) else {
+            return HashMap::new();
+        };
+        intersection.retain(|ptr, value| state.get(ptr) == Some(value));
+    }
+    intersection
+}
+
+fn transfer_load_state(
+    func: &Function,
+    block_idx: usize,
+    state: &mut HashMap<ValueId, ValueId>,
+    work: &mut usize,
+) -> Option<()> {
+    for inst in &func.blocks.get(block_idx)?.insts {
+        *work = work.checked_add(1)?;
+        if *work > MAX_LOAD_DATAFLOW_WORK {
+            return None;
+        }
+        match &inst.kind {
+            InstKind::Load { ptr } => {
+                let result = inst.result?;
+                match state.get(ptr).copied() {
+                    Some(previous) if func.value(previous).ty == func.value(result).ty => {}
+                    _ => {
+                        state.insert(*ptr, result);
+                    }
+                }
+            }
+            InstKind::Store { .. } | InstKind::Call { .. } | InstKind::MemZero { .. } => {
+                state.clear();
+            }
+            _ => {}
+        }
+    }
+    Some(())
+}
+
 /// Removes `store p, v` after `v = load p` in the same block when every
 /// intervening store also writes `v`. Exact pointer identity is required only
 /// for the store being removed; an intervening `store q, v` is harmless even
 /// when `q` aliases `p`.
+
 fn eliminate_redundant_writebacks(func: &mut Function) -> bool {
     let pointer_roots = func
         .values

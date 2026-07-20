@@ -19,6 +19,14 @@ const MAX_FACTOR_FOUR_CODE_GROWTH: usize = 128;
 const MAX_FACTOR_FOUR_GROWTH_MULTIPLIER: usize = 5;
 const MAX_FACTOR_FOUR_PEAK_LIVE_VALUES: usize = 20;
 const MAX_FACTOR_FOUR_CSE_WORK: usize = 4_194_304;
+const MAX_CONDITIONAL_INNER_INSTRUCTIONS: usize = 24;
+const MAX_CONDITIONAL_POINTER_VALUES: usize = 10;
+const MAX_CONDITIONAL_MAPPED_VALUES: usize = 64;
+const MAX_CONDITIONAL_REGISTER_CANDIDATES: usize = 64;
+const MAX_CONDITIONAL_CODE_GROWTH: usize = 96;
+const MAX_CONDITIONAL_GROWTH_MULTIPLIER: usize = 4;
+const MAX_CONDITIONAL_PEAK_LIVE_VALUES: usize = 20;
+const CONDITIONAL_ADDED_BLOCKS: usize = 10;
 const MAX_FUNCTION_BLOCKS: usize = 1024;
 const MAX_FUNCTION_VALUES: usize = 8192;
 const MAX_MEMORY_GEP_CHAIN_DEPTH: usize = 64;
@@ -27,16 +35,16 @@ const MAX_MEMORY_TYPE_NODES: usize = 1024;
 const MAX_MEMORY_PROOF_WORK: usize = 4096;
 const MAX_FUNCTION_INSTRUCTIONS: usize = 65_536;
 
-/// Processes two or four adjacent outer iterations in one scalar reduction.
+/// Processes adjacent outer iterations in one scalar reduction.
 ///
-/// This is deliberately narrower than a general loop interchange: it accepts a
-/// canonical two-level loop whose inner loop is a single pure reduction block
-/// and whose only outer-iteration side effect is one store. A target-independent
-/// pressure and growth bound may select four lanes; otherwise the established
-/// two-lane fast path remains. The complete original loop handles every dynamic
-/// tail. Memory independence is proved from global-object identity and a
-/// checked typed byte-congruence model of complete GEP chains, rather than from
-/// source names or fixed dimensions.
+/// The established path accepts a canonical two-level loop whose inner loop is
+/// a single pure reduction block and selects two or four lanes. RISC targets
+/// may additionally select a conservative two-lane conditional reduction whose
+/// original diamond and branch-only work are cloned per lane. In both cases the
+/// only outer-iteration side effect is one store and the complete original loop
+/// handles every dynamic tail. Memory independence is proved from global-object
+/// identity and a checked typed byte-congruence model of complete GEP chains,
+/// rather than from source names or fixed dimensions.
 pub(super) struct ReductionJamPass {
     max_factor: usize,
 }
@@ -77,6 +85,26 @@ struct JamCandidate {
     store_ptr: ValueId,
 }
 
+#[derive(Clone)]
+struct ConditionalJamCandidate {
+    outer_header: BlockId,
+    outer_preheader: BlockId,
+    outer_induction: InductionVariable,
+    outer_bound: ValueId,
+    inner_header: BlockId,
+    inner_preheader: BlockId,
+    condition: BlockId,
+    update: BlockId,
+    merge: BlockId,
+    inner_exit: BlockId,
+    inner_induction: InductionVariable,
+    inner_bound: ValueId,
+    accumulator: ValueId,
+    accumulator_initial: ValueId,
+    accumulator_next: ValueId,
+    store_ptr: ValueId,
+}
+
 #[cfg(test)]
 fn jam_one_nest(func: &mut Function) {
     jam_one_nest_with_factor(func, 2);
@@ -97,6 +125,15 @@ fn jam_one_nest_with_factor(func: &mut Function, max_factor: usize) {
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
     let loops = LoopInfo::new(&cfg, &dom).loops().to_vec();
+    // Conditional jamming is intentionally tied to the RISC profitability
+    // entry (`max_factor == 4`). Other targets retain their previous behavior.
+    if max_factor >= 4 {
+        if let Some(candidate) = find_conditional_candidate(func, &loops, &dom) {
+            apply_conditional_candidate(func, &candidate);
+            verify_jammed_function(func);
+            return;
+        }
+    }
     let Some(candidate) = find_candidate(func, &loops, &dom) else {
         return;
     };
@@ -104,6 +141,10 @@ fn jam_one_nest_with_factor(func: &mut Function, max_factor: usize) {
         return;
     };
     apply_candidate(func, &candidate, factor);
+    verify_jammed_function(func);
+}
+
+fn verify_jammed_function(func: &Function) {
     if let Err(errors) = func.verify() {
         panic!(
             "reduction unroll-and-jam produced invalid IR in {}: {:?}",
@@ -338,6 +379,276 @@ fn find_candidate(
     None
 }
 
+fn find_conditional_candidate(
+    func: &Function,
+    loops: &[NaturalLoop],
+    dom: &Dominators,
+) -> Option<ConditionalJamCandidate> {
+    let mut inner_loops = loops.iter().collect::<Vec<_>>();
+    inner_loops.sort_by_key(|natural_loop| natural_loop.blocks.len());
+    for inner in inner_loops {
+        let Some(merge) = inner.unique_latch() else {
+            continue;
+        };
+        let (Some(inner_preheader), Some(inner_exit)) =
+            (inner.dedicated_preheader, inner.unique_exit())
+        else {
+            continue;
+        };
+        if !matches!(
+            func.blocks[merge.0].terminator,
+            Some(Terminator::Jump(target)) if target == inner.header
+        ) || !matches!(
+            func.blocks[inner_preheader.0].terminator,
+            Some(Terminator::Jump(target)) if target == inner.header
+        ) || !has_only_phi_and_branch_condition(func, inner.header)
+            || !is_pure_setup_block(func, inner_preheader)
+            || executable_instruction_count(func, inner_preheader) > MAX_SETUP_INSTRUCTIONS
+        {
+            continue;
+        }
+        let Some(condition) = loop_inside_target(func, inner) else {
+            continue;
+        };
+        let Some(Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        }) = func.blocks[condition.0].terminator.as_ref()
+        else {
+            continue;
+        };
+        let update = match (*then_target == merge, *else_target == merge) {
+            (true, false) => *else_target,
+            (false, true) => *then_target,
+            _ => continue,
+        };
+        if inner.blocks != HashSet::from([inner.header, condition, update, merge])
+            || !matches!(
+                func.blocks[update.0].terminator,
+                Some(Terminator::Jump(target)) if target == merge
+            )
+            || !is_pure_reduction_block(func, condition)
+            || !is_pure_reduction_block(func, update)
+            || executable_instruction_count(func, condition)
+                .checked_add(executable_instruction_count(func, update))
+                .is_none_or(|instructions| instructions > MAX_CONDITIONAL_INNER_INSTRUCTIONS)
+        {
+            continue;
+        }
+        let inner_phis = phi_results(func, inner.header);
+        if inner_phis.len() != 2 {
+            continue;
+        }
+        let Some(inner_induction) = inner_phis.iter().find_map(|phi| {
+            analyze_i32_induction(func, inner, *phi).filter(|induction| induction.step == 1)
+        }) else {
+            continue;
+        };
+        let Some(accumulator) = inner_phis
+            .iter()
+            .copied()
+            .find(|phi| *phi != inner_induction.phi && func.value(*phi).ty == Type::I32)
+        else {
+            continue;
+        };
+        let Some((accumulator_initial, accumulator_next)) =
+            phi_pair(func, accumulator, inner_preheader, merge)
+        else {
+            continue;
+        };
+        let merge_phis = phi_results(func, merge);
+        if merge_phis.as_slice() != [accumulator_next] {
+            continue;
+        }
+        let Some((old_accumulator, updated_accumulator)) =
+            phi_pair(func, accumulator_next, condition, update)
+        else {
+            continue;
+        };
+        if old_accumulator != accumulator
+            || updated_accumulator == accumulator
+            || !matches!(
+                func.values.get(updated_accumulator.0).map(|value| &value.kind),
+                Some(ValueKind::Inst(owner, _)) if *owner == update
+            )
+            || func
+                .values
+                .get(updated_accumulator.0)
+                .map(|value| &value.ty)
+                != Some(&Type::I32)
+            || !has_exact_conditional_merge(func, merge, accumulator_next, inner_induction.next)
+        {
+            continue;
+        }
+        let Some(inner_bound) = canonical_less_than_bound(func, inner, inner_induction.phi) else {
+            continue;
+        };
+        let Some(outer) = loops
+            .iter()
+            .filter(|outer| {
+                outer.blocks.len() > inner.blocks.len()
+                    && inner
+                        .blocks
+                        .iter()
+                        .all(|block| outer.blocks.contains(block))
+                    && outer.blocks.contains(&inner_preheader)
+                    && outer.blocks.contains(&inner_exit)
+            })
+            .min_by_key(|outer| outer.blocks.len())
+        else {
+            continue;
+        };
+        let (Some(outer_preheader), Some(outer_latch)) =
+            (outer.dedicated_preheader, outer.unique_latch())
+        else {
+            continue;
+        };
+        if outer_latch != inner_exit
+            || outer.blocks
+                != HashSet::from([
+                    outer.header,
+                    inner_preheader,
+                    inner.header,
+                    condition,
+                    update,
+                    merge,
+                    inner_exit,
+                ])
+            || !matches!(
+                func.blocks[outer_preheader.0].terminator,
+                Some(Terminator::Jump(target)) if target == outer.header
+            )
+            || !matches!(
+                func.blocks[inner_exit.0].terminator,
+                Some(Terminator::Jump(target)) if target == outer.header
+            )
+            || !has_only_phi_and_branch_condition(func, outer.header)
+        {
+            continue;
+        }
+        let outer_phis = phi_results(func, outer.header);
+        if outer_phis.len() != 1 {
+            continue;
+        }
+        let Some(outer_induction) = analyze_i32_induction(func, outer, outer_phis[0])
+            .filter(|induction| induction.step == 1)
+        else {
+            continue;
+        };
+        let Some(outer_initial) = const_i32(func, outer_induction.initial) else {
+            continue;
+        };
+        if !(0..i32::MAX).contains(&outer_initial) || outer_initial & 1 != 0 {
+            continue;
+        }
+        let Some(outer_bound) = canonical_less_than_bound(func, outer, outer_induction.phi) else {
+            continue;
+        };
+        if analyze_const_i32_trip_count(func, outer, outer_induction).is_some_and(|count| count < 2)
+            || !value_available_at(func, dom, outer_bound, outer_preheader)
+            || !value_available_at(func, dom, inner_bound, outer_preheader)
+            || !value_available_at(func, dom, inner_induction.initial, outer_preheader)
+            || !value_mappable_from_blocks(
+                func,
+                dom,
+                accumulator_initial,
+                outer_preheader,
+                outer_induction.phi,
+                &[inner_preheader],
+            )
+            || loop_inside_target(func, outer) != Some(inner_preheader)
+            || !inner_results_have_no_extra_liveouts(func, inner, accumulator, inner_exit)
+        {
+            continue;
+        }
+
+        let stores = func.blocks[inner_exit.0]
+            .insts
+            .iter()
+            .filter_map(|inst| match inst.kind {
+                InstKind::Store { ptr, value } => Some((ptr, value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(store_ptr, store_value)] = stores.as_slice() else {
+            continue;
+        };
+        if *store_value != accumulator
+            || !has_only_one_store_side_effect(func, inner_exit)
+            || !value_mappable_from_blocks(
+                func,
+                dom,
+                *store_ptr,
+                outer_preheader,
+                outer_induction.phi,
+                &[inner_preheader, inner_exit],
+            )
+            || !proves_lane_independence_in_blocks(
+                func,
+                *store_ptr,
+                *store_value,
+                outer_induction.phi,
+                &[condition, update],
+                2,
+            )
+        {
+            continue;
+        }
+
+        let setup_results = block_results(func, inner_preheader);
+        let setup_mapped = HashSet::from([outer_induction.phi]);
+        let mut loop_mapped = setup_results.clone();
+        loop_mapped.extend([outer_induction.phi, inner_induction.phi, accumulator]);
+        let condition_results = block_results(func, condition);
+        let mut update_mapped = loop_mapped.clone();
+        update_mapped.extend(condition_results.iter().copied());
+        if !block_operands_cloneable(
+            func,
+            dom,
+            inner_preheader,
+            outer_preheader,
+            &setup_mapped,
+            false,
+        ) || !block_operands_cloneable(
+            func,
+            dom,
+            condition,
+            outer_preheader,
+            &loop_mapped,
+            false,
+        ) || !branch_condition_cloneable(func, dom, condition, outer_preheader, &update_mapped)
+            || !block_operands_cloneable(func, dom, update, outer_preheader, &update_mapped, false)
+            || !block_operands_cloneable(func, dom, inner_exit, outer_preheader, &loop_mapped, true)
+        {
+            continue;
+        }
+
+        let candidate = ConditionalJamCandidate {
+            outer_header: outer.header,
+            outer_preheader,
+            outer_induction,
+            outer_bound,
+            inner_header: inner.header,
+            inner_preheader,
+            condition,
+            update,
+            merge,
+            inner_exit,
+            inner_induction,
+            inner_bound,
+            accumulator,
+            accumulator_initial,
+            accumulator_next,
+            store_ptr: *store_ptr,
+        };
+        if conditional_factor_two_is_profitable(func, &candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn select_jam_factor(
     func: &Function,
     candidate: &JamCandidate,
@@ -352,7 +663,7 @@ fn select_jam_factor(
         return None;
     }
     let factor_two_cost = estimate_jam_cost(func, candidate, 2)?;
-    if !factor_is_within_hard_budgets(func, &factor_two_cost, 2) {
+    if !factor_is_within_hard_budgets(func, &factor_two_cost, 2, 5) {
         return None;
     }
     if max_factor < 4
@@ -405,7 +716,7 @@ fn factor_four_is_profitable(func: &Function, candidate: &JamCandidate) -> bool 
     else {
         return false;
     };
-    factor_is_within_hard_budgets(func, &cost, 4)
+    factor_is_within_hard_budgets(func, &cost, 4, 5)
         && cost.shared_load_streams > 0
         && cost.active_accumulators <= MAX_FACTOR_FOUR_ACTIVE_ACCUMULATORS
         && cost.pointer_values <= MAX_FACTOR_FOUR_POINTER_VALUES
@@ -502,7 +813,12 @@ fn bounded_type_nodes(mut ty: &Type) -> Option<usize> {
     }
 }
 
-fn factor_is_within_hard_budgets(func: &Function, cost: &JamCost, factor: usize) -> bool {
+fn factor_is_within_hard_budgets(
+    func: &Function,
+    cost: &JamCost,
+    factor: usize,
+    added_blocks: usize,
+) -> bool {
     let Some(function_instructions) = func
         .blocks
         .iter()
@@ -512,7 +828,7 @@ fn factor_is_within_hard_budgets(func: &Function, cost: &JamCost, factor: usize)
     };
     func.blocks
         .len()
-        .checked_add(5)
+        .checked_add(added_blocks)
         .is_some_and(|blocks| blocks <= MAX_FUNCTION_BLOCKS)
         && func
             .values
@@ -653,6 +969,200 @@ fn estimate_jam_cost(func: &Function, candidate: &JamCandidate, factor: usize) -
             .checked_mul(cloned_instructions)?
             .checked_add(factor.checked_mul(3)?)?
             .checked_add(4)?,
+        original_region,
+    })
+}
+
+fn conditional_factor_two_is_profitable(
+    func: &Function,
+    candidate: &ConditionalJamCandidate,
+) -> bool {
+    let Some(cost) = estimate_conditional_jam_cost(func, candidate) else {
+        return false;
+    };
+    let Some(relative_growth_budget) = cost
+        .original_region
+        .checked_mul(MAX_CONDITIONAL_GROWTH_MULTIPLIER)
+    else {
+        return false;
+    };
+    factor_is_within_hard_budgets(func, &cost, 2, CONDITIONAL_ADDED_BLOCKS)
+        && cost.active_accumulators == 2
+        && cost.pointer_values <= MAX_CONDITIONAL_POINTER_VALUES
+        && cost.mapped_values <= MAX_CONDITIONAL_MAPPED_VALUES
+        && cost.register_candidates <= MAX_CONDITIONAL_REGISTER_CANDIDATES
+        && cost.peak_live_values <= MAX_CONDITIONAL_PEAK_LIVE_VALUES
+        && cse_projection_within_budget(func, &cost)
+        && func
+            .values
+            .len()
+            .checked_add(cost.register_candidates)
+            .and_then(|values| values.checked_add(2))
+            .is_some_and(|values| {
+                values <= 512
+                    && func
+                        .blocks
+                        .len()
+                        .checked_add(CONDITIONAL_ADDED_BLOCKS)
+                        .and_then(|blocks| blocks.checked_mul(values))
+                        .is_some_and(|work| work <= 262_144)
+            })
+        && cost.code_growth <= MAX_CONDITIONAL_CODE_GROWTH
+        && cost.code_growth <= relative_growth_budget
+}
+
+fn estimate_conditional_jam_cost(
+    func: &Function,
+    candidate: &ConditionalJamCandidate,
+) -> Option<JamCost> {
+    let factor = 2usize;
+    let candidate_blocks = HashSet::from([
+        candidate.outer_header,
+        candidate.inner_preheader,
+        candidate.inner_header,
+        candidate.condition,
+        candidate.update,
+        candidate.merge,
+        candidate.inner_exit,
+    ]);
+    let mut lane_dependent = HashSet::from([candidate.outer_induction.phi, candidate.accumulator]);
+    let mut load_pointers = HashSet::new();
+    let mut unconditionally_loaded_pointers = HashSet::new();
+    let mut external_invariant_scalars = HashSet::new();
+    let mut setup_live_scalars = 0usize;
+    let mut condition_cross_edge_results = HashSet::new();
+    let mut condition_loads = 0usize;
+    let mut cloned_instructions = 0usize;
+    let mut cloned_results = 0usize;
+    let mut projected_cse_keys = 0usize;
+    let mut projected_cse_operands = 0usize;
+
+    for (block, is_setup, is_exit, count_external) in [
+        (candidate.inner_preheader, true, false, false),
+        (candidate.condition, false, false, true),
+        (candidate.update, false, false, true),
+        (candidate.inner_exit, false, true, false),
+    ] {
+        for inst in &func.blocks.get(block.0)?.insts {
+            if count_external {
+                for operand in instruction_operands(&inst.kind) {
+                    let value = func.values.get(operand.0)?;
+                    let external = matches!(value.kind, ValueKind::Param)
+                        || matches!(value.kind, ValueKind::Inst(owner, _) if !candidate_blocks.contains(&owner));
+                    if external && matches!(value.ty, Type::I1 | Type::I32 | Type::F32) {
+                        external_invariant_scalars.insert(operand);
+                    }
+                }
+            }
+            if let Some(key_operands) = projected_cse_key_operands(func, inst)? {
+                projected_cse_keys = projected_cse_keys.checked_add(factor)?;
+                projected_cse_operands = projected_cse_operands
+                    .checked_add(factor.checked_mul(key_operands.saturating_add(1))?)?;
+            }
+            if let InstKind::Load { ptr } = inst.kind {
+                load_pointers.insert(ptr);
+                if block == candidate.condition {
+                    condition_loads = condition_loads.checked_add(1)?;
+                    // Every taken inner iteration executes the condition block.
+                    // Loads found only in an update arm remain lane-local: the
+                    // earlier arm does not dominate the later arm, and sharing
+                    // them would require forbidden speculation.
+                    unconditionally_loaded_pointers.insert(ptr);
+                }
+            }
+            if let Some(result) = inst.result {
+                if block == candidate.update {
+                    for operand in instruction_operands(&inst.kind) {
+                        if matches!(
+                            func.values.get(operand.0)?.kind,
+                            ValueKind::Inst(owner, _) if owner == candidate.condition
+                        ) {
+                            condition_cross_edge_results.insert(operand);
+                        }
+                    }
+                }
+                if is_setup && !matches!(func.values.get(result.0)?.ty, Type::Ptr(_)) {
+                    setup_live_scalars = setup_live_scalars.checked_add(1)?;
+                }
+                if instruction_operands(&inst.kind)
+                    .iter()
+                    .any(|operand| lane_dependent.contains(operand))
+                {
+                    lane_dependent.insert(result);
+                }
+            }
+            if matches!(inst.kind, InstKind::Nop)
+                || (is_exit && matches!(inst.kind, InstKind::Store { .. }))
+            {
+                continue;
+            }
+            cloned_instructions = cloned_instructions.checked_add(1)?;
+            if inst.result.is_some() {
+                cloned_results = cloned_results.checked_add(1)?;
+            }
+        }
+    }
+
+    let inner_next = defining_inst(func, candidate.inner_induction.next)?;
+    if let Some(key_operands) = projected_cse_key_operands(
+        func,
+        &crate::ir::Inst {
+            result: Some(candidate.inner_induction.next),
+            kind: inner_next.clone(),
+        },
+    )? {
+        projected_cse_keys = projected_cse_keys.checked_add(1)?;
+        projected_cse_operands =
+            projected_cse_operands.checked_add(key_operands.saturating_add(1))?;
+    }
+
+    let mut shared_load_streams = 0usize;
+    let load_pointer_values = load_pointers.into_iter().try_fold(0usize, |total, ptr| {
+        let copies =
+            if lane_dependent.contains(&ptr) || !unconditionally_loaded_pointers.contains(&ptr) {
+                factor
+            } else {
+                shared_load_streams = shared_load_streams.checked_add(1)?;
+                1
+            };
+        total.checked_add(copies)
+    })?;
+    let original_region = candidate_blocks.iter().try_fold(0usize, |total, block| {
+        total.checked_add(executable_instruction_count(func, *block))
+    })?;
+    projected_cse_keys = projected_cse_keys.checked_add(4)?;
+    projected_cse_operands = projected_cse_operands.checked_add(12)?;
+    let pointer_values = factor.checked_add(1)?.checked_add(load_pointer_values)?;
+
+    Some(JamCost {
+        active_accumulators: factor,
+        pointer_values,
+        shared_load_streams,
+        setup_live_scalars,
+        // Each map contains cloned source results plus the outer index, shared
+        // inner index, lane accumulator, and conditional selector.
+        mapped_values: factor
+            .checked_mul(cloned_results.checked_add(4)?)?
+            // The lane-0 condition reuse table stores each load result and its
+            // remapped pointer; the last lane also retains inner.next.
+            .checked_add(condition_loads.checked_mul(2)?)?
+            .checked_add(1)?,
+        // Eleven generated result values cover both fast headers, selectors,
+        // the shared inner next value, and the fast outer next value.
+        register_candidates: factor.checked_mul(cloned_results)?.checked_add(11)?,
+        projected_cse_keys,
+        projected_cse_operands,
+        peak_live_values: factor
+            .checked_add(pointer_values)?
+            .checked_add(factor.checked_mul(setup_live_scalars)?)?
+            .checked_add(4usize.checked_add(shared_load_streams)?)?
+            .checked_add(external_invariant_scalars.len())?
+            .checked_add(factor.checked_mul(condition_cross_edge_results.len())?)?
+            // Keep one conservative branch-condition temporary per lane.
+            .checked_add(factor)?,
+        // Generated headers/selectors/stores/next values contribute thirteen
+        // instructions in addition to the twice-cloned source blocks.
+        code_growth: factor.checked_mul(cloned_instructions)?.checked_add(13)?,
         original_region,
     })
 }
@@ -835,6 +1345,264 @@ fn apply_candidate(func: &mut Function, candidate: &JamCandidate, factor: usize)
     func.mark_reduction_jammed();
 }
 
+fn apply_conditional_candidate(func: &mut Function, candidate: &ConditionalJamCandidate) {
+    const FACTOR: usize = 2;
+    let fast_header = func.add_block("conditional.reduction.jam.header");
+    let fast_setup = func.add_block("conditional.reduction.jam.setup");
+    let fast_inner_header = func.add_block("conditional.reduction.jam.inner");
+    let lane_blocks = (0..FACTOR)
+        .map(|lane| {
+            (
+                func.add_block(format!("conditional.reduction.jam.condition.{lane}")),
+                func.add_block(format!("conditional.reduction.jam.update.{lane}")),
+                func.add_block(format!("conditional.reduction.jam.merge.{lane}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let fast_exit = func.add_block("conditional.reduction.jam.exit");
+    let last_merge = lane_blocks.last().unwrap().2;
+
+    let fast_outer = func
+        .append_inst(
+            fast_header,
+            InstKind::Phi {
+                incomings: vec![
+                    (candidate.outer_preheader, candidate.outer_induction.initial),
+                    (fast_exit, candidate.outer_induction.initial),
+                ],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let one = get_or_add_i32_const(func, 1);
+    let two = get_or_add_i32_const(func, 2);
+    let lane_one_index = func
+        .append_inst(
+            fast_header,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: fast_outer,
+                rhs: one,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let group_condition = func
+        .append_inst(
+            fast_header,
+            InstKind::Icmp {
+                op: CmpOp::Lt,
+                lhs: lane_one_index,
+                rhs: candidate.outer_bound,
+            },
+            Some(Type::I1),
+        )
+        .unwrap();
+    func.set_terminator(
+        fast_header,
+        Terminator::Branch {
+            cond: group_condition,
+            then_target: fast_setup,
+            else_target: candidate.outer_header,
+        },
+    );
+
+    let mut lane_values = [fast_outer, lane_one_index]
+        .into_iter()
+        .map(|index| HashMap::from([(candidate.outer_induction.phi, index)]))
+        .collect::<Vec<_>>();
+    for values in &mut lane_values {
+        clone_pure_block(func, candidate.inner_preheader, fast_setup, values);
+    }
+    func.set_terminator(fast_setup, Terminator::Jump(fast_inner_header));
+
+    let inner_initial = map_value(candidate.inner_induction.initial, &lane_values[0]);
+    assert!(lane_values
+        .iter()
+        .all(|values| map_value(candidate.inner_induction.initial, values) == inner_initial));
+    let fast_inner = func
+        .append_inst(
+            fast_inner_header,
+            InstKind::Phi {
+                incomings: vec![(fast_setup, inner_initial), (last_merge, inner_initial)],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let mut fast_accumulators = Vec::with_capacity(FACTOR);
+    for values in &lane_values {
+        let initial = map_value(candidate.accumulator_initial, values);
+        let accumulator = func
+            .append_inst(
+                fast_inner_header,
+                InstKind::Phi {
+                    incomings: vec![(fast_setup, initial), (last_merge, initial)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        fast_accumulators.push(accumulator);
+    }
+    let inner_condition = func
+        .append_inst(
+            fast_inner_header,
+            InstKind::Icmp {
+                op: CmpOp::Lt,
+                lhs: fast_inner,
+                rhs: candidate.inner_bound,
+            },
+            Some(Type::I1),
+        )
+        .unwrap();
+    func.set_terminator(
+        fast_inner_header,
+        Terminator::Branch {
+            cond: inner_condition,
+            then_target: lane_blocks[0].0,
+            else_target: fast_exit,
+        },
+    );
+
+    let source_branch = func.blocks[candidate.condition.0]
+        .terminator
+        .clone()
+        .unwrap();
+    let selector_incomings = match defining_inst(func, candidate.accumulator_next).unwrap() {
+        InstKind::Phi { incomings } => incomings.clone(),
+        _ => unreachable!(),
+    };
+    let inner_next_kind = defining_inst(func, candidate.inner_induction.next)
+        .unwrap()
+        .clone();
+    let mut fast_inner_next = None;
+    for lane in 0..FACTOR {
+        let (condition_block, update_block, merge_block) = lane_blocks[lane];
+        let shared_condition_values = (lane > 0)
+            .then(|| conditional_shared_load_values(func, candidate.condition, &lane_values[0]));
+        let values = &mut lane_values[lane];
+        values.insert(candidate.inner_induction.phi, fast_inner);
+        values.insert(candidate.accumulator, fast_accumulators[lane]);
+        clone_conditional_condition_block(
+            func,
+            candidate.condition,
+            condition_block,
+            values,
+            shared_condition_values.as_ref(),
+        );
+
+        let Terminator::Branch {
+            cond,
+            then_target,
+            else_target,
+        } = &source_branch
+        else {
+            unreachable!();
+        };
+        let remap_target = |target: BlockId| {
+            if target == candidate.update {
+                update_block
+            } else if target == candidate.merge {
+                merge_block
+            } else {
+                unreachable!()
+            }
+        };
+        func.set_terminator(
+            condition_block,
+            Terminator::Branch {
+                cond: map_value(*cond, values),
+                then_target: remap_target(*then_target),
+                else_target: remap_target(*else_target),
+            },
+        );
+
+        clone_pure_block(func, candidate.update, update_block, values);
+        func.set_terminator(update_block, Terminator::Jump(merge_block));
+        let incomings = selector_incomings
+            .iter()
+            .map(|(pred, value)| {
+                let pred = if *pred == candidate.condition {
+                    condition_block
+                } else if *pred == candidate.update {
+                    update_block
+                } else {
+                    unreachable!()
+                };
+                (pred, map_value(*value, values))
+            })
+            .collect();
+        let selected = func
+            .append_inst(merge_block, InstKind::Phi { incomings }, Some(Type::I32))
+            .unwrap();
+        values.insert(candidate.accumulator_next, selected);
+
+        if lane + 1 == FACTOR {
+            let kind = remap_pure_kind(&inner_next_kind, values)
+                .expect("validated conditional induction update must be pure");
+            let next = func
+                .append_inst(merge_block, kind, Some(Type::I32))
+                .unwrap();
+            values.insert(candidate.inner_induction.next, next);
+            fast_inner_next = Some(next);
+        }
+        let next_target = if lane + 1 == FACTOR {
+            fast_inner_header
+        } else {
+            lane_blocks[lane + 1].0
+        };
+        func.set_terminator(merge_block, Terminator::Jump(next_target));
+    }
+
+    set_phi_backedge(func, fast_inner, last_merge, fast_inner_next.unwrap());
+    for (values, accumulator) in lane_values.iter().zip(&fast_accumulators) {
+        set_phi_backedge(
+            func,
+            *accumulator,
+            last_merge,
+            map_value(candidate.accumulator_next, values),
+        );
+    }
+
+    for values in &mut lane_values {
+        clone_exit_pure_instructions(func, candidate.inner_exit, fast_exit, values);
+    }
+    // Preserve the source outer-iteration store order. Loads in either arm of
+    // each cloned diamond were included in the cross-lane NoAlias proof.
+    for (values, accumulator) in lane_values.iter().zip(&fast_accumulators) {
+        func.append_inst(
+            fast_exit,
+            InstKind::Store {
+                ptr: map_value(candidate.store_ptr, values),
+                value: *accumulator,
+            },
+            None,
+        );
+    }
+    let fast_outer_next = func
+        .append_inst(
+            fast_exit,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: fast_outer,
+                rhs: two,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    set_phi_backedge(func, fast_outer, fast_exit, fast_outer_next);
+    func.set_terminator(fast_exit, Terminator::Jump(fast_header));
+
+    func.blocks[candidate.outer_preheader.0].terminator = Some(Terminator::Jump(fast_header));
+    replace_phi_incoming(
+        func,
+        candidate.outer_induction.phi,
+        candidate.outer_preheader,
+        fast_header,
+        fast_outer,
+    );
+    func.mark_reduction_jammed();
+}
+
 fn clone_pure_block(
     func: &mut Function,
     source: BlockId,
@@ -848,6 +1616,57 @@ fn clone_pure_block(
         }
         let kind = remap_pure_kind(&inst.kind, values)
             .expect("candidate validation must accept every cloned instruction");
+        let result_ty = inst.result.map(|result| func.value(result).ty.clone());
+        let cloned = func.append_inst(target, kind, result_ty);
+        if let (Some(original), Some(cloned)) = (inst.result, cloned) {
+            values.insert(original, cloned);
+        }
+    }
+}
+
+fn conditional_shared_load_values(
+    func: &Function,
+    source: BlockId,
+    lane_zero_values: &HashMap<ValueId, ValueId>,
+) -> HashMap<ValueId, ValueId> {
+    let mut shared = HashMap::new();
+    for inst in &func.blocks[source.0].insts {
+        let (Some(result), InstKind::Load { ptr }) = (inst.result, &inst.kind) else {
+            continue;
+        };
+        let Some(mapped_result) = lane_zero_values.get(&result).copied() else {
+            continue;
+        };
+        shared.insert(*ptr, map_value(*ptr, lane_zero_values));
+        shared.insert(result, mapped_result);
+    }
+    shared
+}
+
+fn clone_conditional_condition_block(
+    func: &mut Function,
+    source: BlockId,
+    target: BlockId,
+    values: &mut HashMap<ValueId, ValueId>,
+    shared_values: Option<&HashMap<ValueId, ValueId>>,
+) {
+    let instructions = func.blocks[source.0].insts.clone();
+    for inst in instructions {
+        if matches!(inst.kind, InstKind::Nop) {
+            continue;
+        }
+        if let (Some(shared_values), Some(result), InstKind::Load { ptr }) =
+            (shared_values, inst.result, &inst.kind)
+        {
+            if map_value(*ptr, values) == map_value(*ptr, shared_values) {
+                if let Some(shared_result) = shared_values.get(&result).copied() {
+                    values.insert(result, shared_result);
+                    continue;
+                }
+            }
+        }
+        let kind = remap_pure_kind(&inst.kind, values)
+            .expect("conditional candidate validation must accept every cloned instruction");
         let result_ty = inst.result.map(|result| func.value(result).ty.clone());
         let cloned = func.append_inst(target, kind, result_ty);
         if let (Some(original), Some(cloned)) = (inst.result, cloned) {
@@ -1047,6 +1866,84 @@ fn has_only_phi_and_branch_condition(func: &Function, block: BlockId) -> bool {
         })
 }
 
+fn has_exact_conditional_merge(
+    func: &Function,
+    block: BlockId,
+    selector: ValueId,
+    induction_next: ValueId,
+) -> bool {
+    let mut saw_selector = false;
+    let mut saw_induction_next = false;
+    for inst in &func.blocks[block.0].insts {
+        match &inst.kind {
+            InstKind::Nop => {}
+            InstKind::Phi { .. } if inst.result == Some(selector) && !saw_selector => {
+                saw_selector = true;
+            }
+            InstKind::Binary { op, .. }
+                if inst.result == Some(induction_next)
+                    && !saw_induction_next
+                    && !matches!(op, BinaryOp::Idiv | BinaryOp::Imod | BinaryOp::Fdiv) =>
+            {
+                saw_induction_next = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_selector && saw_induction_next
+}
+
+fn inner_results_have_no_extra_liveouts(
+    func: &Function,
+    inner: &NaturalLoop,
+    accumulator: ValueId,
+    inner_exit: BlockId,
+) -> bool {
+    let inner_results = inner
+        .blocks
+        .iter()
+        .flat_map(|block| &func.blocks[block.0].insts)
+        .filter_map(|inst| inst.result)
+        .collect::<HashSet<_>>();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let block_id = BlockId(block_idx);
+        if inner.blocks.contains(&block_id) {
+            continue;
+        }
+        for inst in &block.insts {
+            let used_inner = instruction_operands(&inst.kind)
+                .into_iter()
+                .filter(|operand| inner_results.contains(operand))
+                .collect::<Vec<_>>();
+            if used_inner.is_empty() {
+                continue;
+            }
+            if block_id == inner_exit
+                && matches!(
+                    inst.kind,
+                    InstKind::Store { value, .. } if value == accumulator
+                )
+                && used_inner == [accumulator]
+            {
+                continue;
+            }
+            return false;
+        }
+        let terminator_operands = match block.terminator.as_ref() {
+            Some(Terminator::Return(value)) => value.iter().copied().collect::<Vec<_>>(),
+            Some(Terminator::Branch { cond, .. }) => vec![*cond],
+            Some(Terminator::Jump(_)) | None => Vec::new(),
+        };
+        if terminator_operands
+            .iter()
+            .any(|operand| inner_results.contains(operand))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn is_pure_setup_block(func: &Function, block: BlockId) -> bool {
     func.blocks[block.0]
         .insts
@@ -1117,6 +2014,24 @@ fn proves_lane_independence(
     inner_body: BlockId,
     factor: usize,
 ) -> bool {
+    proves_lane_independence_in_blocks(
+        func,
+        store_ptr,
+        store_value,
+        outer_induction,
+        &[inner_body],
+        factor,
+    )
+}
+
+fn proves_lane_independence_in_blocks(
+    func: &Function,
+    store_ptr: ValueId,
+    store_value: ValueId,
+    outer_induction: ValueId,
+    load_blocks: &[BlockId],
+    factor: usize,
+) -> bool {
     if !matches!(factor, 2 | 4) {
         return false;
     }
@@ -1132,23 +2047,25 @@ fn proves_lane_independence(
     }
 
     let mut loads = Vec::new();
-    for inst in &func.blocks[inner_body.0].insts {
-        let InstKind::Load { ptr } = inst.kind else {
-            continue;
-        };
-        let Some(result) = inst.result else {
-            return false;
-        };
-        let Some(load_ty) = func.values.get(result.0).map(|value| &value.ty) else {
-            return false;
-        };
-        let Some(load) = analyze_global_memory_access(func, ptr, load_ty, &mut budget) else {
-            return false;
-        };
-        if load.global == store.global && load.terminal_index != outer_induction {
-            return false;
+    for block in load_blocks {
+        for inst in &func.blocks[block.0].insts {
+            let InstKind::Load { ptr } = inst.kind else {
+                continue;
+            };
+            let Some(result) = inst.result else {
+                return false;
+            };
+            let Some(load_ty) = func.values.get(result.0).map(|value| &value.ty) else {
+                return false;
+            };
+            let Some(load) = analyze_global_memory_access(func, ptr, load_ty, &mut budget) else {
+                return false;
+            };
+            if load.global == store.global && load.terminal_index != outer_induction {
+                return false;
+            }
+            loads.push(load);
         }
-        loads.push(load);
     }
 
     // Stores stay in original lane order. For every store that originally
@@ -1506,6 +2423,27 @@ fn value_mappable_from_blocks(
         func.value(value).kind,
         ValueKind::Inst(block, _) if cloned_blocks.contains(&block)
     )
+}
+
+fn block_results(func: &Function, block: BlockId) -> HashSet<ValueId> {
+    func.blocks[block.0]
+        .insts
+        .iter()
+        .filter_map(|inst| inst.result)
+        .collect()
+}
+
+fn branch_condition_cloneable(
+    func: &Function,
+    dom: &Dominators,
+    block: BlockId,
+    insertion_preheader: BlockId,
+    mapped: &HashSet<ValueId>,
+) -> bool {
+    let Some(Terminator::Branch { cond, .. }) = func.blocks[block.0].terminator.as_ref() else {
+        return false;
+    };
+    mapped.contains(cond) || value_available_at(func, dom, *cond, insertion_preheader)
 }
 
 fn block_operands_cloneable(
