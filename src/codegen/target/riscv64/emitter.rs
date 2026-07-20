@@ -1,10 +1,10 @@
 use super::regalloc::Riscv64RegAlloc;
 use super::{Riscv64IrEmitter, Riscv64IrFuncEmitter};
 use crate::codegen::common::{
-    emit_ir_data_section, entry_early_return, ir_align_to, loop_rotated_block_order, IrFuncLayout,
-    IrModuleCtx,
+    emit_ir_data_section, entry_early_return, ir_align_to, loop_rotated_block_order,
+    natural_loop_depths, IrFuncLayout, IrModuleCtx,
 };
-use crate::ir::{Function, Module};
+use crate::ir::{BlockId, Function, Module, Terminator};
 
 pub(super) fn emit_asm(module: &Module) -> String {
     Riscv64IrEmitter::new(module).emit()
@@ -26,6 +26,67 @@ impl<'a> Riscv64IrEmitter<'a> {
             Riscv64IrFuncEmitter::new(&mut self, func).emit();
         }
         self.out
+    }
+}
+
+fn deepest_loop_targets(func: &Function, block_order: &[usize]) -> Vec<bool> {
+    const MAX_ALIGNMENT_BLOCKS: usize = 1024;
+    const MAX_ALIGNED_TARGETS: usize = 8;
+
+    let block_count = func.blocks.len();
+    let mut aligned = vec![false; block_count];
+    if block_count == 0 || block_count > MAX_ALIGNMENT_BLOCKS {
+        return aligned;
+    }
+    let depths = natural_loop_depths(func);
+    let Some(max_depth) = depths.iter().copied().max().filter(|depth| *depth > 0) else {
+        return aligned;
+    };
+    let mut positions = vec![usize::MAX; block_count];
+    for (position, block) in block_order.iter().copied().enumerate() {
+        positions[block] = position;
+    }
+    let mut count = 0usize;
+    for source in block_order.iter().copied() {
+        for target in terminator_targets(func.blocks[source].terminator.as_ref()) {
+            if positions[target.0] == usize::MAX
+                || positions[source] <= positions[target.0]
+                || depths[target.0] != max_depth
+            {
+                continue;
+            }
+            if positions[target.0] > 0 {
+                let previous = block_order[positions[target.0] - 1];
+                if terminator_targets(func.blocks[previous].terminator.as_ref()).contains(&target) {
+                    continue;
+                }
+            }
+            if !aligned[target.0] {
+                count += 1;
+                if count > MAX_ALIGNED_TARGETS {
+                    return vec![false; block_count];
+                }
+                aligned[target.0] = true;
+            }
+        }
+    }
+    aligned
+}
+
+fn terminator_targets(terminator: Option<&Terminator>) -> Vec<BlockId> {
+    match terminator {
+        Some(Terminator::Jump(target)) => vec![*target],
+        Some(Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        }) if then_target == else_target => vec![*then_target],
+        Some(Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        }) => vec![*then_target, *else_target],
+        Some(Terminator::Return(_)) | None => Vec::new(),
     }
 }
 
@@ -78,8 +139,12 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 })
             })
             .collect::<Vec<_>>();
+        let aligned_loop_targets = deepest_loop_targets(self.func, &block_order);
         for (order_idx, block_idx) in block_order.iter().copied().enumerate() {
             let block = &self.func.blocks[block_idx];
+            if aligned_loop_targets[block_idx] {
+                self.body.push_str(".p2align 4\n");
+            }
             self.body
                 .push_str(&format!("{}:\n", self.block_label(block_idx)));
             for inst in &block.insts {
@@ -97,6 +162,12 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         let blocks = self.body[setup_end..].to_string();
         let saved_regs = self.regalloc.used_regs().to_vec();
         let stack_size = ir_align_to(self.layout.stack_size + self.regalloc.saved_area_size(), 16);
+        let leaf = !self.func.blocks.iter().any(|block| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, crate::ir::InstKind::Call { .. }))
+        });
         let recursive = self.func.blocks.iter().any(|block| {
             block.insts.iter().any(|inst| {
                 matches!(&inst.kind, crate::ir::InstKind::Call { name, .. } if name == &self.func.name)
@@ -116,13 +187,21 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         if let Some((_, prelude)) = &early_return {
             self.parent.out.push_str(prelude);
         }
-        self.parent
-            .out
-            .push_str("  addi sp, sp, -16\n  sd ra, 8(sp)\n  sd s0, 0(sp)\n  mv s0, sp\n");
+        self.parent.out.push_str("  addi sp, sp, -16\n");
+        if !leaf {
+            self.parent.out.push_str("  sd ra, 8(sp)\n");
+        }
+        self.parent.out.push_str("  sd s0, 0(sp)\n  mv s0, sp\n");
         if stack_size != 0 {
-            self.parent
-                .out
-                .push_str(&format!("  li t6, {}\n  sub sp, sp, t6\n", stack_size));
+            if stack_size <= 2048 {
+                self.parent
+                    .out
+                    .push_str(&format!("  addi sp, sp, -{}\n", stack_size));
+            } else {
+                self.parent
+                    .out
+                    .push_str(&format!("  li t6, {}\n  sub sp, sp, t6\n", stack_size));
+            }
         }
         for (idx, reg) in saved_regs.iter().enumerate() {
             self.parent
@@ -139,8 +218,12 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 .out
                 .push_str(&format!("  ld {}, -{}(s0)\n", reg, (idx + 1) * 8));
         }
+        self.parent.out.push_str("  mv sp, s0\n");
+        if !leaf {
+            self.parent.out.push_str("  ld ra, 8(sp)\n");
+        }
         self.parent
             .out
-            .push_str("  mv sp, s0\n  ld ra, 8(sp)\n  ld s0, 0(sp)\n  addi sp, sp, 16\n  ret\n\n");
+            .push_str("  ld s0, 0(sp)\n  addi sp, sp, 16\n  ret\n\n");
     }
 }

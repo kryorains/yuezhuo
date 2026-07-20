@@ -22,14 +22,25 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         if bytes == 0 {
             return;
         }
-        let loop_label = self.parent.ctx.fresh_label("memzero");
-        let end_label = self.parent.ctx.fresh_label("memzero_end");
+        const CHUNK_BYTES: usize = 8;
         self.load_value(ptr);
-        self.body.push_str(&format!("  li a1, {}\n", bytes));
-        self.body.push_str(&format!(
-            "{}:\n  beqz a1, {}\n  sb zero, 0(a0)\n  addi a0, a0, 1\n  addi a1, a1, -1\n  j {}\n{}:\n",
-            loop_label, end_label, loop_label, end_label
-        ));
+        let chunks = bytes / CHUNK_BYTES;
+        let tail = bytes % CHUNK_BYTES;
+        if chunks != 0 {
+            let loop_label = self.parent.ctx.fresh_label("memzero");
+            self.body.push_str(&format!("  li a1, {}\n", chunks));
+            self.body.push_str(&format!("{}:\n", loop_label));
+            for offset in 0..CHUNK_BYTES {
+                self.body.push_str(&format!("  sb zero, {}(a0)\n", offset));
+            }
+            self.body.push_str(&format!(
+                "  addi a0, a0, {}\n  addi a1, a1, -1\n  bnez a1, {}\n",
+                CHUNK_BYTES, loop_label
+            ));
+        }
+        for offset in 0..tail {
+            self.body.push_str(&format!("  sb zero, {}(a0)\n", offset));
+        }
     }
 
     pub(super) fn assigned_reg(&self, value: ValueId) -> Option<&'static str> {
@@ -39,12 +50,11 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn emit_assigned_load(&mut self, result: ValueId, ptr: ValueId) -> bool {
-        let (base, offset) = self.memory_address(ptr);
-        let (Some(destination), Some(pointer)) =
-            (self.assigned_reg(result), self.assigned_reg(base))
-        else {
+        let Some(destination) = self.assigned_reg(result) else {
             return false;
         };
+        let (base, offset) = self.memory_address(ptr);
+        let pointer = self.load_or_assigned(base, "a0");
         match self.func.value(result).ty {
             Type::Ptr(_) => self
                 .body
@@ -58,9 +68,22 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
     pub(super) fn emit_assigned_store(&mut self, ptr: ValueId, value: ValueId) -> bool {
         let (base, offset) = self.memory_address(ptr);
-        let (Some(pointer), Some(source)) = (self.assigned_reg(base), self.assigned_reg(value))
-        else {
+        let pointer = self.assigned_reg(base);
+        let source = self.assigned_reg(value);
+        if pointer.is_none() && source.is_none() {
             return false;
+        }
+        let pointer = if let Some(pointer) = pointer {
+            pointer
+        } else {
+            self.load_value_into(base, "a1");
+            "a1"
+        };
+        let source = if let Some(source) = source {
+            source
+        } else {
+            self.load_value_into(value, "a0");
+            "a0"
         };
         match self.func.value(value).ty {
             Type::Ptr(_) => self
@@ -268,6 +291,17 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 self.body.push_str(&format!("  fmv.w.x {}, a0\n", reg));
             }
         }
+    }
+
+    pub(super) fn rematerialize_into(&mut self, value: ValueId, destination: &str) -> bool {
+        match &self.func.value(value).kind {
+            ValueKind::Const(value) => self.load_const_into(value, destination),
+            ValueKind::Global(name) => self
+                .body
+                .push_str(&format!("  la {}, {}\n", destination, name)),
+            ValueKind::Param | ValueKind::Inst(_, _) => return false,
+        }
+        true
     }
 
     fn load_const_into(&mut self, value: &Const, destination: &str) {
