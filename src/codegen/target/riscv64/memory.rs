@@ -1,6 +1,21 @@
 use super::Riscv64IrFuncEmitter;
 use crate::codegen::common::{gep_elem_type, ir_size, pointee};
-use crate::ir::{Const, Type, ValueId, ValueKind};
+use crate::ir::{Const, Function, InstKind, Type, ValueId, ValueKind};
+use std::collections::HashMap;
+
+const MAX_FOLDED_MEMORY_BLOCKS: usize = 1024;
+const MAX_FOLDED_MEMORY_VALUES: usize = 8192;
+const MAX_FOLDED_MEMORY_INSTRUCTIONS: usize = 32_768;
+const MAX_FOLDED_MEMORY_USES: usize = 65_536;
+const MAX_FOLDED_MEMORY_GEPS: usize = 1024;
+const MAX_FOLDED_MEMORY_TYPE_NODES: usize = 128;
+const MAX_FOLDED_MEMORY_CLONE_TYPE_NODES: usize = 65_536;
+
+#[derive(Clone, Copy)]
+pub(super) struct FoldedMemoryGep {
+    pub(super) base: ValueId,
+    offset: i32,
+}
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     pub(super) fn emit_memzero(&mut self, ptr: ValueId, bytes: usize) {
@@ -24,36 +39,48 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn emit_assigned_load(&mut self, result: ValueId, ptr: ValueId) -> bool {
+        let (base, offset) = self.memory_address(ptr);
         let (Some(destination), Some(pointer)) =
-            (self.assigned_reg(result), self.assigned_reg(ptr))
+            (self.assigned_reg(result), self.assigned_reg(base))
         else {
             return false;
         };
         match self.func.value(result).ty {
             Type::Ptr(_) => self
                 .body
-                .push_str(&format!("  ld {}, 0({})\n", destination, pointer)),
+                .push_str(&format!("  ld {}, {}({})\n", destination, offset, pointer)),
             _ => self
                 .body
-                .push_str(&format!("  lw {}, 0({})\n", destination, pointer)),
+                .push_str(&format!("  lw {}, {}({})\n", destination, offset, pointer)),
         }
         true
     }
 
     pub(super) fn emit_assigned_store(&mut self, ptr: ValueId, value: ValueId) -> bool {
-        let (Some(pointer), Some(source)) = (self.assigned_reg(ptr), self.assigned_reg(value))
+        let (base, offset) = self.memory_address(ptr);
+        let (Some(pointer), Some(source)) = (self.assigned_reg(base), self.assigned_reg(value))
         else {
             return false;
         };
         match self.func.value(value).ty {
             Type::Ptr(_) => self
                 .body
-                .push_str(&format!("  sd {}, 0({})\n", source, pointer)),
+                .push_str(&format!("  sd {}, {}({})\n", source, offset, pointer)),
             _ => self
                 .body
-                .push_str(&format!("  sw {}, 0({})\n", source, pointer)),
+                .push_str(&format!("  sw {}, {}({})\n", source, offset, pointer)),
         }
         true
+    }
+
+    pub(super) fn memory_address(&self, ptr: ValueId) -> (ValueId, i32) {
+        self.folded_memory_geps
+            .get(&ptr)
+            .map_or((ptr, 0), |address| (address.base, address.offset))
+    }
+
+    pub(super) fn skips_folded_memory_gep(&self, result: ValueId) -> bool {
+        self.folded_memory_geps.contains_key(&result)
     }
 
     pub(super) fn emit_assigned_gep(
@@ -254,17 +281,17 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             .push_str(&format!("  li {}, {}\n", destination, value));
     }
 
-    pub(super) fn load_indirect(&mut self, ty: &Type) {
+    pub(super) fn load_indirect(&mut self, ty: &Type, offset: i32) {
         match ty {
-            Type::Ptr(_) => self.body.push_str("  ld a0, 0(a0)\n"),
-            _ => self.body.push_str("  lw a0, 0(a0)\n"),
+            Type::Ptr(_) => self.body.push_str(&format!("  ld a0, {}(a0)\n", offset)),
+            _ => self.body.push_str(&format!("  lw a0, {}(a0)\n", offset)),
         }
     }
 
-    pub(super) fn store_indirect(&mut self, ty: &Type) {
+    pub(super) fn store_indirect(&mut self, ty: &Type, offset: i32) {
         match ty {
-            Type::Ptr(_) => self.body.push_str("  sd a0, 0(a1)\n"),
-            _ => self.body.push_str("  sw a0, 0(a1)\n"),
+            Type::Ptr(_) => self.body.push_str(&format!("  sd a0, {}(a1)\n", offset)),
+            _ => self.body.push_str(&format!("  sw a0, {}(a1)\n", offset)),
         }
     }
 
@@ -444,13 +471,248 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 }
 
-fn const_gep_offset(func: &crate::ir::Function, index: ValueId, stride: i32) -> Option<i64> {
-    let index = match &func.value(index).kind {
+/// Precomputes the only GEPs that may be omitted during emission. Comparing
+/// the complete generic use count with typed load/store pointer uses makes a
+/// missed phi, call, address, value, or terminator use disable folding.
+pub(super) fn collect_folded_memory_geps(
+    func: &Function,
+    value_use_counts: &[usize],
+) -> HashMap<ValueId, FoldedMemoryGep> {
+    let instruction_count = func
+        .blocks
+        .iter()
+        .try_fold(0usize, |total, block| total.checked_add(block.insts.len()));
+    let use_count = value_use_counts
+        .iter()
+        .try_fold(0usize, |total, count| total.checked_add(*count));
+    if value_use_counts.len() != func.values.len()
+        || !function_types_fit_clone_budget(func)
+        || func.blocks.len() > MAX_FOLDED_MEMORY_BLOCKS
+        || func.values.len() > MAX_FOLDED_MEMORY_VALUES
+        || instruction_count.is_none_or(|count| count > MAX_FOLDED_MEMORY_INSTRUCTIONS)
+        || use_count.is_none_or(|count| count > MAX_FOLDED_MEMORY_USES)
+    {
+        return HashMap::new();
+    }
+
+    let mut memory_pointer_uses = vec![0usize; func.values.len()];
+    let mut memory_pointer_types_are_exact = vec![true; func.values.len()];
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let (ptr, access_ty) = match &inst.kind {
+                InstKind::Load { ptr } => {
+                    let Some(result) = inst.result else {
+                        if let Some(exact) = memory_pointer_types_are_exact.get_mut(ptr.0) {
+                            *exact = false;
+                        }
+                        continue;
+                    };
+                    (*ptr, func.values.get(result.0).map(|value| &value.ty))
+                }
+                InstKind::Store { ptr, value } => {
+                    (*ptr, func.values.get(value.0).map(|value| &value.ty))
+                }
+                _ => continue,
+            };
+            let Some(count) = memory_pointer_uses.get_mut(ptr.0) else {
+                continue;
+            };
+            *count = count.saturating_add(1);
+            let exact = match (func.values.get(ptr.0), access_ty) {
+                (Some(pointer), Some(access_ty)) => match &pointer.ty {
+                    Type::Ptr(pointee) => types_equal_bounded(pointee, access_ty),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !exact {
+                memory_pointer_types_are_exact[ptr.0] = false;
+            }
+        }
+    }
+
+    let mut folded = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let (Some(result), InstKind::Gep { base, indices }) = (inst.result, &inst.kind) else {
+                continue;
+            };
+            let [index] = indices.as_slice() else {
+                continue;
+            };
+            let Some(total_uses) = value_use_counts.get(result.0).copied() else {
+                continue;
+            };
+            if total_uses == 0
+                || memory_pointer_uses.get(result.0).copied() != Some(total_uses)
+                || memory_pointer_types_are_exact.get(result.0) != Some(&true)
+            {
+                continue;
+            }
+            let Some(stride) = strict_single_index_stride(func, *base, result) else {
+                continue;
+            };
+            let Some(offset) = const_gep_offset(func, *index, stride)
+                .and_then(|offset| i32::try_from(offset).ok())
+                .filter(|offset| fits_i12(*offset))
+            else {
+                continue;
+            };
+            if folded.len() == MAX_FOLDED_MEMORY_GEPS {
+                return HashMap::new();
+            }
+            folded.insert(
+                result,
+                FoldedMemoryGep {
+                    base: *base,
+                    offset,
+                },
+            );
+        }
+    }
+    folded
+}
+
+/// Makes register allocation see the same base live ranges that folded memory
+/// emission will use. Value IDs and instruction slots stay stable; this is a
+/// private allocation view and does not mutate the verified IR.
+pub(super) fn rewrite_folded_memory_uses_for_allocation(
+    func: &mut Function,
+    folded: &HashMap<ValueId, FoldedMemoryGep>,
+) {
+    if folded.is_empty() {
+        return;
+    }
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            match &mut inst.kind {
+                InstKind::Load { ptr } | InstKind::Store { ptr, .. } => {
+                    if let Some(address) = folded.get(ptr) {
+                        *ptr = address.base;
+                    }
+                }
+                _ => {}
+            }
+            if inst
+                .result
+                .is_some_and(|result| folded.contains_key(&result))
+            {
+                inst.result = None;
+                inst.kind = InstKind::Nop;
+            }
+        }
+    }
+}
+
+fn function_types_fit_clone_budget(func: &Function) -> bool {
+    let mut roots = func
+        .values
+        .iter()
+        .map(|value| &value.ty)
+        .collect::<Vec<_>>();
+    roots.extend(func.blocks.iter().flat_map(|block| {
+        block.insts.iter().filter_map(|inst| match &inst.kind {
+            InstKind::Alloca { ty } => Some(ty),
+            _ => None,
+        })
+    }));
+    let mut total = 0usize;
+    for root in roots {
+        let mut worklist = vec![(root, 1usize)];
+        while let Some((ty, depth)) = worklist.pop() {
+            let Some(next_total) = total.checked_add(1) else {
+                return false;
+            };
+            total = next_total;
+            if total > MAX_FOLDED_MEMORY_CLONE_TYPE_NODES || depth > MAX_FOLDED_MEMORY_TYPE_NODES {
+                return false;
+            }
+            match ty {
+                Type::Ptr(inner) => worklist.push((inner, depth + 1)),
+                Type::Array { elem, .. } => worklist.push((elem, depth + 1)),
+                Type::Void | Type::I1 | Type::I32 | Type::F32 => {}
+            }
+        }
+    }
+    true
+}
+
+fn strict_single_index_stride(func: &Function, base: ValueId, result: ValueId) -> Option<i32> {
+    let Type::Ptr(base_pointee) = &func.values.get(base.0)?.ty else {
+        return None;
+    };
+    let Type::Ptr(result_pointee) = &func.values.get(result.0)?.ty else {
+        return None;
+    };
+    let compatible = types_equal_bounded(base_pointee, result_pointee)
+        || matches!(
+            base_pointee.as_ref(),
+            Type::Array { elem, .. } if types_equal_bounded(elem, result_pointee)
+        );
+    if !compatible {
+        return None;
+    }
+    checked_type_size(result_pointee).filter(|size| *size > 0)
+}
+
+fn checked_type_size(ty: &Type) -> Option<i32> {
+    let mut current = ty;
+    let mut elements = 1i32;
+    for _ in 0..MAX_FOLDED_MEMORY_TYPE_NODES {
+        match current {
+            Type::Void => return Some(0),
+            Type::I1 | Type::I32 | Type::F32 => return elements.checked_mul(4),
+            Type::Ptr(_) => return elements.checked_mul(8),
+            Type::Array { elem, len } => {
+                elements = elements.checked_mul(i32::try_from(*len).ok()?)?;
+                current = elem;
+            }
+        }
+    }
+    None
+}
+
+fn types_equal_bounded(mut lhs: &Type, mut rhs: &Type) -> bool {
+    for _ in 0..MAX_FOLDED_MEMORY_TYPE_NODES {
+        match (lhs, rhs) {
+            (Type::Void, Type::Void)
+            | (Type::I1, Type::I1)
+            | (Type::I32, Type::I32)
+            | (Type::F32, Type::F32) => return true,
+            (Type::Ptr(lhs_inner), Type::Ptr(rhs_inner)) => {
+                lhs = lhs_inner;
+                rhs = rhs_inner;
+            }
+            (
+                Type::Array {
+                    elem: lhs_elem,
+                    len: lhs_len,
+                },
+                Type::Array {
+                    elem: rhs_elem,
+                    len: rhs_len,
+                },
+            ) if lhs_len == rhs_len => {
+                lhs = lhs_elem;
+                rhs = rhs_elem;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn const_gep_offset(func: &Function, index: ValueId, stride: i32) -> Option<i64> {
+    let value = func.values.get(index.0)?;
+    if value.ty != Type::I32 {
+        return None;
+    }
+    let index = match &value.kind {
         ValueKind::Const(Const::Int(value)) => *value,
-        ValueKind::Const(Const::Bool(value)) => *value as i32,
+        ValueKind::Const(Const::Zero(Type::I32)) => 0,
         _ => return None,
     };
-    Some(i64::from(index) * i64::from(stride))
+    i64::from(index).checked_mul(i64::from(stride))
 }
 
 fn fits_i12(value: i32) -> bool {

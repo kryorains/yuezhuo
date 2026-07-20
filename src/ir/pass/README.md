@@ -44,10 +44,12 @@
   29. `InstCombinePass`
   30. `ConstFoldPass`
   31. `GepInductionPass`
-  32. `SimplifyCfgPass`
+  32. `PointerRecurrenceCoalescePass`
   33. `DcePass`
+  34. `SimplifyCfgPass`
+  35. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量特化、CFG 内联、常量折叠、CSE、LICM 等主动优化。O1 开头先传播只读标量全局常量，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；第一次标量提升会暴露 `NoMemory` 调用摘要，随后第二轮全局标量局部化和提升可安全跨纯调用保留状态。常量实参特化后立即折叠常量、清理 CFG 和死代码，再按统一成本模型执行递归及普通纯标量 CFG 内联。O1 末尾由 InstCombine 和 ConstFold 规范化局部整数算术，再执行通用 GEP 地址归纳强度削弱，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。GEP 变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量特化、CFG 内联、常量折叠、CSE、LICM 等主动优化。O1 开头先传播只读全局常量，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；第一次标量提升会暴露 `NoMemory` 调用摘要，随后第二轮全局标量局部化和提升可安全跨纯调用保留状态。常量实参特化后立即折叠常量、清理 CFG 和死代码，再按统一成本模型执行递归及普通纯标量 CFG 内联。O1 末尾由 InstCombine 和 ConstFold 规范化局部整数算术，再执行通用 GEP 地址归纳强度削弱与 pointer recurrence 合并；第一轮 DCE 专门清掉被合并的 pointer `phi -> GEP -> phi` SCC，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。地址变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
 
 ## Pass 列表
 
@@ -103,6 +105,8 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 - 对仅合并布尔值并立即分支的 `phi` 块，如果所有动态 incoming 都能证明等于分支条件，则把前驱边直接穿透到分支目标；目前要求至少一个目标块直接返回，并拒绝会改变后继 `phi` 的情况。
 - 对可安全推测的一条布尔 RHS 做局部短路 if-conversion，并把无副作用的条件加减 diamond 改写为 wrapping 算术选择；每次改写后都用 verifier 复核，证明失败则原样回退。
 - 迭代移除不可达块、转发空跳转块并合并唯一前驱的无 phi 线性基本块；同步重映射 BlockId、指令定义位置和后继 phi incoming。
+
+O1 在首轮及标量提升/常量特化后的中间清理阶段，仅保护 `LoopInfo` 已证明为 dedicated preheader 的空跳转块；其它安全的空跳转仍照常转发，从而保留后续标准循环变换所需形状而不扩大中间 CFG。ReductionJam、地址归纳等 shape-sensitive 变换完成后，末尾的完整 SimplifyCfg 会再次转发所有安全的空块。为限制每轮重建支配树/循环森林的最坏工作量，超过 256 blocks 的中间函数会把全部空块转发延迟到末轮，而不是反复执行无预算循环分析。
 
 ### `TailRecursionPass` (`tail_recursion.rs`)
 
@@ -194,6 +198,12 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 变换在 preheader 用 induction 初值重建完整地址，在 header 插入 pointer phi，在 latch 用单索引常量 GEP 生成固定步长 next pointer。只有全部使用都位于循环内且新 phi 支配普通使用及 phi edge 时才替换原 GEP；仅作为其它已选 nested GEP base 的中间地址不会单独生成死 recurrence。常量 trip-count 分析或 header signed comparison 还必须证明 i32 induction 在每个回边不 wrap，否则 sign extension 后的重算地址与 pointer increment 并不等价，pass 会拒绝。
 
 pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有 live-out 地址时，header pointer state 仍只沿唯一 backedge 更新。含调用的循环不会变换，因为跨调用 pointer recurrence 会占用 callee-saved 寄存器或增加 spill，而地址重算通常不是这类循环的主要成本。动态大步长、循环内变化的 offset、非 GEP 派生链、不能在 preheader 使用的定义、不可整除为最终 pointee stride 的步长及类型大小溢出都保守保留。变换后立即运行 verifier，重复执行不会再次匹配生成的 pointer recurrence。
+
+### `PointerRecurrenceCoalescePass` (`pointer_recurrence_coalesce.rs`)
+
+合并同一自然循环中保持固定 byte distance 的 pointer recurrence。候选必须具有同一 header/latch、精确相同的 pointer type 和单索引常量 GEP step；初值会沿完整 typed GEP chain 展开为对象根、SSA 动态索引项及 checked 常量 byte offset，只有对象根和全部动态项系数完全相同的 recurrence 才能配对。索引中的 `iv + constant` 仅在 i32 addrec 初值/步长同余类的完整 signed 极值范围证明该加减不回绕时才提取常量；证明失败时该 SSA 表达式保持为不透明动态项，不假设源码维度或循环上界。
+
+secondary pointer 除唯一 backedge update 外，只能作为循环内、pointee/access type 精确一致的 load/store pointer；update 自身也只能回到该 phi。pass 在 header 从 primary pointer 建立一个可表示该 byte distance 的单索引常量 GEP，并只改写已证明的 memory pointer use；旧 secondary `phi/update` SCC 交给紧随其后的 mark-and-sweep DCE 删除。函数规模、use 数、recurrence 数、GEP chain/index、affine 深度、type nodes、pair proof 和总 work 都有固定预算；所有计划在改写前完成，预算或算术证明失败不产生部分 IR。改写后运行 verifier，重复执行不会再次处理已失去 memory use 的 secondary。
 
 ### `ReductionJamPass` (`reduction_jam.rs`)
 

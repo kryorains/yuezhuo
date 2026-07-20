@@ -72,18 +72,20 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             InstKind::Load { ptr } => {
                 let result = inst.result.unwrap();
                 if !self.emit_assigned_load(result, *ptr) {
-                    self.load_value(*ptr);
+                    let (base, offset) = self.memory_address(*ptr);
+                    self.load_value(base);
                     let ty = self.func.value(result).ty.clone();
-                    self.load_indirect(&ty);
+                    self.load_indirect(&ty, offset);
                     self.store_result(result);
                 }
             }
             InstKind::Store { ptr, value } => {
                 if !self.emit_assigned_store(*ptr, *value) {
-                    self.load_value_into(*ptr, "a1");
+                    let (base, offset) = self.memory_address(*ptr);
+                    self.load_value_into(base, "a1");
                     self.load_value(*value);
                     let ty = self.func.value(*value).ty.clone();
-                    self.store_indirect(&ty);
+                    self.store_indirect(&ty, offset);
                 }
             }
             InstKind::MemZero { ptr, bytes } => self.emit_memzero(*ptr, *bytes),
@@ -118,6 +120,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Gep { base, indices } => {
                 let result = inst.result.unwrap();
+                if self.skips_folded_memory_gep(result) {
+                    return;
+                }
                 if !self.emit_assigned_gep(result, *base, indices) {
                     self.emit_gep(result, *base, indices);
                     self.store_result(result);

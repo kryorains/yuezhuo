@@ -13,6 +13,7 @@ mod invariant_load;
 mod licm;
 mod local_forward;
 mod loop_analysis;
+mod pointer_recurrence_coalesce;
 mod recursive_inline;
 mod reduction_jam;
 mod repeat_reduction;
@@ -35,6 +36,7 @@ use inst_combine::InstCombinePass;
 use invariant_load::InvariantLoadForwardPass;
 use licm::LicmPass;
 use local_forward::LocalForwardPass;
+use pointer_recurrence_coalesce::PointerRecurrenceCoalescePass;
 use recursive_inline::{CfgInlinePass, RecursiveInlinePass};
 use reduction_jam::ReductionJamPass;
 use repeat_reduction::RepeatReductionPass;
@@ -80,7 +82,7 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(GlobalConstPropPass::new());
             pipeline.add(ConstFoldPass::new());
             pipeline.add(DcePass::new());
-            pipeline.add(SimplifyCfgPass::new());
+            pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
             pipeline.add(TailRecursionPass::new());
             pipeline.add(GlobalScalarLocalizePass::new());
             pipeline.add(ScalarPromotePass::new());
@@ -88,7 +90,7 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(ConstSpecializePass::new());
             pipeline.add(ConstFoldPass::new());
-            pipeline.add(SimplifyCfgPass::new());
+            pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
             pipeline.add(DcePass::new());
             pipeline.add(RecursiveInlinePass::new());
             pipeline.add(InlineSmallExprPass::new());
@@ -113,6 +115,8 @@ pub fn run_pipeline_with_reduction_jam_factor(
             // intentionally expects the source loop-phi set. In particular,
             // this preserves the existing simple-unroll profitability gate.
             pipeline.add(GepInductionPass::new());
+            pipeline.add(PointerRecurrenceCoalescePass::new());
+            pipeline.add(DcePass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());
         }

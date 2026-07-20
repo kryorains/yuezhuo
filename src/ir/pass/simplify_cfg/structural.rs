@@ -1,5 +1,6 @@
 use super::all_predecessors;
 use crate::ir::{BlockId, Const, Function, InstKind, Terminator, ValueKind};
+use std::collections::HashSet;
 
 pub(super) fn merge_linear_block(func: &mut Function) -> bool {
     let predecessors = all_predecessors(func);
@@ -59,10 +60,18 @@ pub(super) fn merge_linear_block(func: &mut Function) -> bool {
 }
 
 pub(super) fn forward_empty_jump_block(func: &mut Function) -> bool {
+    forward_empty_jump_block_except(func, &HashSet::new())
+}
+
+pub(super) fn forward_empty_jump_block_except(
+    func: &mut Function,
+    protected: &HashSet<BlockId>,
+) -> bool {
     let predecessors = all_predecessors(func);
     for (block_idx, block_predecessors) in predecessors.iter().enumerate() {
         let block = BlockId(block_idx);
         if block == func.entry
+            || protected.contains(&block)
             || func.blocks[block_idx]
                 .insts
                 .iter()

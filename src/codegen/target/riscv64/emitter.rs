@@ -31,17 +31,28 @@ impl<'a> Riscv64IrEmitter<'a> {
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     fn new(parent: &'a mut Riscv64IrEmitter<'b>, func: &'b Function) -> Self {
+        let value_use_counts = crate::codegen::common::ir_value_use_counts(func);
+        let folded_memory_geps = super::memory::collect_folded_memory_geps(func, &value_use_counts);
+        let mut allocation_view = (!folded_memory_geps.is_empty()).then(|| func.clone());
+        if let Some(allocation_view) = &mut allocation_view {
+            super::memory::rewrite_folded_memory_uses_for_allocation(
+                allocation_view,
+                &folded_memory_geps,
+            );
+        }
+        let allocation_func = allocation_view.as_ref().unwrap_or(func);
         Self {
             parent,
             func,
             layout: IrFuncLayout::new(func),
-            regalloc: Riscv64RegAlloc::new(func),
+            regalloc: Riscv64RegAlloc::new(allocation_func),
             local_regs: crate::codegen::common::IrLocalRegs::new(
-                func,
+                allocation_func,
                 &["t3", "t4", "t5", "t6"],
                 true,
             ),
-            value_use_counts: crate::codegen::common::ir_value_use_counts(func),
+            value_use_counts,
+            folded_memory_geps,
             body: String::new(),
             return_label: format!(".L_return_{}", func.name),
         }
