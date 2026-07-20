@@ -1,22 +1,34 @@
+use super::function_effects::FunctionEffects;
 use super::scalar_promote::{MAX_PROMOTION_BLOCKS, MAX_PROMOTION_VALUES};
 use super::ModulePass;
 use crate::ir::{Function, Inst, InstKind, Module, Terminator, Type, Value, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
-pub(super) struct GlobalScalarLocalizePass;
+pub(super) struct GlobalScalarLocalizePass {
+    across_no_memory_calls: bool,
+}
 
 const MAX_LOCALIZED_GLOBALS: usize = 64;
 
 impl GlobalScalarLocalizePass {
     pub(super) fn new() -> Self {
-        Self
+        Self {
+            across_no_memory_calls: false,
+        }
+    }
+
+    pub(super) fn new_across_no_memory_calls() -> Self {
+        Self {
+            across_no_memory_calls: true,
+        }
     }
 }
 
 impl ModulePass for GlobalScalarLocalizePass {
     fn run(&mut self, module: &mut Module) {
+        let effects = FunctionEffects::analyze(module);
         for func in &mut module.funcs {
-            localize_leaf_globals(func);
+            localize_globals(func, &effects, self.across_no_memory_calls);
         }
     }
 }
@@ -29,16 +41,29 @@ struct Candidate {
     valid: bool,
 }
 
-fn localize_leaf_globals(func: &mut Function) {
+fn localize_globals(func: &mut Function, effects: &FunctionEffects, across_no_memory_calls: bool) {
     if func.blocks.len() > MAX_PROMOTION_BLOCKS || func.values.len() >= MAX_PROMOTION_VALUES {
         return;
     }
-    if func.blocks.iter().any(|block| {
-        block
-            .insts
-            .iter()
-            .any(|inst| matches!(inst.kind, InstKind::Call { .. }))
-    }) {
+    let calls = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter_map(|inst| match &inst.kind {
+            InstKind::Call { name, args } => Some((inst.result, name, args)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if calls.is_empty() == across_no_memory_calls
+        || calls.iter().any(|(result, name, args)| {
+            let Some(result) = result else {
+                return true;
+            };
+            effects
+                .resolve_no_memory_call(func, name, *result, args)
+                .is_none()
+        })
+    {
         return;
     }
 

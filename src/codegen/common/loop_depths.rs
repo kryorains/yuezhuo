@@ -198,6 +198,11 @@ pub(crate) fn loop_rotated_block_order(func: &Function) -> Vec<usize> {
         order.insert(latch_position + 1, header);
         order.insert(latch_position + 2, exit);
     }
+    let mut reachable = vec![false; block_count];
+    for block in reverse_postorder {
+        reachable[block] = true;
+    }
+    order.retain(|block| reachable[*block]);
     order
 }
 

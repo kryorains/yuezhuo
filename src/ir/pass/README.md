@@ -20,27 +20,34 @@
   5. `TailRecursionPass`
   6. `GlobalScalarLocalizePass`
   7. `ScalarPromotePass`
-  8. `RecursiveInlinePass`
-  9. `InlineSmallExprPass`
-  10. `LocalForwardPass`
-  11. `CsePass`
-  12. `LicmPass`
-  13. `InvariantLoadForwardPass`
-  14. `DcePass`
-  15. `ReductionJamPass`
-  16. `CsePass`
+  8. `GlobalScalarLocalizePass`
+  9. `ScalarPromotePass`
+  10. `ConstSpecializePass`
+  11. `ConstFoldPass`
+  12. `SimplifyCfgPass`
+  13. `DcePass`
+  14. `RecursiveInlinePass`
+  15. `InlineSmallExprPass`
+  16. `CfgInlinePass`
   17. `LocalForwardPass`
-  18. `InvariantLoadForwardPass`
-  19. `DcePass`
-  20. `RepeatReductionPass`
-  21. `SimpleLoopUnrollPass`（按目标收益门控）
-  22. `InstCombinePass`
-  23. `ConstFoldPass`
-  24. `GepInductionPass`
-  25. `SimplifyCfgPass`
+  18. `CsePass`
+  19. `LicmPass`
+  20. `InvariantLoadForwardPass`
+  21. `DcePass`
+  22. `ReductionJamPass`
+  23. `CsePass`
+  24. `LocalForwardPass`
+  25. `InvariantLoadForwardPass`
   26. `DcePass`
+  27. `RepeatReductionPass`
+  28. `SimpleLoopUnrollPass`（按目标收益门控）
+  29. `InstCombinePass`
+  30. `ConstFoldPass`
+  31. `GepInductionPass`
+  32. `SimplifyCfgPass`
+  33. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量折叠、CSE、LICM 等主动优化。O1 开头先传播只读标量全局常量，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；流水线中的其它前置 DCE 会清掉标量提升遗留的死 phi。O1 末尾由 InstCombine 和 ConstFold 规范化局部整数算术，再执行通用 GEP 地址归纳强度削弱，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。GEP 变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量特化、CFG 内联、常量折叠、CSE、LICM 等主动优化。O1 开头先传播只读标量全局常量，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；第一次标量提升会暴露 `NoMemory` 调用摘要，随后第二轮全局标量局部化和提升可安全跨纯调用保留状态。常量实参特化后立即折叠常量、清理 CFG 和死代码，再按统一成本模型执行递归及普通纯标量 CFG 内联。O1 末尾由 InstCombine 和 ConstFold 规范化局部整数算术，再执行通用 GEP 地址归纳强度削弱，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。GEP 变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
 
 ## Pass 列表
 
@@ -67,6 +74,10 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 - `x == x` 简化成 `true`。
 - 所有 incoming 都相同的 `phi` 简化成那个唯一值。
 
+### `ConstSpecializePass` (`const_specialize.rs`)
+
+对具有标量常量实参的唯一内部调用目标创建有预算的函数变体，并在变体中把对应形参使用替换为常量。变换只使用符号唯一性、完整调用签名、参数 use-def 和统一的函数/模块代码增长预算；不读取函数名含义、变量名、块名或调用所在测例。只有至少被使用两次的形参参与特化；直接自递归函数保守跳过。每个函数的总变体数、轮数、块数、活动指令数和完整指令槽数均有固定上限，只传播 i1/i32/f32 标量常量。紧随其后的 ConstFold、SimplifyCfg 和 DCE 负责折叠分支及清理不可达路径。
+
 ### `InstCombinePass` (`inst_combine.rs`)
 
 逐指令执行的通用整数表达式规范化。它遍历所有函数，只检查当前指令及其操作数的直接定义，不读取函数名、变量名、块名，也不匹配整函数或 CFG 形状。目前支持：
@@ -90,6 +101,8 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 - 如果 `branch` 条件是常量，直接选定唯一可达的目标块。
 - 当删掉某条 CFG 边时，同步删除目标块里 `phi` 对应的 incoming。
 - 对仅合并布尔值并立即分支的 `phi` 块，如果所有动态 incoming 都能证明等于分支条件，则把前驱边直接穿透到分支目标；目前要求至少一个目标块直接返回，并拒绝会改变后继 `phi` 的情况。
+- 对可安全推测的一条布尔 RHS 做局部短路 if-conversion，并把无副作用的条件加减 diamond 改写为 wrapping 算术选择；每次改写后都用 verifier 复核，证明失败则原样回退。
+- 迭代移除不可达块、转发空跳转块并合并唯一前驱的无 phi 线性基本块；同步重映射 BlockId、指令定义位置和后继 phi incoming。
 
 ### `TailRecursionPass` (`tail_recursion.rs`)
 
@@ -111,7 +124,7 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 
 ### `GlobalScalarLocalizePass` (`global_scalar_localize.rs`)
 
-把叶函数中反复访问的标量全局变量暂存为局部标量：入口加载一次，每个正常返回点写回一次，再由后续 `ScalarPromotePass` 提升为 SSA。候选全局必须只被直接 `load`/`store` 使用，函数内不能有调用，且候选地址不能参与 `memzero`，从而避免指针逃逸、调用可见性及别名问题。处理顺序按全局名排序并受固定数量和下游标量提升规模预算约束，保证代码生成稳定且避免大函数编译时间膨胀。
+把函数中反复访问的标量全局变量暂存为局部标量：入口加载一次，每个正常返回点写回一次，再由后续 `ScalarPromotePass` 提升为 SSA。候选全局必须只被直接 `load`/`store` 使用，候选地址不能参与 `memzero` 或逃逸；函数可以包含经闭世界摘要和完整签名证明为 `NoMemory` 的有结果调用，其它调用仍保守拒绝，从而保证局部状态不会被调用观察或改写。处理顺序按全局名排序并受固定数量和下游标量提升规模预算约束，保证代码生成稳定且避免大函数编译时间膨胀。
 
 ### `ScalarPromotePass` (`scalar_promote.rs`)
 
@@ -135,6 +148,10 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 变换在调用处拆出 continuation，克隆 pass 开始时快照中的全部 callee CFG、SSA 值、phi 和 terminator，把形参映射到实参，并让所有克隆 return 跳到 continuation。非 void 返回统一用 phi 合并，因此多个返回路径保持原 edge 语义。原后继 phi 的前驱边会从调用块改到 continuation。每个调用点完成后立即执行 IR verifier；函数级标记保证重复运行不会再增加递归深度。
 
 当前证明边界有意保守：只接受 i1/i32 返回，入口不可达的死 CFG 不参与调用点、指令增长和克隆，但函数总块上限及禁用类型检查仍覆盖整个 IR；拒绝 f32、void/result-less call、active `alloca`、`memzero`、歧义调用目标和签名不一致的自调用。普通整数、指针、load/store/GEP、phi 及有结果的调用会按原控制流与副作用顺序克隆。pass 放在 `ScalarPromotePass` 之后，使已安全提升的标量栈槽不会阻挡候选；只接入 O1。
+
+### `CfgInlinePass` (`recursive_inline.rs`)
+
+对唯一内部调用目标执行有预算的普通 CFG 内联。候选必须是无内存、无调用、无浮点和无栈对象的纯 i1/i32 CFG；允许 phi、分支和多返回。pass 使用与递归 CFG 内联相同的 continuation 拆分、全值预分配、phi/terminator 克隆和返回值合并逻辑，但按独立的普通函数块数、指令数、调用点、调用方及模块增长预算决定收益。所有候选和调用点来自 pass 入口快照，符号名只用于唯一调用解析，不参与收益判断。
 
 ### `InlineSmallExprPass` (`inline.rs`)
 
