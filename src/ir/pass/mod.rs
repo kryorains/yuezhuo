@@ -1,3 +1,4 @@
+mod aarch64_thread;
 mod const_fold;
 mod const_specialize;
 mod cse;
@@ -23,6 +24,7 @@ mod tail_recursion;
 mod util;
 
 use super::Module;
+use aarch64_thread::AArch64ThreadOutlinePass;
 use const_fold::ConstFoldPass;
 use const_specialize::ConstSpecializePass;
 use cse::CsePass;
@@ -52,6 +54,9 @@ pub enum OptLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PassOptions {
     pub enable_simple_loop_unroll: bool,
+    /// Enables strict dual-core outlining. The driver sets this only for an
+    /// AArch64 O1 compilation; the default/non-AArch64 paths leave it false.
+    pub enable_aarch64_threading: bool,
 }
 
 pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptions) {
@@ -99,6 +104,12 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             }
             pipeline.add(InstCombinePass::new());
             pipeline.add(ConstFoldPass::new());
+            // Thread outlining proves exact counter-indexed typed GEPs before
+            // address strength reduction replaces them with pointer phis. It
+            // only appends verified helpers and leaves the scalar loop intact.
+            if options.enable_aarch64_threading {
+                pipeline.add(AArch64ThreadOutlinePass::new());
+            }
             // Run address strength reduction after transforms whose matching
             // intentionally expects the source loop-phi set. In particular,
             // this preserves the existing simple-unroll profitability gate.

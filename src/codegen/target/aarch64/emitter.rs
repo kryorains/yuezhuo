@@ -5,7 +5,7 @@ use crate::codegen::common::{
     emit_ir_data_section, entry_early_return, ir_align_to, loop_rotated_block_order, IrFuncLayout,
     IrModuleCtx,
 };
-use crate::ir::{Function, Module};
+use crate::ir::{AArch64ThreadPlan, Function, FunctionId, Module};
 
 pub(super) fn emit_asm(module: &Module) -> String {
     AArch64IrEmitter::new(module).emit()
@@ -13,8 +13,15 @@ pub(super) fn emit_asm(module: &Module) -> String {
 
 impl<'a> AArch64IrEmitter<'a> {
     fn new(module: &'a Module) -> Self {
+        let thread_plans = module
+            .aarch64_thread_plans
+            .iter()
+            .filter(|plan| super::thread::valid_plan(module, plan))
+            .cloned()
+            .collect();
         Self {
             ctx: IrModuleCtx::new(module),
+            thread_plans,
             out: String::new(),
         }
     }
@@ -22,37 +29,59 @@ impl<'a> AArch64IrEmitter<'a> {
     fn emit(mut self) -> String {
         self.out
             .push_str(&emit_ir_data_section(self.ctx.module, ".word"));
+        self.out
+            .push_str(&super::thread::emit_contexts(&self.thread_plans));
         self.out.push_str(".text\n");
-        for func in &self.ctx.module.funcs {
-            AArch64IrFuncEmitter::new(&mut self, func).emit();
+        for function_idx in 0..self.ctx.module.funcs.len() {
+            let func = &self.ctx.module.funcs[function_idx];
+            let plan = self
+                .thread_plans
+                .iter()
+                .find(|plan| plan.parent == FunctionId(function_idx))
+                .cloned();
+            AArch64IrFuncEmitter::new(&mut self, func, plan).emit();
         }
+        self.out.push_str(&super::thread::emit_workers(
+            self.ctx.module,
+            &self.thread_plans,
+        ));
         self.out
     }
 }
 
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
-    fn new(parent: &'a mut AArch64IrEmitter<'b>, func: &'b Function) -> Self {
+    fn new(
+        parent: &'a mut AArch64IrEmitter<'b>,
+        func: &'b Function,
+        thread_plan: Option<AArch64ThreadPlan>,
+    ) -> Self {
         Self {
             parent,
             func,
             layout: IrFuncLayout::new(func),
-            phi_regs: AArch64PhiRegs::new(func),
+            phi_regs: AArch64PhiRegs::new(func, thread_plan.is_some()),
             local_regs: crate::codegen::common::IrLocalRegs::new(
                 func,
                 &["x3", "x4", "x5", "x6", "x7"],
                 false,
             ),
             value_use_counts: crate::codegen::common::ir_value_use_counts(func),
+            thread_plan,
             body: String::new(),
             return_label: format!(".L_return_{}", func.name),
         }
     }
 
     fn emit(mut self) {
-        let early_return = entry_early_return(self.func).and_then(|plan| {
-            self.pre_prologue_early_return(&plan)
-                .map(|prelude| (plan, prelude))
-        });
+        let early_return = self
+            .thread_plan
+            .is_none()
+            .then(|| entry_early_return(self.func))
+            .flatten()
+            .and_then(|plan| {
+                self.pre_prologue_early_return(&plan)
+                    .map(|prelude| (plan, prelude))
+            });
         self.emit_params();
         if let Some((plan, _)) = &early_return {
             self.emit_phi_copies(self.func.entry.0, plan.slow_block.0);
@@ -76,11 +105,20 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 self.emit_inst(inst);
             }
             if let Some(terminator) = &block.terminator {
-                self.emit_terminator(
-                    block_idx,
-                    terminator,
-                    block_order.get(order_idx + 1).copied(),
-                );
+                if self
+                    .thread_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.preheader.0 == block_idx)
+                {
+                    let plan = self.thread_plan.clone().unwrap();
+                    self.emit_thread_dispatch(&plan);
+                } else {
+                    self.emit_terminator(
+                        block_idx,
+                        terminator,
+                        block_order.get(order_idx + 1).copied(),
+                    );
+                }
             }
         }
         let setup = self.body[..setup_end].to_string();

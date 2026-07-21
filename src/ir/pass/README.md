@@ -43,9 +43,10 @@
   28. `SimpleLoopUnrollPass`（按目标收益门控）
   29. `InstCombinePass`
   30. `ConstFoldPass`
-  31. `GepInductionPass`
-  32. `SimplifyCfgPass`
-  33. `DcePass`
+  31. `AArch64ThreadOutlinePass`（仅显式启用的 AArch64 O1）
+  32. `GepInductionPass`
+  33. `SimplifyCfgPass`
+  34. `DcePass`
 
 O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量特化、CFG 内联、常量折叠、CSE、LICM 等主动优化。O1 开头先传播只读标量全局常量，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；第一次标量提升会暴露 `NoMemory` 调用摘要，随后第二轮全局标量局部化和提升可安全跨纯调用保留状态。常量实参特化后立即折叠常量、清理 CFG 和死代码，再按统一成本模型执行递归及普通纯标量 CFG 内联。O1 末尾由 InstCombine 和 ConstFold 规范化局部整数算术，再执行通用 GEP 地址归纳强度削弱，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。GEP 变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
 
@@ -184,6 +185,14 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 转发支配当前位置且来自只读对象的重复加载。
 
 它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
+
+### `AArch64ThreadOutlinePass` (`aarch64_thread.rs`)
+
+仅在 driver 通过 `PassOptions` 显式选择 AArch64 O1 时运行的保守双核 outlining。候选必须是入口可达、非嵌套、专用 preheader、唯一 latch/exit 的两块自然循环；header 仅有从 0 开始、步长 1 的 i32 counter phi、可安全复制的条件 setup 和直接 signed `< bound`，body/latch 只允许有预算的纯 scalar、typed GEP、4 字节 load/store，并且至少有一个 store。
+
+内存证明要求每个 load/store 地址都是 body 内 `root[counter]` 的单索引 typed GEP，全部访问共享同一精确 root，GEP 结果不得逃出当次 memory use；未知 A/B 别名、偏移或间接索引、call、alloca、memzero、reduction、live-out、Fdiv 和动态/零整数除数均拒绝。helper 是带 `begin/end` 和至多 6 个 i32/指针 capture 的普通 verified IR 函数；原标量循环不改写。目标后端依据 plan 发射阈值检查、静态 context 和 pthread AAPCS64 胶水，因此 generic IR 不伪造 `pthread_t`、i64 或函数指针。
+
+pass 对块、值、body、memory、capture、module candidate、use/provenance work 和 helper 增长均有 hard budget；生成符号与用户函数/global 冲突时禁用。每函数最多一个、每模块最多 16 个 plan，重复执行不会继续增长。它位于 GEP induction 之前以证明原始精确 counter GEP；后续地址强度削弱不改变已经建立的迭代独立性证明。
 
 ### `GepInductionPass` (`gep_induction.rs`)
 

@@ -17,21 +17,23 @@ const MAX_LIVENESS_ITERATIONS: usize = 128;
 /// Within fixed compile-time budgets, every function uses exact CFG liveness,
 /// phi-edge interference coloring and copy affinity. Over-budget functions use
 /// a conservative unique-register policy. Leaf functions may use x9-x15 in
-/// addition to x19-x28; non-leaf functions use only saved x19-x28.
+/// addition to x19-x28; non-leaf functions use only saved x19-x28. A backend
+/// plan with implicit calls forces the latter policy even when IR has no Call.
 pub(super) struct AArch64PhiRegs {
     regs: HashMap<ValueId, &'static str>,
     saved_regs: Vec<&'static str>,
 }
 
 impl AArch64PhiRegs {
-    pub(super) fn new(func: &Function) -> Self {
+    pub(super) fn new(func: &Function, force_non_leaf: bool) -> Self {
+        let leaf_registers_allowed = !force_non_leaf && is_leaf(func);
         if func.blocks.len() > MAX_INTERFERENCE_BLOCKS
             || func.values.len() > MAX_INTERFERENCE_VALUES
         {
-            return Self::new_conservative(func);
+            return Self::new_conservative(func, leaf_registers_allowed);
         }
 
-        let is_leaf = is_leaf(func);
+        let is_leaf = leaf_registers_allowed;
         let scores = weighted_use_scores(func);
         let block_local_values = collect_block_local_values(func);
         let direct_branch_conditions = collect_direct_branch_conditions(func);
@@ -67,7 +69,7 @@ impl AArch64PhiRegs {
         if candidates.len() > MAX_INTERFERENCE_CANDIDATES
             || func.blocks.len().saturating_mul(candidates.len()) > MAX_LIVENESS_CELLS
         {
-            return Self::new_conservative(func);
+            return Self::new_conservative(func, leaf_registers_allowed);
         }
 
         // Rank loop phis and other cross-block values in one pool. Reserving all
@@ -84,7 +86,7 @@ impl AArch64PhiRegs {
             .map(|(value, _)| *value)
             .collect::<HashSet<_>>();
         let Some(interference) = interference_graph(func, &candidate_set) else {
-            return Self::new_conservative(func);
+            return Self::new_conservative(func, leaf_registers_allowed);
         };
         let affinities = phi_affinities(func, &candidate_set, &interference);
         let mut regs = HashMap::new();
@@ -116,8 +118,7 @@ impl AArch64PhiRegs {
         Self { regs, saved_regs }
     }
 
-    fn new_conservative(func: &Function) -> Self {
-        let is_leaf = is_leaf(func);
+    fn new_conservative(func: &Function, is_leaf: bool) -> Self {
         let mut available = Vec::new();
         if is_leaf {
             available.extend(LEAF_REGS);
@@ -548,7 +549,7 @@ mod tests {
         func.set_terminator(body, Terminator::Return(None));
         func.mark_reduction_jammed();
 
-        let regs = AArch64PhiRegs::new(&func);
+        let regs = AArch64PhiRegs::new(&func, false);
         assert!(regs.reg(lhs).is_some());
         assert!(regs.reg(rhs).is_some());
         assert_ne!(regs.reg(lhs), regs.reg(rhs));

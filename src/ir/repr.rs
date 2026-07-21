@@ -20,10 +20,28 @@ pub enum Type {
     Array { elem: Box<Type>, len: usize },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Module {
     pub globals: Vec<Global>,
     pub funcs: Vec<Function>,
+    /// Target-specific plans are populated only by the explicitly gated
+    /// AArch64 O1 outlining pass. They do not alter the source functions.
+    pub(crate) aarch64_thread_plans: Vec<AArch64ThreadPlan>,
+}
+
+impl fmt::Debug for Module {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut module = formatter.debug_struct("Module");
+        module
+            .field("globals", &self.globals)
+            .field("funcs", &self.funcs);
+        // Preserve byte-for-byte debug IR shape for O0, non-AArch64, and
+        // rejected AArch64 modules. Only a successful explicit plan is shown.
+        if !self.aarch64_thread_plans.is_empty() {
+            module.field("aarch64_thread_plans", &self.aarch64_thread_plans);
+        }
+        module.finish()
+    }
 }
 
 impl Module {
@@ -31,6 +49,7 @@ impl Module {
         Self {
             globals: Vec::new(),
             funcs: Vec::new(),
+            aarch64_thread_plans: Vec::new(),
         }
     }
 
@@ -47,6 +66,32 @@ pub struct Global {
     pub ty: Type,
     pub is_const: bool,
     pub init: Option<Const>,
+}
+
+/// A backend-only dual-core dispatch around an unchanged scalar loop.
+///
+/// The range helper is an ordinary verified IR function. pthread ABI details
+/// and the static context remain AArch64 assembly concerns, so no integer or
+/// function-pointer stand-ins are introduced into the generic IR type system.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AArch64ThreadPlan {
+    pub(crate) parent: FunctionId,
+    pub(crate) helper: FunctionId,
+    pub(crate) preheader: BlockId,
+    pub(crate) header: BlockId,
+    pub(crate) body: BlockId,
+    pub(crate) exit: BlockId,
+    pub(crate) bound: ValueId,
+    pub(crate) dispatch_setup: Vec<ValueId>,
+    pub(crate) captures: Vec<AArch64ThreadCapture>,
+    pub(crate) context_symbol: String,
+    pub(crate) worker_symbol: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AArch64ThreadCapture {
+    pub(crate) value: ValueId,
+    pub(crate) ty: Type,
 }
 
 #[derive(Clone)]

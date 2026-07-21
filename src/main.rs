@@ -117,6 +117,10 @@ fn main() {
         // The current AArch64 stack-oriented lowering makes cloned scalar
         // bodies slower; keep the transform behind a target profitability gate.
         enable_simple_loop_unroll: target != codegen::Target::AArch64,
+        // pthread glue is target ABI code and is never planned at O0 or for a
+        // different backend.
+        enable_aarch64_threading: target == codegen::Target::AArch64
+            && opt_level == ir::pass::OptLevel::O1,
     };
     ir::pass::run_pipeline(&mut module, opt_level, pass_options);
 

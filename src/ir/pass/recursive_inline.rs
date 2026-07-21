@@ -974,6 +974,7 @@ mod tests {
         o1.add_func(func);
         let options = PassOptions {
             enable_simple_loop_unroll: false,
+            enable_aarch64_threading: false,
         };
 
         run_pipeline(&mut o0, OptLevel::O0, options);
