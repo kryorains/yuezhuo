@@ -84,6 +84,10 @@ pub(crate) struct AArch64ThreadPlan {
     pub(crate) bound: ValueId,
     pub(crate) dispatch_setup: Vec<ValueId>,
     pub(crate) captures: Vec<AArch64ThreadCapture>,
+    /// Minimum signed outer trip bound required before creating a worker.
+    /// This stays at 65,536 unless the proof finds guaranteed constant inner
+    /// work and conservatively converts that work into outer iterations.
+    pub(crate) parallel_threshold: i32,
     pub(crate) context_symbol: String,
     pub(crate) worker_symbol: String,
 }

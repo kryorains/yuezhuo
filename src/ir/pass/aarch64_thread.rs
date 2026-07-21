@@ -1,5 +1,7 @@
 use super::dominators::{ControlFlowGraph, Dominators};
-use super::loop_analysis::{analyze_i32_induction, LoopInfo, NaturalLoop};
+use super::loop_analysis::{
+    analyze_const_i32_trip_count, analyze_i32_induction, LoopInfo, NaturalLoop,
+};
 use super::ModulePass;
 use crate::ir::{
     AArch64ThreadCapture, AArch64ThreadPlan, BinaryOp, BlockId, CastOp, CmpOp, Const, Function,
@@ -10,17 +12,24 @@ use std::collections::{HashMap, HashSet};
 const MAX_BLOCKS: usize = 1024;
 const MAX_VALUES: usize = 8192;
 const MAX_FUNCTIONS: usize = 256;
-const MAX_ACTIVE_BODY_INSTS: usize = 64;
-const MAX_MEMORY_INSTS: usize = 32;
+const MAX_GLOBALS: usize = 4096;
+const MAX_REGION_BLOCKS: usize = 128;
+const MAX_REGION_INSTS: usize = 1024;
+const MAX_MEMORY_INSTS: usize = 256;
+const MAX_GEP_CHAIN: usize = 32;
+const MAX_TYPE_DEPTH: usize = 32;
+const MAX_DEPENDENCE_VALUES: usize = 2048;
 const MAX_CAPTURES: usize = 6;
 const MAX_PLANS_PER_MODULE: usize = 16;
 const MAX_PROOF_WORK: usize = 65_536;
 const MAX_ADDED_VALUES: usize = 2048;
-const MIN_ACTIVE_BODY_COST: usize = 8;
+const MIN_ACTIVE_REGION_COST: usize = 8;
+const DEFAULT_PARALLEL_THRESHOLD: u32 = 65_536;
 
-/// Outlines an intentionally narrow owner-computes loop into a verified range
-/// helper. The original loop is not rewritten: AArch64 emission adds a guarded
-/// pthread dispatch and retains the exact scalar edge as its failure path.
+/// Outlines a strictly proven outer owner-computes loop into a verified range
+/// helper. The original loop remains unchanged: AArch64 emission inserts the
+/// pthread dispatch at its preheader and retains the exact scalar edge as the
+/// create-failure path.
 pub(super) struct AArch64ThreadOutlinePass;
 
 impl AArch64ThreadOutlinePass {
@@ -42,13 +51,19 @@ impl ModulePass for AArch64ThreadOutlinePass {
 struct Candidate {
     preheader: BlockId,
     header: BlockId,
-    body: BlockId,
+    /// Kept in the existing plan slot named `body`; for a multi-block region
+    /// this is the unique outer latch.
+    latch: BlockId,
     exit: BlockId,
     counter: ValueId,
     counter_next: ValueId,
+    condition: ValueId,
     bound: ValueId,
+    region_blocks: Vec<BlockId>,
     dispatch_setup: Vec<ValueId>,
     captures: Vec<AArch64ThreadCapture>,
+    parallel_threshold: i32,
+    loop_rank: usize,
 }
 
 struct PendingOutline {
@@ -69,6 +84,8 @@ struct UseSite {
 enum UseRole {
     LoadPointer,
     StorePointer,
+    GepBase,
+    GepIndex,
     Phi {
         predecessor: BlockId,
         target: BlockId,
@@ -97,9 +114,39 @@ impl WorkBudget {
     }
 }
 
+struct RegionAnalysis {
+    active_cost: usize,
+    written_roots: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct PointerPath {
+    root: String,
+    root_is_const: bool,
+    links: Vec<PointerLink>,
+    geps: Vec<ValueId>,
+}
+
+#[derive(Clone)]
+struct PointerLink {
+    index: ValueId,
+    selected_ty: Type,
+}
+
+struct MemoryAccess {
+    path: PointerPath,
+    is_store: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SliceSelector {
+    depth: usize,
+    selected_ty: Type,
+}
+
 fn outline_module(module: &mut Module) {
     let original_function_count = module.funcs.len();
-    if original_function_count > MAX_FUNCTIONS {
+    if original_function_count > MAX_FUNCTIONS || module.globals.len() > MAX_GLOBALS {
         return;
     }
     let mut symbol_counts = HashMap::<String, usize>::new();
@@ -157,6 +204,11 @@ fn outline_module(module: &mut Module) {
         let cfg = ControlFlowGraph::new(func);
         let dom = Dominators::new(func, &cfg);
         let loop_info = LoopInfo::new(&cfg, &dom);
+        let Some(uses) = collect_uses(func, &mut budget) else {
+            return;
+        };
+        let mut selected = None::<Candidate>;
+        let mut maximum_outer_loop_rank = 0usize;
         for (loop_idx, natural_loop) in loop_info.loops().iter().enumerate() {
             let Some(nesting_work) = loop_info
                 .loops()
@@ -168,62 +220,76 @@ fn outline_module(module: &mut Module) {
             if budget.spend(nesting_work).is_none() {
                 return;
             }
-            if loop_info
-                .loops()
-                .iter()
-                .enumerate()
-                .any(|(other_idx, other)| {
-                    other_idx != loop_idx
-                        && natural_loop
-                            .blocks
-                            .iter()
-                            .any(|block| other.blocks.contains(block))
-                })
-            {
-                continue;
-            }
-            let Some(candidate) =
-                match_candidate(module, func, &cfg, &dom, natural_loop, &mut budget)
+            let Some(nested_loops) = complete_nested_loops(&loop_info, loop_idx, &mut budget)
             else {
                 continue;
             };
-
-            let range_symbol = format!("__yuezhuo_parallel_range_{}", function_idx);
-            let worker_symbol = format!("__yuezhuo_parallel_worker_{}", function_idx);
-            let context_symbol = format!("__yuezhuo_parallel_context_{}", function_idx);
-            if [&range_symbol, &worker_symbol, &context_symbol]
-                .into_iter()
-                .any(|symbol| reserved_symbols.contains(symbol))
-            {
-                continue;
-            }
-            let Some(helper) = build_range_helper(func, &candidate, range_symbol.clone()) else {
+            maximum_outer_loop_rank =
+                maximum_outer_loop_rank.max(nested_loops.len().saturating_add(1));
+            let Some(candidate) = match_candidate(
+                module,
+                func,
+                &cfg,
+                &dom,
+                natural_loop,
+                &nested_loops,
+                &uses,
+                &mut budget,
+            ) else {
                 continue;
             };
-            let Some(next_added_values) = added_values.checked_add(helper.values.len()) else {
-                return;
-            };
-            if next_added_values > MAX_ADDED_VALUES {
-                continue;
-            }
-            added_values = next_added_values;
-            reserved_symbols.insert(range_symbol);
-            reserved_symbols.insert(worker_symbol.clone());
-            reserved_symbols.insert(context_symbol.clone());
-            // SysY has no user-created threads. While this per-site context is
-            // active, both lanes execute this call-free helper and the parent
-            // cannot continue (or recurse) until join/completion. Consequently
-            // another activation cannot overlap this static context.
-            pending.push(PendingOutline {
-                parent: FunctionId(function_idx),
-                candidate,
-                helper,
-                context_symbol,
-                worker_symbol,
+            let is_better = selected.as_ref().is_none_or(|best| {
+                candidate.parallel_threshold < best.parallel_threshold
+                    || candidate.parallel_threshold == best.parallel_threshold
+                        && candidate.region_blocks.len() > best.region_blocks.len()
             });
-            // At most one candidate per source function.
-            break;
+            if is_better {
+                selected = Some(candidate);
+            }
         }
+        let Some(candidate) = selected else {
+            continue;
+        };
+        if candidate.loop_rank < maximum_outer_loop_rank {
+            // Do not pay thread startup for a shallower side loop while a
+            // structurally more expensive loop nest in the same function
+            // remains serial. This is a target-cost guard, not a legality fact.
+            continue;
+        }
+
+        let range_symbol = format!("__yuezhuo_parallel_range_{}", function_idx);
+        let worker_symbol = format!("__yuezhuo_parallel_worker_{}", function_idx);
+        let context_symbol = format!("__yuezhuo_parallel_context_{}", function_idx);
+        if [&range_symbol, &worker_symbol, &context_symbol]
+            .into_iter()
+            .any(|symbol| reserved_symbols.contains(symbol))
+        {
+            continue;
+        }
+        let Some(helper) = build_range_helper(func, &candidate, range_symbol.clone(), &mut budget)
+        else {
+            continue;
+        };
+        let Some(next_added_values) = added_values.checked_add(helper.values.len()) else {
+            return;
+        };
+        if next_added_values > MAX_ADDED_VALUES {
+            continue;
+        }
+        added_values = next_added_values;
+        reserved_symbols.insert(range_symbol);
+        reserved_symbols.insert(worker_symbol.clone());
+        reserved_symbols.insert(context_symbol.clone());
+        // SysY has no user-created threads. Both lanes execute a call-free
+        // helper and the parent waits for completion, so another activation
+        // cannot overlap this per-site static context.
+        pending.push(PendingOutline {
+            parent: FunctionId(function_idx),
+            candidate,
+            helper,
+            context_symbol,
+            worker_symbol,
+        });
     }
 
     if module.funcs.len().checked_add(pending.len()).is_none() {
@@ -237,53 +303,105 @@ fn outline_module(module: &mut Module) {
             helper,
             preheader: candidate.preheader,
             header: candidate.header,
-            body: candidate.body,
+            body: candidate.latch,
             exit: candidate.exit,
             bound: candidate.bound,
             dispatch_setup: candidate.dispatch_setup,
             captures: candidate.captures,
+            parallel_threshold: candidate.parallel_threshold,
             context_symbol: outline.context_symbol,
             worker_symbol: outline.worker_symbol,
         });
     }
 }
 
+fn complete_nested_loops<'a>(
+    loop_info: &'a LoopInfo,
+    outer_idx: usize,
+    budget: &mut WorkBudget,
+) -> Option<Vec<&'a NaturalLoop>> {
+    let outer = loop_info.loops().get(outer_idx)?;
+    let mut nested = Vec::new();
+    for (other_idx, other) in loop_info.loops().iter().enumerate() {
+        if other_idx == outer_idx {
+            continue;
+        }
+        budget.spend(other.blocks.len())?;
+        if !outer
+            .blocks
+            .iter()
+            .any(|block| other.blocks.contains(block))
+        {
+            continue;
+        }
+        // Reject an inner candidate that is contained by an outer loop and any
+        // partially overlapping/non-natural nesting. A selected outer region
+        // must contain every intersecting natural loop in full.
+        if !other.blocks.is_subset(&outer.blocks) || other.blocks.len() >= outer.blocks.len() {
+            return None;
+        }
+        let entering = other.unique_entering_pred?;
+        if !outer.blocks.contains(&entering) || other.blocks.contains(&entering) {
+            return None;
+        }
+        nested.push(other);
+    }
+    Some(nested)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn match_candidate(
     module: &Module,
     func: &Function,
     cfg: &ControlFlowGraph,
     dom: &Dominators,
     natural_loop: &NaturalLoop,
+    nested_loops: &[&NaturalLoop],
+    uses: &[Vec<UseSite>],
     budget: &mut WorkBudget,
 ) -> Option<Candidate> {
     budget.spend(func.blocks.len())?;
-    if natural_loop.blocks.len() != 2 {
+    if !(2..=MAX_REGION_BLOCKS).contains(&natural_loop.blocks.len()) {
         return None;
     }
     let preheader = natural_loop.dedicated_preheader?;
     let header = natural_loop.header;
-    let body = natural_loop.unique_latch()?;
+    let latch = natural_loop.unique_latch()?;
     let exit = natural_loop.unique_exit()?;
-    if body == header
+    if latch == header
         || natural_loop.exit_edges.as_slice() != [(header, exit)]
         || func.blocks.get(preheader.0)?.terminator != Some(Terminator::Jump(header))
-        || func.blocks.get(body.0)?.terminator != Some(Terminator::Jump(header))
-        || cfg.preds.get(body.0)?.as_slice() != [header]
+        || func.blocks.get(latch.0)?.terminator != Some(Terminator::Jump(header))
     {
         return None;
     }
+
     let header_predecessors = cfg.preds.get(header.0)?;
     if header_predecessors.len() != 2
         || !header_predecessors.contains(&preheader)
-        || !header_predecessors.contains(&body)
-        || func
-            .blocks
-            .get(exit.0)?
-            .insts
-            .iter()
-            .any(|inst| matches!(inst.kind, InstKind::Phi { .. }))
+        || !header_predecessors.contains(&latch)
     {
         return None;
+    }
+    for block in &natural_loop.blocks {
+        budget.spend(1)?;
+        if !dom.is_reachable(*block) || !dom.dominates(header, *block) {
+            return None;
+        }
+        if *block != header
+            && cfg
+                .preds
+                .get(block.0)?
+                .iter()
+                .any(|pred| !natural_loop.blocks.contains(pred))
+        {
+            return None;
+        }
+        if cfg.succs.get(block.0)?.iter().any(|target| {
+            !(natural_loop.blocks.contains(target) || *block == header && *target == exit)
+        }) {
+            return None;
+        }
     }
 
     let header_block = func.blocks.get(header.0)?;
@@ -295,17 +413,21 @@ fn match_candidate(
     else {
         return None;
     };
-    if *then_target != body || *else_target != exit {
+    if !natural_loop.blocks.contains(then_target) || *else_target != exit {
         return None;
     }
 
     let mut counter = None;
     let mut condition = None;
-    let mut non_condition_values = Vec::new();
+    let mut setup_values = Vec::new();
     for inst in &header_block.insts {
         budget.spend(1)?;
         match &inst.kind {
-            InstKind::Nop => {}
+            InstKind::Nop => {
+                if inst.result.is_some() {
+                    return None;
+                }
+            }
             InstKind::Phi { .. } => {
                 if counter.replace(inst.result?).is_some() {
                     return None;
@@ -320,7 +442,7 @@ fn match_candidate(
                     return None;
                 }
             }
-            _ => non_condition_values.push(inst.result?),
+            _ => setup_values.push(inst.result?),
         }
     }
     let counter = counter?;
@@ -332,48 +454,43 @@ fn match_candidate(
     {
         return None;
     }
+
     let induction = analyze_i32_induction(func, natural_loop, counter)?;
     if induction.step != 1
         || const_i32(func, induction.initial) != Some(0)
         || !matches!(
             func.value(induction.next).kind,
-            ValueKind::Inst(owner, _) if owner == body
+            ValueKind::Inst(owner, _) if owner == latch
         )
     {
         return None;
     }
 
-    let uses = collect_uses(func, budget)?;
-    let counter_uses = uses.get(counter.0)?;
-    if counter_uses
-        .iter()
-        .any(|site| site.block != header && site.block != body)
-        || counter_uses
-            .iter()
-            .filter(|site| site.block == header)
-            .count()
-            != 1
-    {
-        // The successful path skips the scalar header/body entirely. Until a
-        // final-counter merge is represented explicitly, no outside/header
-        // use beyond the loop condition may observe that skipped phi state.
-        return None;
-    }
-    let (captures, memory_root) = analyze_body(
-        module,
+    validate_region_liveouts(
         func,
-        dom,
-        body,
+        natural_loop,
         header,
-        preheader,
+        latch,
         counter,
         induction.next,
-        &uses,
+        *cond,
+        uses,
+        budget,
+    )?;
+    let analysis = analyze_region(
+        module,
+        func,
+        cfg,
+        natural_loop,
+        header,
+        counter,
+        induction.next,
+        uses,
         budget,
     )?;
 
     let dispatch_setup = if value_available_at(func, dom, bound, preheader) {
-        if !non_condition_values.is_empty() {
+        if !setup_values.is_empty() {
             return None;
         }
         Vec::new()
@@ -383,275 +500,647 @@ fn match_candidate(
             func,
             header,
             bound,
-            &non_condition_values,
-            &uses,
-            memory_root,
+            &setup_values,
+            uses,
+            &analysis.written_roots,
             budget,
         )?
     };
 
+    let captures = collect_captures(
+        func,
+        dom,
+        natural_loop,
+        preheader,
+        header,
+        latch,
+        counter,
+        induction.next,
+        *cond,
+        bound,
+        budget,
+    )?;
+    let parallel_threshold = estimate_parallel_threshold(
+        func,
+        cfg,
+        dom,
+        natural_loop,
+        nested_loops,
+        bound,
+        analysis.active_cost,
+        budget,
+    );
+
+    let mut region_blocks = natural_loop.blocks.iter().copied().collect::<Vec<_>>();
+    region_blocks.sort_by_key(|block| (*block != header, block.0));
     Some(Candidate {
         preheader,
         header,
-        body,
+        latch,
         exit,
         counter,
         counter_next: induction.next,
+        condition: *cond,
         bound,
+        region_blocks,
         dispatch_setup,
         captures,
+        parallel_threshold,
+        loop_rank: nested_loops.len().saturating_add(1),
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn analyze_body(
+fn validate_region_liveouts(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    header: BlockId,
+    latch: BlockId,
+    counter: ValueId,
+    counter_next: ValueId,
+    condition: ValueId,
+    uses: &[Vec<UseSite>],
+    budget: &mut WorkBudget,
+) -> Option<()> {
+    for block in &natural_loop.blocks {
+        for inst in &func.blocks.get(block.0)?.insts {
+            let Some(result) = inst.result else {
+                continue;
+            };
+            for site in uses.get(result.0)? {
+                budget.spend(1)?;
+                if !natural_loop.blocks.contains(&site.block) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let counter_uses = uses.get(counter.0)?;
+    if counter_uses
+        .iter()
+        .any(|site| !natural_loop.blocks.contains(&site.block))
+        || counter_uses
+            .iter()
+            .filter(|site| site.block == header)
+            .count()
+            != 1
+        || !counter_uses
+            .iter()
+            .any(|site| site.block == header && site.role == UseRole::Other)
+    {
+        return None;
+    }
+    let condition_uses = uses.get(condition.0)?;
+    if condition_uses.len() != 1
+        || condition_uses[0].block != header
+        || condition_uses[0].role != UseRole::Other
+    {
+        return None;
+    }
+    let backedge_uses = uses
+        .get(counter_next.0)?
+        .iter()
+        .filter(|site| {
+            site.role
+                == (UseRole::Phi {
+                    predecessor: latch,
+                    target: header,
+                })
+        })
+        .count();
+    (backedge_uses == 1).then_some(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_region(
     module: &Module,
     func: &Function,
-    dom: &Dominators,
-    body: BlockId,
+    cfg: &ControlFlowGraph,
+    natural_loop: &NaturalLoop,
     header: BlockId,
-    preheader: BlockId,
     counter: ValueId,
     counter_next: ValueId,
     uses: &[Vec<UseSite>],
     budget: &mut WorkBudget,
-) -> Option<(Vec<AArch64ThreadCapture>, ValueId)> {
-    let block = func.blocks.get(body.0)?;
-    let active = block
-        .insts
-        .iter()
-        .filter(|inst| !matches!(inst.kind, InstKind::Nop))
-        .count();
-    if active == 0 || active > MAX_ACTIVE_BODY_INSTS {
-        return None;
-    }
-
-    let body_results = block
-        .insts
-        .iter()
-        .filter_map(|inst| inst.result)
-        .collect::<HashSet<_>>();
-    let mut defined = HashSet::new();
-    let mut memory_count = 0usize;
-    let mut has_store = false;
-    let mut memory_root = None;
-    let mut body_cost = 0usize;
-
-    for (inst_idx, inst) in block.insts.iter().enumerate() {
-        budget.spend(1)?;
-        if matches!(inst.kind, InstKind::Nop) {
-            continue;
+) -> Option<RegionAnalysis> {
+    let region_exit = natural_loop.unique_exit()?;
+    let mut instruction_count = 0usize;
+    let mut active_cost = 0usize;
+    for block in sorted_region_blocks(natural_loop, header) {
+        let source_block = func.blocks.get(block.0)?;
+        instruction_count = instruction_count.checked_add(source_block.insts.len())?;
+        if instruction_count > MAX_REGION_INSTS {
+            return None;
         }
-        for operand in inst_operands(&inst.kind) {
+        match source_block.terminator.as_ref()? {
+            Terminator::Return(_) => return None,
+            Terminator::Jump(target) => {
+                if !natural_loop.blocks.contains(target) {
+                    return None;
+                }
+            }
+            Terminator::Branch {
+                cond,
+                then_target,
+                else_target,
+            } => {
+                if func.value(*cond).ty != Type::I1
+                    || !(natural_loop.blocks.contains(then_target)
+                        || block == header && *then_target == region_exit)
+                    || !(natural_loop.blocks.contains(else_target)
+                        || block == header && *else_target == region_exit)
+                {
+                    return None;
+                }
+            }
+        }
+
+        for inst in &source_block.insts {
             budget.spend(1)?;
-            if matches!(func.value(operand).kind, ValueKind::Inst(owner, owner_idx)
-                if owner == body && (owner_idx >= inst_idx || !defined.contains(&operand)))
-            {
-                return None;
-            }
-        }
-        validate_body_inst(func, inst)?;
-        if let Some(result) = inst.result {
-            defined.insert(result);
-        }
-        body_cost = body_cost.checked_add(instruction_cost(inst, counter_next))?;
-
-        match &inst.kind {
-            InstKind::Load { ptr } => {
-                memory_count = memory_count.checked_add(1)?;
-                check_memory_pointer(func, body, counter, *ptr, uses, &mut memory_root)?;
-                let Type::Ptr(pointee) = &func.value(*ptr).ty else {
-                    return None;
-                };
-                if **pointee != func.value(inst.result?).ty || !is_four_byte_scalar(pointee) {
-                    return None;
-                }
-            }
-            InstKind::Store { ptr, value } => {
-                memory_count = memory_count.checked_add(1)?;
-                has_store = true;
-                check_memory_pointer(func, body, counter, *ptr, uses, &mut memory_root)?;
-                let Type::Ptr(pointee) = &func.value(*ptr).ty else {
-                    return None;
-                };
-                if **pointee != func.value(*value).ty || !is_four_byte_scalar(pointee) {
-                    return None;
-                }
-            }
-            InstKind::Gep { .. } => {
-                let result = inst.result?;
-                if uses.get(result.0)?.is_empty()
-                    || uses[result.0].iter().any(|site| {
-                        site.block != body
-                            || !matches!(site.role, UseRole::LoadPointer | UseRole::StorePointer)
+            validate_region_inst(func, inst)?;
+            if let InstKind::Phi { incomings } = &inst.kind {
+                if block == header {
+                    if inst.result != Some(counter) {
+                        return None;
+                    }
+                } else if incomings.is_empty()
+                    || incomings.iter().any(|(pred, _)| {
+                        !natural_loop.blocks.contains(pred) || !cfg.preds[block.0].contains(pred)
                     })
                 {
                     return None;
                 }
             }
-            _ => {}
+            if inst.result != Some(counter)
+                && inst.result != Some(counter_next)
+                && !matches!(inst.kind, InstKind::Nop)
+            {
+                active_cost = active_cost.checked_add(instruction_cost(inst))?;
+            }
         }
     }
-    if !has_store || memory_count > MAX_MEMORY_INSTS || body_cost < MIN_ACTIVE_BODY_COST {
+    if active_cost < MIN_ACTIVE_REGION_COST {
         return None;
     }
 
-    for result in &body_results {
-        for site in uses.get(result.0)? {
-            budget.spend(1)?;
-            if site.block == body {
-                continue;
-            }
-            if *result != counter_next
-                || site.role
-                    != (UseRole::Phi {
-                        predecessor: body,
-                        target: header,
-                    })
-            {
-                return None;
-            }
-        }
-    }
-    let next_uses = uses.get(counter_next.0)?;
-    if next_uses.iter().filter(|site| site.block != body).count() != 1 {
-        return None;
-    }
-
-    let root = memory_root?;
-    validate_memory_root(module, func, dom, root, preheader)?;
-    let mut captures = Vec::new();
-    let mut captured = HashSet::new();
-    for inst in &block.insts {
-        for operand in inst_operands(&inst.kind) {
-            if operand == counter || body_results.contains(&operand) {
-                continue;
-            }
-            match &func.value(operand).kind {
-                ValueKind::Const(_) | ValueKind::Global(_) => continue,
-                ValueKind::Inst(owner, _) if *owner == header => return None,
-                _ => {}
-            }
-            if !value_available_at(func, dom, operand, preheader)
-                || !matches!(func.value(operand).ty, Type::I32 | Type::Ptr(_))
-            {
-                return None;
-            }
-            if captured.insert(operand) {
-                captures.push(AArch64ThreadCapture {
-                    value: operand,
-                    ty: func.value(operand).ty.clone(),
-                });
-                if captures.len() > MAX_CAPTURES {
-                    return None;
-                }
-            }
-        }
-    }
-    Some((captures, root))
+    let written_roots = analyze_memory(module, func, natural_loop, counter, uses, budget)?;
+    Some(RegionAnalysis {
+        active_cost,
+        written_roots,
+    })
 }
 
-fn validate_body_inst(func: &Function, inst: &Inst) -> Option<()> {
+fn validate_region_inst(func: &Function, inst: &Inst) -> Option<()> {
     match &inst.kind {
-        InstKind::Nop => {}
-        InstKind::Load { .. }
-        | InstKind::Unary { .. }
-        | InstKind::Icmp { .. }
-        | InstKind::Fcmp { .. }
-        | InstKind::Cast { .. }
-        | InstKind::Gep { .. } => {
-            inst.result?;
-        }
-        InstKind::Store { .. } => {
+        InstKind::Nop => {
             if inst.result.is_some() {
                 return None;
             }
         }
-        InstKind::Binary { op, rhs, .. } => {
-            inst.result?;
-            if *op == BinaryOp::Fdiv
+        InstKind::Phi { incomings } => {
+            let result = inst.result?;
+            if incomings.is_empty()
+                || incomings
+                    .iter()
+                    .any(|(_, value)| func.value(*value).ty != func.value(result).ty)
+            {
+                return None;
+            }
+        }
+        InstKind::Load { ptr } => {
+            let result = inst.result?;
+            let Type::Ptr(pointee) = &func.value(*ptr).ty else {
+                return None;
+            };
+            if !is_four_byte_scalar(pointee) || **pointee != func.value(result).ty {
+                return None;
+            }
+        }
+        InstKind::Store { ptr, value } => {
+            if inst.result.is_some() {
+                return None;
+            }
+            let Type::Ptr(pointee) = &func.value(*ptr).ty else {
+                return None;
+            };
+            if !is_four_byte_scalar(pointee) || **pointee != func.value(*value).ty {
+                return None;
+            }
+        }
+        InstKind::Unary { op, value } => {
+            let result = inst.result?;
+            let expected = match op {
+                UnaryOp::Ineg => Type::I32,
+                UnaryOp::Fneg => Type::F32,
+                UnaryOp::Not => Type::I1,
+            };
+            if func.value(*value).ty != expected || func.value(result).ty != expected {
+                return None;
+            }
+        }
+        InstKind::Binary { op, lhs, rhs } => {
+            let result = inst.result?;
+            let expected = binary_type(*op);
+            if func.value(*lhs).ty != expected
+                || func.value(*rhs).ty != expected
+                || func.value(result).ty != expected
+                || *op == BinaryOp::Fdiv
                 || (matches!(op, BinaryOp::Idiv | BinaryOp::Imod)
                     && const_i32(func, *rhs).is_none_or(|divisor| divisor == 0))
             {
                 return None;
             }
         }
-        InstKind::Phi { .. }
-        | InstKind::Alloca { .. }
-        | InstKind::MemZero { .. }
-        | InstKind::Call { .. } => return None,
+        InstKind::Icmp { lhs, rhs, .. } => {
+            let result = inst.result?;
+            if func.value(*lhs).ty != Type::I32
+                || func.value(*rhs).ty != Type::I32
+                || func.value(result).ty != Type::I1
+            {
+                return None;
+            }
+        }
+        InstKind::Fcmp { lhs, rhs, .. } => {
+            let result = inst.result?;
+            if func.value(*lhs).ty != Type::F32
+                || func.value(*rhs).ty != Type::F32
+                || func.value(result).ty != Type::I1
+            {
+                return None;
+            }
+        }
+        InstKind::Cast { op, value } => {
+            let result = inst.result?;
+            let (source, destination) = match op {
+                CastOp::I32ToF32 => (Type::I32, Type::F32),
+                CastOp::F32ToI32 => (Type::F32, Type::I32),
+                CastOp::BoolToI32 => (Type::I1, Type::I32),
+                CastOp::I32ToBool => (Type::I32, Type::I1),
+                CastOp::F32ToBool => (Type::F32, Type::I1),
+            };
+            if func.value(*value).ty != source || func.value(result).ty != destination {
+                return None;
+            }
+        }
+        InstKind::Gep { .. } => {
+            if !matches!(
+                inst.result.map(|result| &func.value(result).ty),
+                Some(Type::Ptr(_))
+            ) {
+                return None;
+            }
+        }
+        InstKind::Alloca { .. } | InstKind::MemZero { .. } | InstKind::Call { .. } => return None,
     }
     Some(())
 }
 
-fn check_memory_pointer(
-    func: &Function,
-    body: BlockId,
-    counter: ValueId,
-    pointer: ValueId,
-    uses: &[Vec<UseSite>],
-    memory_root: &mut Option<ValueId>,
-) -> Option<()> {
-    let ValueKind::Inst(owner, inst_idx) = func.value(pointer).kind else {
-        return None;
-    };
-    if owner != body {
-        return None;
+fn binary_type(op: BinaryOp) -> Type {
+    match op {
+        BinaryOp::Iadd
+        | BinaryOp::Isub
+        | BinaryOp::Imul
+        | BinaryOp::Idiv
+        | BinaryOp::Imod
+        | BinaryOp::Iand
+        | BinaryOp::Ior
+        | BinaryOp::Ixor
+        | BinaryOp::Ishl
+        | BinaryOp::Iashr => Type::I32,
+        BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv => Type::F32,
+        BinaryOp::And | BinaryOp::Or => Type::I1,
     }
-    let inst = func.blocks.get(owner.0)?.insts.get(inst_idx)?;
-    let InstKind::Gep { base, indices } = &inst.kind else {
-        return None;
-    };
-    if inst.result != Some(pointer)
-        || indices.as_slice() != [counter]
-        || !matches!(func.value(pointer).ty, Type::Ptr(ref pointee) if is_four_byte_scalar(pointee))
-        || uses.get(pointer.0)?.iter().any(|site| {
-            site.block != body || !matches!(site.role, UseRole::LoadPointer | UseRole::StorePointer)
-        })
-    {
-        return None;
-    }
-    if memory_root.is_some_and(|root| !roots_are_identical(func, root, *base)) {
-        return None;
-    }
-    if memory_root.is_none() {
-        *memory_root = Some(*base);
-    }
-    Some(())
 }
 
-fn roots_are_identical(func: &Function, lhs: ValueId, rhs: ValueId) -> bool {
-    lhs == rhs
-        || matches!(
-            (&func.value(lhs).kind, &func.value(rhs).kind),
-            (ValueKind::Global(lhs_name), ValueKind::Global(rhs_name)) if lhs_name == rhs_name
-        )
-}
-
-fn validate_memory_root(
+fn analyze_memory(
     module: &Module,
     func: &Function,
-    dom: &Dominators,
-    root: ValueId,
-    preheader: BlockId,
-) -> Option<()> {
-    if !matches!(func.value(root).ty, Type::Ptr(_))
-        || !value_available_at(func, dom, root, preheader)
-    {
+    natural_loop: &NaturalLoop,
+    counter: ValueId,
+    uses: &[Vec<UseSite>],
+    budget: &mut WorkBudget,
+) -> Option<HashSet<String>> {
+    let mut accesses = Vec::new();
+    let mut all_region_geps = HashSet::new();
+    let mut proven_geps = HashSet::new();
+    let mut memory_count = 0usize;
+    let mut has_store = false;
+
+    for block in sorted_region_blocks(natural_loop, natural_loop.header) {
+        for inst in &func.blocks.get(block.0)?.insts {
+            if let InstKind::Gep { .. } = inst.kind {
+                all_region_geps.insert(inst.result?);
+            }
+            let (pointer, is_store) = match inst.kind {
+                InstKind::Load { ptr } => (ptr, false),
+                InstKind::Store { ptr, .. } => (ptr, true),
+                _ => continue,
+            };
+            memory_count = memory_count.checked_add(1)?;
+            if memory_count > MAX_MEMORY_INSTS {
+                return None;
+            }
+            has_store |= is_store;
+            let path =
+                trace_typed_global_pointer(module, func, natural_loop, pointer, uses, budget)?;
+            proven_geps.extend(path.geps.iter().copied());
+            accesses.push(MemoryAccess { path, is_store });
+        }
+    }
+    if !has_store || all_region_geps != proven_geps {
         return None;
     }
-    match &func.value(root).kind {
-        ValueKind::Param => Some(()),
-        ValueKind::Inst(_, _) => Some(()),
-        ValueKind::Global(name) => (module
-            .globals
-            .iter()
-            .filter(|global| global.name == *name)
-            .count()
-            == 1)
-            .then_some(()),
-        ValueKind::Const(_) => None,
+
+    let mut written_selectors = HashMap::<String, SliceSelector>::new();
+    for access in accesses.iter().filter(|access| access.is_store) {
+        if access.path.root_is_const {
+            return None;
+        }
+        let selector = partition_selector(func, natural_loop, counter, &access.path, budget)?;
+        if written_selectors
+            .get(&access.path.root)
+            .is_some_and(|existing| *existing != selector)
+        {
+            return None;
+        }
+        written_selectors
+            .entry(access.path.root.clone())
+            .or_insert(selector);
     }
+    for access in &accesses {
+        let Some(expected) = written_selectors.get(&access.path.root) else {
+            // A root with no stores in this region cannot race with either lane;
+            // its complete typed in-object address may otherwise be arbitrary.
+            continue;
+        };
+        let selector = partition_selector(func, natural_loop, counter, &access.path, budget)?;
+        if &selector != expected {
+            return None;
+        }
+    }
+    Some(written_selectors.into_keys().collect())
+}
+
+fn trace_typed_global_pointer(
+    module: &Module,
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    pointer: ValueId,
+    uses: &[Vec<UseSite>],
+    budget: &mut WorkBudget,
+) -> Option<PointerPath> {
+    let mut current = pointer;
+    let mut reverse_links = Vec::new();
+    let mut reverse_geps = Vec::new();
+
+    loop {
+        budget.spend(1)?;
+        if reverse_links.len() > MAX_GEP_CHAIN {
+            return None;
+        }
+        match &func.value(current).kind {
+            ValueKind::Global(name) => {
+                budget.spend(module.globals.len())?;
+                let mut globals = module.globals.iter().filter(|global| global.name == *name);
+                let global = globals.next()?;
+                if globals.next().is_some()
+                    || func.value(current).ty != Type::Ptr(Box::new(global.ty.clone()))
+                    || checked_object_size(&global.ty, budget).is_none()
+                {
+                    return None;
+                }
+                reverse_links.reverse();
+                reverse_geps.reverse();
+                return Some(PointerPath {
+                    root: name.clone(),
+                    root_is_const: global.is_const,
+                    links: reverse_links,
+                    geps: reverse_geps,
+                });
+            }
+            ValueKind::Inst(owner, inst_idx) if natural_loop.blocks.contains(owner) => {
+                let inst = func.blocks.get(owner.0)?.insts.get(*inst_idx)?;
+                if inst.result != Some(current) {
+                    return None;
+                }
+                let InstKind::Gep { base, indices } = &inst.kind else {
+                    return None;
+                };
+                let [index] = indices.as_slice() else {
+                    // The lowering emits one typed array step per GEP. Keeping
+                    // that form makes every selected subobject unambiguous.
+                    return None;
+                };
+                let Type::Ptr(container) = &func.value(*base).ty else {
+                    return None;
+                };
+                let Type::Ptr(selected) = &func.value(current).ty else {
+                    return None;
+                };
+                let Type::Array { elem, len } = &**container else {
+                    return None;
+                };
+                if *len == 0
+                    || **elem != **selected
+                    || func.value(*index).ty != Type::I32
+                    || checked_object_size(container, budget).is_none()
+                    || checked_object_size(selected, budget).is_none()
+                {
+                    return None;
+                }
+                for site in uses.get(current.0)? {
+                    budget.spend(1)?;
+                    if !natural_loop.blocks.contains(&site.block)
+                        || !matches!(
+                            site.role,
+                            UseRole::LoadPointer | UseRole::StorePointer | UseRole::GepBase
+                        )
+                    {
+                        return None;
+                    }
+                }
+                reverse_links.push(PointerLink {
+                    index: *index,
+                    selected_ty: (**selected).clone(),
+                });
+                reverse_geps.push(current);
+                current = *base;
+            }
+            ValueKind::Param | ValueKind::Const(_) | ValueKind::Inst(_, _) => return None,
+        }
+    }
+}
+
+fn checked_object_size(ty: &Type, budget: &mut WorkBudget) -> Option<usize> {
+    let mut current = ty;
+    let mut elements = 1usize;
+    for _ in 0..MAX_TYPE_DEPTH {
+        budget.spend(1)?;
+        match current {
+            Type::Array { elem, len } => {
+                if *len == 0 || i32::try_from(*len).is_err() {
+                    return None;
+                }
+                elements = elements.checked_mul(*len)?;
+                current = elem;
+            }
+            Type::I1 | Type::I32 | Type::F32 => {
+                return elements
+                    .checked_mul(4)
+                    .filter(|size| *size <= i32::MAX as usize)
+            }
+            Type::Ptr(_) => {
+                return elements
+                    .checked_mul(8)
+                    .filter(|size| *size <= i32::MAX as usize)
+            }
+            Type::Void => return None,
+        }
+    }
+    None
+}
+
+fn partition_selector(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    counter: ValueId,
+    path: &PointerPath,
+    budget: &mut WorkBudget,
+) -> Option<SliceSelector> {
+    let mut selector = None;
+    for (depth, link) in path.links.iter().enumerate() {
+        budget.spend(1)?;
+        if link.index == counter {
+            if selector
+                .replace(SliceSelector {
+                    depth,
+                    selected_ty: link.selected_ty.clone(),
+                })
+                .is_some()
+            {
+                return None;
+            }
+        } else if value_depends_on_counter(func, natural_loop, link.index, counter, budget)? {
+            // This includes i+c, flattened dynamic strides, copied/indirect
+            // selectors, and a second counter-dependent subscript.
+            return None;
+        }
+    }
+    selector
+}
+
+fn value_depends_on_counter(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    value: ValueId,
+    counter: ValueId,
+    budget: &mut WorkBudget,
+) -> Option<bool> {
+    let mut stack = vec![value];
+    let mut visited = HashSet::new();
+    while let Some(current) = stack.pop() {
+        budget.spend(1)?;
+        if current == counter {
+            return Some(true);
+        }
+        if !visited.insert(current) {
+            continue;
+        }
+        if visited.len() > MAX_DEPENDENCE_VALUES {
+            return None;
+        }
+        let ValueKind::Inst(owner, inst_idx) = func.value(current).kind else {
+            continue;
+        };
+        if !natural_loop.blocks.contains(&owner) {
+            continue;
+        }
+        let inst = func.blocks.get(owner.0)?.insts.get(inst_idx)?;
+        if inst.result != Some(current) {
+            return None;
+        }
+        stack.extend(inst_operands(&inst.kind));
+    }
+    Some(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_captures(
+    func: &Function,
+    dom: &Dominators,
+    natural_loop: &NaturalLoop,
+    preheader: BlockId,
+    header: BlockId,
+    latch: BlockId,
+    counter: ValueId,
+    counter_next: ValueId,
+    condition: ValueId,
+    bound: ValueId,
+    budget: &mut WorkBudget,
+) -> Option<Vec<AArch64ThreadCapture>> {
+    let region_results = natural_loop
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            func.blocks[block.0]
+                .insts
+                .iter()
+                .filter_map(|inst| inst.result)
+        })
+        .collect::<HashSet<_>>();
+    let mut captured = HashSet::new();
+    let mut captures = Vec::new();
+
+    for block in sorted_region_blocks(natural_loop, header) {
+        for inst in &func.blocks.get(block.0)?.insts {
+            let operands = if inst.result == Some(counter) {
+                let InstKind::Phi { incomings } = &inst.kind else {
+                    return None;
+                };
+                incomings
+                    .iter()
+                    .filter_map(|(pred, value)| (*pred == latch).then_some(*value))
+                    .collect::<Vec<_>>()
+            } else if inst.result == Some(condition) {
+                // The helper compares its cloned counter with `end`; the source
+                // bound operand is not needed for this one use.
+                vec![counter]
+            } else {
+                inst_operands(&inst.kind)
+            };
+            for operand in operands {
+                budget.spend(1)?;
+                if operand == counter_next || region_results.contains(&operand) {
+                    continue;
+                }
+                match &func.value(operand).kind {
+                    ValueKind::Const(_) | ValueKind::Global(_) => continue,
+                    ValueKind::Param | ValueKind::Inst(_, _) => {}
+                }
+                if !value_available_at(func, dom, operand, preheader)
+                    || !matches!(func.value(operand).ty, Type::I32 | Type::Ptr(_))
+                {
+                    return None;
+                }
+                if captured.insert(operand) {
+                    captures.push(AArch64ThreadCapture {
+                        value: operand,
+                        ty: func.value(operand).ty.clone(),
+                    });
+                    if captures.len() > MAX_CAPTURES {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    // `bound` may also occur outside the rewritten condition. In that case it
+    // was encountered above and captured normally; otherwise it deliberately
+    // consumes no helper argument.
+    let _ = bound;
+    Some(captures)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -662,7 +1151,7 @@ fn analyze_header_setup(
     bound: ValueId,
     setup_values: &[ValueId],
     uses: &[Vec<UseSite>],
-    memory_root: ValueId,
+    written_roots: &HashSet<String>,
     budget: &mut WorkBudget,
 ) -> Option<Vec<ValueId>> {
     let setup_set = setup_values.iter().copied().collect::<HashSet<_>>();
@@ -686,7 +1175,6 @@ fn analyze_header_setup(
 
     let mut seen = HashSet::new();
     let mut ordered = Vec::new();
-    let mut loaded_global = None::<String>;
     for inst in &func.blocks.get(header.0)?.insts {
         let Some(result) = inst.result.filter(|result| setup_set.contains(result)) else {
             continue;
@@ -700,22 +1188,23 @@ fn analyze_header_setup(
         }
         match &inst.kind {
             InstKind::Load { ptr } => {
-                if loaded_global.is_some() || func.value(result).ty != Type::I32 {
+                if func.value(result).ty != Type::I32 {
                     return None;
                 }
                 let ValueKind::Global(name) = &func.value(*ptr).kind else {
                     return None;
                 };
-                if module
-                    .globals
-                    .iter()
-                    .filter(|global| global.name == *name && global.ty == Type::I32)
-                    .count()
-                    != 1
+                budget.spend(module.globals.len())?;
+                if written_roots.contains(name)
+                    || module
+                        .globals
+                        .iter()
+                        .filter(|global| global.name == *name && global.ty == Type::I32)
+                        .count()
+                        != 1
                 {
                     return None;
                 }
-                loaded_global = Some(name.clone());
             }
             InstKind::Unary {
                 op: UnaryOp::Ineg | UnaryOp::Not,
@@ -748,7 +1237,6 @@ fn analyze_header_setup(
         seen.insert(result);
         ordered.push(result);
     }
-    let loaded_global = loaded_global?;
     if ordered.len() != setup_values.len()
         || setup_values.iter().any(|value| {
             uses.get(value.0)
@@ -757,97 +1245,301 @@ fn analyze_header_setup(
     {
         return None;
     }
-
-    // A copied bound load may run concurrently with the worker. For this MVP,
-    // prove separation by requiring the loop's only memory root to be a
-    // distinct, uniquely defined global object. Unknown pointer/global aliasing
-    // is deliberately not inferred from source-language conventions.
-    let ValueKind::Global(root_name) = &func.value(memory_root).kind else {
-        return None;
-    };
-    if *root_name == loaded_global
-        || module
-            .globals
-            .iter()
-            .filter(|global| global.name == *root_name)
-            .count()
-            != 1
-    {
-        return None;
-    }
     Some(ordered)
 }
 
-fn build_range_helper(func: &Function, candidate: &Candidate, name: String) -> Option<Function> {
+fn estimate_parallel_threshold(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dom: &Dominators,
+    outer: &NaturalLoop,
+    nested_loops: &[&NaturalLoop],
+    outer_bound: ValueId,
+    active_cost: usize,
+    budget: &mut WorkBudget,
+) -> i32 {
+    if active_cost < MIN_ACTIVE_REGION_COST {
+        return DEFAULT_PARALLEL_THRESHOLD as i32;
+    }
+    let Some(outer_latch) = outer.unique_latch() else {
+        return DEFAULT_PARALLEL_THRESHOLD as i32;
+    };
+    let mut threshold = DEFAULT_PARALLEL_THRESHOLD;
+    for inner in nested_loops {
+        if budget.spend(inner.blocks.len()).is_none() {
+            break;
+        }
+        let Some(entering) = inner.unique_entering_pred else {
+            continue;
+        };
+        let Some(inner_exit) = inner.unique_exit() else {
+            continue;
+        };
+        if inner.exit_edges.as_slice() != [(inner.header, inner_exit)] {
+            // A body/latch break makes the nominal header trip count only an
+            // upper bound, not guaranteed work for every outer iteration.
+            continue;
+        }
+        if !outer.blocks.contains(&entering)
+            || inner.blocks.contains(&entering)
+            || !outer.blocks.contains(&inner_exit)
+            || !dom.dominates(inner.header, outer_latch)
+            || !dom.dominates(inner_exit, outer_latch)
+            || cfg
+                .succs
+                .get(entering.0)
+                .is_none_or(|successors| !successors.contains(&inner.header))
+        {
+            continue;
+        }
+        let mut nested_active = 0usize;
+        for block in &inner.blocks {
+            let instructions = &func.blocks[block.0].insts;
+            if budget.spend(instructions.len()).is_none() {
+                return DEFAULT_PARALLEL_THRESHOLD as i32;
+            }
+            nested_active = nested_active.saturating_add(
+                instructions
+                    .iter()
+                    .filter(|inst| !matches!(inst.kind, InstKind::Nop | InstKind::Phi { .. }))
+                    .count(),
+            );
+        }
+        if nested_active < MIN_ACTIVE_REGION_COST {
+            continue;
+        }
+        if budget
+            .spend(func.blocks[inner.header.0].insts.len())
+            .is_none()
+        {
+            return DEFAULT_PARALLEL_THRESHOLD as i32;
+        }
+        for induction in func.blocks[inner.header.0]
+            .insts
+            .iter()
+            .filter_map(|inst| inst.result)
+            .filter_map(|phi| analyze_i32_induction(func, inner, phi))
+        {
+            if let Some(trip_count) = analyze_const_i32_trip_count(func, inner, induction)
+                .filter(|trip_count| *trip_count > 1)
+            {
+                threshold = threshold.min(DEFAULT_PARALLEL_THRESHOLD.div_ceil(trip_count));
+            }
+            if induction.step == 1
+                && const_i32(func, induction.initial) == Some(0)
+                && canonical_lt_bound(func, inner, induction.phi) == Some(outer_bound)
+            {
+                // Once the outer bound reaches ceil(sqrt(base work)), this
+                // guaranteed inner loop contributes at least the same number
+                // of iterations to every active outer iteration.
+                threshold = threshold.min(ceil_sqrt(DEFAULT_PARALLEL_THRESHOLD));
+            }
+        }
+    }
+    threshold.max(2) as i32
+}
+
+fn canonical_lt_bound(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    induction: ValueId,
+) -> Option<ValueId> {
+    let Terminator::Branch {
+        cond,
+        then_target,
+        else_target,
+    } = func
+        .blocks
+        .get(natural_loop.header.0)?
+        .terminator
+        .as_ref()?
+    else {
+        return None;
+    };
+    if !natural_loop.blocks.contains(then_target) || natural_loop.blocks.contains(else_target) {
+        return None;
+    }
+    let InstKind::Icmp {
+        op: CmpOp::Lt,
+        lhs,
+        rhs,
+    } = &defining_inst(func, *cond)?.kind
+    else {
+        return None;
+    };
+    (*lhs == induction).then_some(*rhs)
+}
+
+fn ceil_sqrt(value: u32) -> u32 {
+    let mut low = 0u32;
+    let mut high = value;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if middle.saturating_mul(middle) >= value {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
+}
+
+fn build_range_helper(
+    func: &Function,
+    candidate: &Candidate,
+    name: String,
+    budget: &mut WorkBudget,
+) -> Option<Function> {
+    let instruction_count = candidate
+        .region_blocks
+        .iter()
+        .try_fold(0usize, |total, block| {
+            total.checked_add(func.blocks.get(block.0)?.insts.len())
+        })?;
+    if candidate.region_blocks.len() > MAX_REGION_BLOCKS
+        || instruction_count > MAX_REGION_INSTS
+        || budget
+            .spend(
+                candidate
+                    .region_blocks
+                    .len()
+                    .checked_add(instruction_count)?,
+            )
+            .is_none()
+    {
+        return None;
+    }
+
     let mut helper = Function::new(name, Type::Void);
     let begin = helper.add_param("begin", Type::I32);
     let end = helper.add_param("end", Type::I32);
-    let mut values = HashMap::from([(candidate.counter, begin)]);
+    let mut values = HashMap::new();
     for (idx, capture) in candidate.captures.iter().enumerate() {
         let parameter = helper.add_param(format!("capture{}", idx), capture.ty.clone());
         values.insert(capture.value, parameter);
     }
 
-    let header = helper.add_block("range.header");
-    let body = helper.add_block("range.body");
-    let exit = helper.add_block("range.exit");
-    helper.set_terminator(helper.entry, Terminator::Jump(header));
-    let counter = helper.append_inst(
-        header,
-        InstKind::Phi {
-            incomings: vec![(helper.entry, begin), (body, begin)],
-        },
-        Some(Type::I32),
-    )?;
-    values.insert(candidate.counter, counter);
-    let condition = helper.append_inst(
-        header,
-        InstKind::Icmp {
-            op: CmpOp::Lt,
-            lhs: counter,
-            rhs: end,
-        },
-        Some(Type::I1),
-    )?;
+    // Stage one: allocate the complete block map before cloning any edge.
+    let mut blocks = HashMap::new();
+    for source in &candidate.region_blocks {
+        let cloned = helper.add_block(format!("range.{}", func.blocks[source.0].name));
+        blocks.insert(*source, cloned);
+    }
+    let helper_exit = helper.add_block("range.exit");
     helper.set_terminator(
-        header,
-        Terminator::Branch {
-            cond: condition,
-            then_target: body,
-            else_target: exit,
-        },
+        helper.entry,
+        Terminator::Jump(*blocks.get(&candidate.header)?),
     );
 
-    for inst in &func.blocks.get(candidate.body.0)?.insts {
-        if matches!(inst.kind, InstKind::Nop) {
-            continue;
-        }
-        let kind = remap_inst(func, &mut helper, &mut values, &inst.kind)?;
-        let result_ty = inst.result.map(|result| func.value(result).ty.clone());
-        let cloned = helper.append_inst(body, kind, result_ty);
-        if let Some(original) = inst.result {
-            values.insert(original, cloned?);
+    // Stage two: preallocate every instruction/result location. This makes all
+    // forward, phi, and backedge values available before any operand remap.
+    for source in &candidate.region_blocks {
+        let cloned_block = *blocks.get(source)?;
+        for inst in &func.blocks.get(source.0)?.insts {
+            budget.spend(1)?;
+            let result_ty = inst.result.map(|result| func.value(result).ty.clone());
+            let cloned_result = helper.append_inst(cloned_block, InstKind::Nop, result_ty);
+            if let Some(original) = inst.result {
+                values.insert(original, cloned_result?);
+            }
+            if helper.values.len() > MAX_ADDED_VALUES {
+                return None;
+            }
         }
     }
-    let next = *values.get(&candidate.counter_next)?;
-    helper.set_terminator(body, Terminator::Jump(header));
-    helper.set_terminator(exit, Terminator::Return(None));
-    let InstKind::Phi { incomings } = &mut helper.blocks[header.0].insts[0].kind else {
+
+    for source in &candidate.region_blocks {
+        let cloned_block = *blocks.get(source)?;
+        for (inst_idx, inst) in func.blocks.get(source.0)?.insts.iter().enumerate() {
+            budget.spend(1)?;
+            let kind = clone_inst_kind(
+                func,
+                &mut helper,
+                candidate,
+                &blocks,
+                &mut values,
+                begin,
+                end,
+                inst,
+                budget,
+            )?;
+            helper
+                .blocks
+                .get_mut(cloned_block.0)?
+                .insts
+                .get_mut(inst_idx)?
+                .kind = kind;
+        }
+        let terminator = clone_terminator(
+            func,
+            func.blocks.get(source.0)?.terminator.as_ref()?,
+            *source,
+            candidate,
+            &blocks,
+            &mut helper,
+            &mut values,
+            helper_exit,
+            budget,
+        )?;
+        helper.set_terminator(cloned_block, terminator);
+    }
+    helper.set_terminator(helper_exit, Terminator::Return(None));
+    if helper.values.len() > MAX_ADDED_VALUES || helper.verify().is_err() {
         return None;
-    };
-    incomings[1].1 = next;
-    helper.verify().ok()?;
+    }
     Some(helper)
 }
 
-fn remap_inst(
+#[allow(clippy::too_many_arguments)]
+fn clone_inst_kind(
     source: &Function,
     helper: &mut Function,
+    candidate: &Candidate,
+    blocks: &HashMap<BlockId, BlockId>,
     values: &mut HashMap<ValueId, ValueId>,
-    kind: &InstKind,
+    begin: ValueId,
+    end: ValueId,
+    inst: &Inst,
+    budget: &mut WorkBudget,
 ) -> Option<InstKind> {
-    let mut map = |value| map_value(source, helper, values, value);
-    Some(match kind {
+    if inst.result == Some(candidate.counter) {
+        let InstKind::Phi { incomings } = &inst.kind else {
+            return None;
+        };
+        let mut cloned = Vec::with_capacity(incomings.len());
+        for (pred, value) in incomings {
+            budget.spend(1)?;
+            if *pred == candidate.preheader {
+                if const_i32(source, *value) != Some(0) {
+                    return None;
+                }
+                cloned.push((helper.entry, begin));
+            } else {
+                cloned.push((
+                    *blocks.get(pred)?,
+                    map_value(source, helper, values, *value, budget)?,
+                ));
+            }
+        }
+        return Some(InstKind::Phi { incomings: cloned });
+    }
+    if inst.result == Some(candidate.condition) {
+        return Some(InstKind::Icmp {
+            op: CmpOp::Lt,
+            lhs: *values.get(&candidate.counter)?,
+            rhs: end,
+        });
+    }
+
+    let mut map = |value| map_value(source, helper, values, value, budget);
+    Some(match &inst.kind {
+        InstKind::Nop => InstKind::Nop,
+        InstKind::Phi { incomings } => InstKind::Phi {
+            incomings: incomings
+                .iter()
+                .map(|(pred, value)| Some((*blocks.get(pred)?, map(*value)?)))
+                .collect::<Option<Vec<_>>>()?,
+        },
         InstKind::Load { ptr } => InstKind::Load { ptr: map(*ptr)? },
         InstKind::Store { ptr, value } => InstKind::Store {
             ptr: map(*ptr)?,
@@ -883,11 +1575,42 @@ fn remap_inst(
                 .map(|index| map(*index))
                 .collect::<Option<Vec<_>>>()?,
         },
-        InstKind::Nop
-        | InstKind::Phi { .. }
-        | InstKind::Alloca { .. }
-        | InstKind::MemZero { .. }
-        | InstKind::Call { .. } => return None,
+        InstKind::Alloca { .. } | InstKind::MemZero { .. } | InstKind::Call { .. } => return None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clone_terminator(
+    source: &Function,
+    terminator: &Terminator,
+    source_block: BlockId,
+    candidate: &Candidate,
+    blocks: &HashMap<BlockId, BlockId>,
+    helper: &mut Function,
+    values: &mut HashMap<ValueId, ValueId>,
+    helper_exit: BlockId,
+    budget: &mut WorkBudget,
+) -> Option<Terminator> {
+    budget.spend(1)?;
+    let target = |target: BlockId| {
+        if target == candidate.exit && source_block == candidate.header {
+            Some(helper_exit)
+        } else {
+            blocks.get(&target).copied()
+        }
+    };
+    Some(match terminator {
+        Terminator::Return(_) => return None,
+        Terminator::Jump(destination) => Terminator::Jump(target(*destination)?),
+        Terminator::Branch {
+            cond,
+            then_target,
+            else_target,
+        } => Terminator::Branch {
+            cond: map_value(source, helper, values, *cond, budget)?,
+            then_target: target(*then_target)?,
+            else_target: target(*else_target)?,
+        },
     })
 }
 
@@ -896,9 +1619,14 @@ fn map_value(
     helper: &mut Function,
     values: &mut HashMap<ValueId, ValueId>,
     value: ValueId,
+    budget: &mut WorkBudget,
 ) -> Option<ValueId> {
+    budget.spend(1)?;
     if let Some(mapped) = values.get(&value) {
         return Some(*mapped);
+    }
+    if helper.values.len() >= MAX_ADDED_VALUES {
+        return None;
     }
     let mapped = match &source.value(value).kind {
         ValueKind::Const(constant) => helper.add_const(constant.clone()),
@@ -947,6 +1675,19 @@ fn collect_uses(func: &Function, budget: &mut WorkBudget) -> Option<Vec<Vec<UseS
                         role: UseRole::Other,
                     });
                 }
+                InstKind::Gep { base, indices } => {
+                    budget.spend(indices.len().checked_add(1)?)?;
+                    uses.get_mut(base.0)?.push(UseSite {
+                        block: owner,
+                        role: UseRole::GepBase,
+                    });
+                    for index in indices {
+                        uses.get_mut(index.0)?.push(UseSite {
+                            block: owner,
+                            role: UseRole::GepIndex,
+                        });
+                    }
+                }
                 kind => {
                     for value in inst_operands(kind) {
                         budget.spend(1)?;
@@ -975,7 +1716,7 @@ fn value_available_at(func: &Function, dom: &Dominators, value: ValueId, block: 
         Some(ValueKind::Inst(owner, inst_idx)) => {
             func.blocks
                 .get(owner.0)
-                .and_then(|block| block.insts.get(*inst_idx))
+                .and_then(|source| source.insts.get(*inst_idx))
                 .is_some_and(|inst| inst.result == Some(value))
                 && (*owner == block || dom.dominates(*owner, block))
         }
@@ -1002,10 +1743,7 @@ fn is_four_byte_scalar(ty: &Type) -> bool {
     matches!(ty, Type::I32 | Type::F32)
 }
 
-fn instruction_cost(inst: &Inst, counter_next: ValueId) -> usize {
-    if inst.result == Some(counter_next) {
-        return 0;
-    }
+fn instruction_cost(inst: &Inst) -> usize {
     match inst.kind {
         InstKind::Load { .. } | InstKind::Store { .. } => 3,
         InstKind::Binary {
@@ -1017,9 +1755,15 @@ fn instruction_cost(inst: &Inst, counter_next: ValueId) -> usize {
             ..
         } => 3,
         InstKind::Gep { .. } => 1,
-        InstKind::Nop => 0,
+        InstKind::Nop | InstKind::Phi { .. } => 0,
         _ => 1,
     }
+}
+
+fn sorted_region_blocks(natural_loop: &NaturalLoop, header: BlockId) -> Vec<BlockId> {
+    let mut blocks = natural_loop.blocks.iter().copied().collect::<Vec<_>>();
+    blocks.sort_by_key(|block| (*block != header, block.0));
+    blocks
 }
 
 fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
@@ -1071,12 +1815,54 @@ mod tests {
         module
     }
 
-    const SAFE_MAP: &str = r#"
-        int transform(int a[], int n) {
+    const GLOBAL_MAP: &str = r#"
+        int data[100000];
+        int transform(int n, int scale) {
             int i = 0;
             while (i < n) {
-                int x = a[i];
-                a[i] = x * x + x * 3 + 1;
+                int x = data[i];
+                data[i] = x * x + x * scale + 1;
+                i = i + 1;
+            }
+            return 0;
+        }
+    "#;
+
+    const DIFFERENT_ROOT_TRANSPOSE: &str = r#"
+        int input[64][64];
+        int output[64][64];
+        int transform() {
+            int i = 0;
+            while (i < 64) {
+                int j = 0;
+                while (j < 64) {
+                    output[i][j] = input[j][i] + input[j][i] * 3 + 1;
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            return 0;
+        }
+    "#;
+
+    const MATRIX_REDUCTION: &str = r#"
+        int left[64][64];
+        int right[64][64];
+        int result[64][64];
+        int transform() {
+            int i = 0;
+            while (i < 64) {
+                int j = 0;
+                while (j < 64) {
+                    int k = 0;
+                    int sum = 0;
+                    while (k < 64) {
+                        sum = sum + left[i][k] * right[k][j];
+                        k = k + 1;
+                    }
+                    result[i][j] = sum;
+                    j = j + 1;
+                }
                 i = i + 1;
             }
             return 0;
@@ -1084,25 +1870,15 @@ mod tests {
     "#;
 
     #[test]
-    fn accepts_exact_same_root_element_mapping_and_verifies_helper() {
-        let module = optimize(SAFE_MAP, true);
-        assert_eq!(module.aarch64_thread_plans.len(), 1);
-        let plan = &module.aarch64_thread_plans[0];
-        assert_eq!(plan.captures.len(), 1);
-        assert_eq!(plan.captures[0].ty, Type::Ptr(Box::new(Type::I32)));
-        assert!(module.funcs[plan.helper.0].verify().is_ok());
-    }
-
-    #[test]
-    fn accepts_bounded_header_global_setup_for_a_distinct_global_root() {
+    fn accepts_pure_header_bound_setup_from_a_distinct_read_only_global() {
         let module = optimize(
             r#"
-                int side;
-                int data[1000000];
-                int square(int x) { return x * x; }
+                int limit;
+                int data[100000];
+                int square(int value) { return value * value; }
                 int transform() {
                     int i = 0;
-                    while (i < square(side)) {
+                    while (i < square(limit)) {
                         int x = data[i];
                         data[i] = x * x + x * 3 + 1;
                         i = i + 1;
@@ -1113,22 +1889,37 @@ mod tests {
             true,
         );
         assert_eq!(module.aarch64_thread_plans.len(), 1);
-        assert_eq!(module.aarch64_thread_plans[0].dispatch_setup.len(), 2);
+        assert!(!module.aarch64_thread_plans[0].dispatch_setup.is_empty());
         assert!(module.funcs[module.aarch64_thread_plans[0].helper.0]
             .verify()
             .is_ok());
     }
 
     #[test]
-    fn accepts_repeated_refs_to_one_unique_global_root() {
+    fn accepts_different_unique_global_transpose_and_verifies_full_helper() {
+        let module = optimize(DIFFERENT_ROOT_TRANSPOSE, true);
+        assert_eq!(module.aarch64_thread_plans.len(), 1);
+        let plan = &module.aarch64_thread_plans[0];
+        assert!(module.funcs[plan.parent.0].blocks.len() > 2);
+        assert!(module.funcs[plan.helper.0].blocks.len() > 3);
+        assert!(module.funcs[plan.helper.0].verify().is_ok());
+        assert!(plan.parallel_threshold < DEFAULT_PARALLEL_THRESHOLD as i32);
+    }
+
+    #[test]
+    fn lowers_work_gate_for_a_guaranteed_inner_loop_sharing_the_outer_bound() {
         let module = optimize(
             r#"
-                int data[10000];
-                int transform(int n) {
+                int input[1024][1024];
+                int output[1024][1024];
+                int transform(int bound) {
                     int i = 0;
-                    while (i < n) {
-                        int x = data[i];
-                        data[i] = x * x + x * 3 + 1;
+                    while (i < bound) {
+                        int j = 0;
+                        while (j < bound) {
+                            output[i][j] = input[i][j] * 3 + 1;
+                            j = j + 1;
+                        }
                         i = i + 1;
                     }
                     return 0;
@@ -1137,19 +1928,27 @@ mod tests {
             true,
         );
         assert_eq!(module.aarch64_thread_plans.len(), 1);
-        assert!(module.aarch64_thread_plans[0].captures.is_empty());
+        assert_eq!(
+            module.aarch64_thread_plans[0].parallel_threshold,
+            ceil_sqrt(DEFAULT_PARALLEL_THRESHOLD) as i32
+        );
     }
 
     #[test]
-    fn rejects_generated_symbol_collisions() {
+    fn does_not_lower_work_gate_for_an_inner_side_exit() {
         let module = optimize(
             r#"
-                int __yuezhuo_parallel_context_0;
-                int transform(int a[], int n) {
+                int data[100000][1];
+                int guard[100000];
+                int transform(int bound) {
                     int i = 0;
-                    while (i < n) {
-                        int x = a[i];
-                        a[i] = x * x + x * 3 + 1;
+                    while (i < bound) {
+                        int j = 0;
+                        while (j < 100000) {
+                            if (guard[j] != 0) break;
+                            data[i][0] = data[i][0] * data[i][0] + 1;
+                            j = j + 1;
+                        }
                         i = i + 1;
                     }
                     return 0;
@@ -1157,18 +1956,48 @@ mod tests {
             "#,
             true,
         );
-        assert!(module.aarch64_thread_plans.is_empty());
+        assert_eq!(module.aarch64_thread_plans.len(), 1);
+        assert_eq!(
+            module.aarch64_thread_plans[0].parallel_threshold,
+            DEFAULT_PARALLEL_THRESHOLD as i32
+        );
     }
 
     #[test]
-    fn rejects_unknown_alias_between_input_and_output_roots() {
+    fn accepts_matrix_inner_reduction_with_region_private_phis() {
+        let module = optimize(MATRIX_REDUCTION, true);
+        assert_eq!(module.aarch64_thread_plans.len(), 1);
+        let helper = &module.funcs[module.aarch64_thread_plans[0].helper.0];
+        assert!(helper.verify().is_ok());
+        assert!(
+            helper
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .filter(|inst| matches!(inst.kind, InstKind::Phi { .. }))
+                .count()
+                > 1
+        );
+    }
+
+    #[test]
+    fn accepts_multiblock_diamond_inside_partitioned_outer_region() {
         let module = optimize(
             r#"
-                int transform(int a[], int b[], int n) {
+                int input[64][64];
+                int output[64][64];
+                int transform() {
                     int i = 0;
-                    while (i < n) {
-                        int x = b[i];
-                        a[i] = x * x + x * 3 + 1;
+                    while (i < 64) {
+                        int j = 0;
+                        while (j < 64) {
+                            if (input[j][i] > 0) {
+                                output[i][j] = input[j][i] * 3 + 1;
+                            } else {
+                                output[i][j] = 0 - input[j][i] * 2;
+                            }
+                            j = j + 1;
+                        }
                         i = i + 1;
                     }
                     return 0;
@@ -1176,18 +2005,25 @@ mod tests {
             "#,
             true,
         );
-        assert!(module.aarch64_thread_plans.is_empty());
+        assert_eq!(module.aarch64_thread_plans.len(), 1);
+        assert!(module.funcs[module.aarch64_thread_plans[0].helper.0]
+            .verify()
+            .is_ok());
     }
 
     #[test]
-    fn rejects_offset_index() {
+    fn rejects_same_root_cross_slice_transpose_load() {
         let module = optimize(
             r#"
-                int transform(int a[], int n) {
-                    int i = 1;
-                    while (i < n) {
-                        int x = a[i - 1];
-                        a[i] = x * x + x * 3 + 1;
+                int data[64][64];
+                int transform() {
+                    int i = 0;
+                    while (i < 64) {
+                        int j = 0;
+                        while (j < 64) {
+                            data[i][j] = 0 - data[j][i];
+                            j = j + 1;
+                        }
                         i = i + 1;
                     }
                     return 0;
@@ -1199,25 +2035,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_division_without_a_safe_integer_literal() {
+    fn rejects_flattened_or_indirect_outer_selector() {
         for source in [
             r#"
-                int transform(int a[], int n) {
+                int data[4096];
+                int transform() {
                     int i = 0;
-                    while (i < n) {
-                        int x = a[i];
-                        a[i] = x / n + x * x + 1;
+                    while (i < 64) {
+                        int j = 0;
+                        while (j < 64) {
+                            data[i * 64 + j] = i + j;
+                            j = j + 1;
+                        }
                         i = i + 1;
                     }
                     return 0;
                 }
             "#,
             r#"
-                int transform(float a[], int n) {
+                int data[4096];
+                int transform() {
                     int i = 0;
-                    while (i < n) {
-                        float x = a[i];
-                        a[i] = x / 3.0 + x * x + 1.0;
+                    while (i < 64) {
+                        int copied = i * 2;
+                        data[copied] = i * i + i * 3 + 1;
                         i = i + 1;
                     }
                     return 0;
@@ -1229,54 +2070,102 @@ mod tests {
     }
 
     #[test]
-    fn rejects_calls_reductions_and_liveouts() {
+    fn rejects_pointer_parameter_and_alloca_roots() {
         for source in [
             r#"
-                int transform(int a[], int n) {
+                int transform(int data[], int n) {
                     int i = 0;
                     while (i < n) {
-                        int x = a[i];
-                        putint(x);
-                        a[i] = x * x + x * 3 + 1;
+                        data[i] = data[i] * data[i] + data[i] * 3 + 1;
                         i = i + 1;
                     }
                     return 0;
                 }
             "#,
             r#"
-                int transform(int a[], int n) {
+                int transform(int n) {
+                    int data[100];
+                    int i = 0;
+                    while (i < n) {
+                        data[i] = i * i + i * 3 + 1;
+                        i = i + 1;
+                    }
+                    return 0;
+                }
+            "#,
+        ] {
+            assert!(optimize(source, true).aarch64_thread_plans.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_side_exit_call_and_scalar_liveout() {
+        for source in [
+            r#"
+                int data[100000];
+                int transform(int n) {
+                    int i = 0;
+                    while (i < n) {
+                        if (data[i] < 0) return i;
+                        data[i] = data[i] * data[i] + data[i] * 3 + 1;
+                        i = i + 1;
+                    }
+                    return 0;
+                }
+            "#,
+            r#"
+                int data[100000];
+                int transform(int n) {
+                    int i = 0;
+                    while (i < n) {
+                        putint(data[i]);
+                        data[i] = data[i] * data[i] + data[i] * 3 + 1;
+                        i = i + 1;
+                    }
+                    return 0;
+                }
+            "#,
+            r#"
+                int data[100000];
+                int transform(int n) {
                     int i = 0;
                     int sum = 0;
                     while (i < n) {
-                        sum = sum + a[i];
-                        a[i] = a[i] * a[i] + 1;
+                        sum = sum + data[i];
+                        data[i] = data[i] * data[i] + 1;
                         i = i + 1;
                     }
                     return sum;
                 }
             "#,
+        ] {
+            assert!(optimize(source, true).aarch64_thread_plans.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_offset_selector_and_unsafe_division() {
+        for source in [
             r#"
-                int transform(int a[], int n) {
+                int data[100000];
+                int transform(int n) {
                     int i = 0;
-                    int last = 0;
                     while (i < n) {
-                        int x = a[i];
-                        last = x * x + x * 3 + 1;
-                        a[i] = last;
+                        data[i + 1] = data[i + 1] * data[i + 1] + 1;
                         i = i + 1;
                     }
-                    return last;
+                    return 0;
                 }
             "#,
             r#"
-                int transform(int a[], int n) {
+                int data[100000];
+                int transform(int n) {
                     int i = 0;
                     while (i < n) {
-                        int x = a[i];
-                        a[i] = x * x + x * 3 + 1;
+                        data[i] = data[i] / n + data[i] * data[i] + 1;
                         i = i + 1;
                     }
-                    return i;
+                    return 0;
                 }
             "#,
         ] {
@@ -1285,10 +2174,24 @@ mod tests {
     }
 
     #[test]
-    fn requires_aarch64_o1_gate_and_is_idempotent() {
-        assert!(optimize(SAFE_MAP, false).aarch64_thread_plans.is_empty());
+    fn keeps_helper_budget_checked() {
+        let mut source = String::from(
+            "int data[100000]; int transform(int n) { int i = 0; while (i < n) { int x = data[i];",
+        );
+        for _ in 0..(MAX_REGION_INSTS + 32) {
+            source.push_str("x = x + 1;");
+        }
+        source.push_str("data[i] = x; i = i + 1; } return 0; }");
+        let module = optimize(&source, true);
+        assert!(module.aarch64_thread_plans.is_empty());
+        assert_eq!(module.funcs.len(), 1);
+    }
 
-        let mut parser = Parser::new(SAFE_MAP);
+    #[test]
+    fn requires_target_gate_and_is_idempotent() {
+        assert!(optimize(GLOBAL_MAP, false).aarch64_thread_plans.is_empty());
+
+        let mut parser = Parser::new(GLOBAL_MAP);
         let mut o0 = crate::ir::lower::lower_program(&parser.parse_program()).unwrap();
         run_pipeline(
             &mut o0,
@@ -1300,10 +2203,18 @@ mod tests {
         );
         assert!(o0.aarch64_thread_plans.is_empty());
 
-        let mut module = optimize(SAFE_MAP, true);
+        let mut module = optimize(GLOBAL_MAP, true);
+        assert_eq!(module.aarch64_thread_plans.len(), 1);
+        assert_eq!(
+            module.aarch64_thread_plans[0].parallel_threshold,
+            DEFAULT_PARALLEL_THRESHOLD as i32
+        );
         let functions = module.funcs.len();
         AArch64ThreadOutlinePass::new().run(&mut module);
         assert_eq!(module.funcs.len(), functions);
         assert_eq!(module.aarch64_thread_plans.len(), 1);
+        assert!(module.funcs[module.aarch64_thread_plans[0].helper.0]
+            .verify()
+            .is_ok());
     }
 }

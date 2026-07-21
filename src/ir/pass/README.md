@@ -188,11 +188,13 @@ pass 不重关联或以其它方式改写浮点运算，也不把局部常量二
 
 ### `AArch64ThreadOutlinePass` (`aarch64_thread.rs`)
 
-仅在 driver 通过 `PassOptions` 显式选择 AArch64 O1 时运行的保守双核 outlining。候选必须是入口可达、非嵌套、专用 preheader、唯一 latch/exit 的两块自然循环；header 仅有从 0 开始、步长 1 的 i32 counter phi、可安全复制的条件 setup 和直接 signed `< bound`，body/latch 只允许有预算的纯 scalar、typed GEP、4 字节 load/store，并且至少有一个 store。
+仅在 driver 通过 `PassOptions` 显式选择 AArch64 O1 时运行的保守双核 outlining。候选是入口可达、专用 preheader、唯一 outer latch 且仅有 `outer header -> exit` 唯一退出边的自然外层循环；region 可以完整包含规范嵌套自然循环和 diamond，但不能与其它自然循环部分重叠。outer header 仅有从 0 开始、步长 1 的 i32 counter phi、可安全复制的纯 bound setup 和直接 signed `counter < bound`。其它 phi 的所有 predecessor 必须在 region 内，嵌套循环还必须从 outer region 内唯一进入，因此 inner reduction 每次 outer iteration 都重新初始化。call、alloca、memzero、return/side exit、region scalar live-out、Fdiv 及动态/零整数除数均拒绝。
 
-内存证明要求每个 load/store 地址都是 body 内 `root[counter]` 的单索引 typed GEP，全部访问共享同一精确 root，GEP 结果不得逃出当次 memory use；未知 A/B 别名、偏移或间接索引、call、alloca、memzero、reduction、live-out、Fdiv 和动态/零整数除数均拒绝。helper 是带 `begin/end` 和至多 6 个 i32/指针 capture 的普通 verified IR 函数；原标量循环不改写。目标后端依据 plan 发射阈值检查、静态 context 和 pthread AAPCS64 胶水，因此 generic IR 不伪造 `pthread_t`、i64 或函数指针。
+内存证明把每个 4 字节 scalar load/store 的地址沿 region 内完整单层 typed GEP chain 展开到模块中唯一的 Global object；每层都验证 array base/result pointee、i32 index、固定对象大小和 GEP use，pointer parameter/alloca/未知 root 不参与首版证明。每个 written root 的 store chain 必须有且仅有一层 index 直接等于 outer counter，任何其它 counter-dependent、偏移、flatten 或间接 selector 都拒绝；同一 written root 的全部 load 必须使用相同 selector depth 和 typed subobject，所以 `A[i][j]` 读改写可行而 `A[j][i]` cross-slice load 不可行。不同且各自唯一的 Global object 证明 NoAlias；region 内未写的 root 可使用任意完整 typed in-object 地址。
 
-pass 对块、值、body、memory、capture、module candidate、use/provenance work 和 helper 增长均有 hard budget；生成符号与用户函数/global 冲突时禁用。每函数最多一个、每模块最多 16 个 plan，重复执行不会继续增长。它位于 GEP induction 之前以证明原始精确 counter GEP；后续地址强度削弱不改变已经建立的迭代独立性证明。
+helper 是带 `begin/end` 和至多 6 个 preheader-available i32/指针 capture 的普通 verified IR 函数。它先预分配完整 block/value map，再克隆整个 outer region：entry 跳 cloned header，counter 初值换成 `begin`，outer condition bound 换成 `end`，原 outer exit edge 换成 helper return，其它 CFG、phi、指令和 terminator 保持。原 scalar 循环不改写。默认运行门仍为 65,536 outer iterations；只有严格证明一个必经嵌套循环有足够 active work，且其 trip count 为常量或规范化内层 bound 与 outer bound 是同一 SSA 值时，才按已证明的总 work（常量乘数或 `outer²`）保守降低门槛。每个函数仍只生成一个 plan；若有多个合法 region，统一选择证明门槛最低、再选择 region 更完整者，不依赖符号名、维度或算法形状。
+
+pass 对函数、region block/instruction/value、memory、typed chain/type depth、capture、module candidate、use/dependence/provenance work 和 helper 增长均有 checked hard budget；生成符号与用户函数/global 冲突时禁用。每函数最多一个、每模块最多 16 个 plan，重复执行不会继续增长。它位于 GEP induction 之前以证明原始 typed counter GEP；后续语义保持的地址强度削弱不改变已经建立的迭代独立性证明。
 
 ### `GepInductionPass` (`gep_induction.rs`)
 

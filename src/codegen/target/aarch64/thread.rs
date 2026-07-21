@@ -1,7 +1,6 @@
+use super::imm::mov_w_imm;
 use super::AArch64IrFuncEmitter;
-use crate::ir::{
-    AArch64ThreadCapture, AArch64ThreadPlan, InstKind, Module, Terminator, Type, ValueKind,
-};
+use crate::ir::{AArch64ThreadCapture, AArch64ThreadPlan, Module, Terminator, Type, ValueKind};
 
 const TID_OFFSET: usize = 0;
 const BEGIN_OFFSET: usize = 8;
@@ -9,7 +8,7 @@ const END_OFFSET: usize = 12;
 const DONE_OFFSET: usize = 16;
 const CAPTURE_OFFSET: usize = 24;
 const CAPTURE_STRIDE: usize = 8;
-const PARALLEL_THRESHOLD: i32 = 65_536;
+const MAX_PARALLEL_THRESHOLD: i32 = 65_536;
 
 pub(super) fn valid_plan(module: &Module, plan: &AArch64ThreadPlan) -> bool {
     let Some(parent) = module.funcs.get(plan.parent.0) else {
@@ -26,12 +25,9 @@ pub(super) fn valid_plan(module: &Module, plan: &AArch64ThreadPlan) -> bool {
         || parent.blocks.get(plan.header.0).is_none()
         || parent.blocks.get(plan.body.0).is_none()
         || parent.blocks.get(plan.exit.0).is_none()
+        || !(2..=MAX_PARALLEL_THRESHOLD).contains(&plan.parallel_threshold)
         || parent.blocks[plan.preheader.0].terminator != Some(Terminator::Jump(plan.header))
         || parent.blocks[plan.body.0].terminator != Some(Terminator::Jump(plan.header))
-        || parent.blocks[plan.exit.0]
-            .insts
-            .iter()
-            .any(|inst| matches!(inst.kind, InstKind::Phi { .. }))
     {
         return false;
     }
@@ -43,7 +39,10 @@ pub(super) fn valid_plan(module: &Module, plan: &AArch64ThreadPlan) -> bool {
     else {
         return false;
     };
-    if *then_target != plan.body || *else_target != plan.exit {
+    if *else_target != plan.exit
+        || *then_target == plan.exit
+        || parent.blocks.get(then_target.0).is_none()
+    {
         return false;
     }
     if plan.captures.iter().any(|capture| {
@@ -150,11 +149,13 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
         let fallback = self.parent.ctx.fresh_label("thread_fallback");
         let join_wait = self.parent.ctx.fresh_label("thread_join_wait");
+        let parallel_exit = self.parent.ctx.fresh_label("thread_parallel_exit");
         let helper = &self.parent.ctx.module.funcs[plan.helper.0].name;
         self.load_value(plan.bound);
+        self.body
+            .push_str(&mov_w_imm("w17", plan.parallel_threshold));
         self.body.push_str(&format!(
-            "  cmp w0, #{threshold}, lsl #12\n  blt {fallback}\n  lsr w17, w0, #1\n  adrp x15, {context}\n  add x15, x15, :lo12:{context}\n  str w17, [x15, #{begin}]\n  str w0, [x15, #{end}]\n",
-            threshold = PARALLEL_THRESHOLD >> 12,
+            "  cmp w0, w17\n  blt {fallback}\n  lsr w17, w0, #1\n  adrp x15, {context}\n  add x15, x15, :lo12:{context}\n  str w17, [x15, #{begin}]\n  str w0, [x15, #{end}]\n",
             fallback = fallback,
             context = plan.context_symbol,
             begin = BEGIN_OFFSET,
@@ -183,14 +184,22 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         ));
         emit_capture_loads(&mut self.body, &plan.captures, "x8");
         self.body.push_str(&format!(
-            "  bl {helper}\n  adrp x8, {context}\n  add x8, x8, :lo12:{context}\n  ldr x0, [x8, #{tid}]\n  mov x1, xzr\n  bl pthread_join\n  cbnz w0, {join_wait}\n  b {exit}\n{join_wait}:\n  adrp x8, {context}\n  add x8, x8, :lo12:{context}\n  add x8, x8, #{done}\n{join_wait}_spin:\n  ldar w9, [x8]\n  cbz w9, {join_wait}_spin\n  b {exit}\n{fallback}:\n",
+            "  bl {helper}\n  adrp x8, {context}\n  add x8, x8, :lo12:{context}\n  ldr x0, [x8, #{tid}]\n  mov x1, xzr\n  bl pthread_join\n  cbnz w0, {join_wait}\n  b {parallel_exit}\n{join_wait}:\n  adrp x8, {context}\n  add x8, x8, :lo12:{context}\n  add x8, x8, #{done}\n{join_wait}_spin:\n  ldar w9, [x8]\n  cbz w9, {join_wait}_spin\n  b {parallel_exit}\n{parallel_exit}:\n",
             helper = helper,
             context = plan.context_symbol,
             tid = TID_OFFSET,
             join_wait = join_wait,
             done = DONE_OFFSET,
-            exit = self.block_label(plan.exit.0),
-            fallback = fallback,
+            parallel_exit = parallel_exit,
+        ));
+        // The parallel path semantically takes the original header -> exit
+        // edge, including any phi copies whose incoming values are proven
+        // region-external. The proof rejects all region-defined live-outs.
+        self.emit_phi_copies(plan.header.0, plan.exit.0);
+        self.body.push_str(&format!(
+            "  b {}\n{}:\n",
+            self.block_label(plan.exit.0),
+            fallback
         ));
         self.emit_phi_copies(plan.preheader.0, plan.header.0);
         self.body
@@ -226,11 +235,12 @@ mod tests {
 
     fn threaded_module() -> Module {
         let source = r#"
-            int transform(int a[], int n) {
+            int data[100000];
+            int transform(int n) {
                 int i = 0;
                 while (i < n) {
-                    int x = a[i];
-                    a[i] = x * x + x * 3 + 1;
+                    int x = data[i];
+                    data[i] = x * x + x * 3 + 1;
                     i = i + 1;
                 }
                 return 0;
