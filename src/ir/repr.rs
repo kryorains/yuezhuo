@@ -25,7 +25,8 @@ pub struct Module {
     pub globals: Vec<Global>,
     pub funcs: Vec<Function>,
     /// Target-specific plans are populated only by the explicitly gated
-    /// AArch64 O1 outlining pass. They do not alter the source functions.
+    /// AArch64 O1 outlining pass. A selected loop may gain one semantic edge-
+    /// split preheader; rejected and non-target functions remain unchanged.
     pub(crate) aarch64_thread_plans: Vec<AArch64ThreadPlan>,
 }
 
@@ -68,7 +69,7 @@ pub struct Global {
     pub init: Option<Const>,
 }
 
-/// A backend-only dual-core dispatch around an unchanged scalar loop.
+/// A backend-only dual-core dispatch around a semantically unchanged scalar loop.
 ///
 /// The range helper is an ordinary verified IR function. pthread ABI details
 /// and the static context remain AArch64 assembly concerns, so no integer or

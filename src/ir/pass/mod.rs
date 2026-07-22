@@ -60,6 +60,13 @@ pub struct PassOptions {
 }
 
 pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptions) {
+    if !module.aarch64_thread_plans.is_empty() {
+        // Thread plans carry verified source FunctionId/BlockId/ValueId
+        // locations. A completed pipeline is therefore independently
+        // idempotent: rerunning earlier CFG/LICM passes must not stale those
+        // locations and silently disable backend validation.
+        return;
+    }
     // 所有优化 pass 都在这里排队，方便统一调整执行顺序。
     let mut pipeline = PassPipeline::new();
     match opt_level {

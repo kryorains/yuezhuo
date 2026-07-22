@@ -21,15 +21,17 @@ const MAX_TYPE_DEPTH: usize = 32;
 const MAX_DEPENDENCE_VALUES: usize = 2048;
 const MAX_CAPTURES: usize = 6;
 const MAX_PLANS_PER_MODULE: usize = 16;
-const MAX_PROOF_WORK: usize = 65_536;
+const MAX_PROOF_WORK: usize = 262_144;
 const MAX_ADDED_VALUES: usize = 2048;
+const MAX_ADDED_BLOCKS: usize = 2048;
 const MIN_ACTIVE_REGION_COST: usize = 8;
 const DEFAULT_PARALLEL_THRESHOLD: u32 = 65_536;
 
 /// Outlines a strictly proven outer owner-computes loop into a verified range
-/// helper. The original loop remains unchanged: AArch64 emission inserts the
-/// pthread dispatch at its preheader and retains the exact scalar edge as the
-/// create-failure path.
+/// helper. The original loop remains semantically unchanged: when necessary a
+/// unique entering edge is transactionally split, and AArch64 emission inserts
+/// the pthread dispatch at the resulting preheader while retaining the exact
+/// scalar edge as the create-failure path.
 pub(super) struct AArch64ThreadOutlinePass;
 
 impl AArch64ThreadOutlinePass {
@@ -49,7 +51,10 @@ impl ModulePass for AArch64ThreadOutlinePass {
 
 #[derive(Clone)]
 struct Candidate {
-    preheader: BlockId,
+    /// The predecessor used by all original-CFG proofs and helper cloning.
+    /// When `needs_split` is true this is only a virtual preheader.
+    entering_pred: BlockId,
+    needs_split: bool,
     header: BlockId,
     /// Kept in the existing plan slot named `body`; for a multi-block region
     /// this is the unique outer latch.
@@ -70,6 +75,10 @@ struct PendingOutline {
     parent: FunctionId,
     candidate: Candidate,
     helper: Function,
+    plan_preheader: BlockId,
+    parent_after_split: Option<Function>,
+    needs_split: bool,
+    entering_pred: BlockId,
     context_symbol: String,
     worker_symbol: String,
 }
@@ -95,22 +104,29 @@ enum UseRole {
 
 struct WorkBudget {
     remaining: usize,
+    exhausted: bool,
 }
 
 impl WorkBudget {
     fn new() -> Self {
         Self {
             remaining: MAX_PROOF_WORK,
+            exhausted: false,
         }
     }
 
     fn spend(&mut self, amount: usize) -> Option<()> {
         if amount > self.remaining {
             self.remaining = 0;
+            self.exhausted = true;
             return None;
         }
         self.remaining -= amount;
         Some(())
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 }
 
@@ -166,6 +182,7 @@ fn outline_module(module: &mut Module) {
     let mut budget = WorkBudget::new();
     let mut pending = Vec::new();
     let mut added_values = 0usize;
+    let mut added_blocks = 0usize;
 
     for function_idx in 0..original_function_count {
         if pending.len() >= MAX_PLANS_PER_MODULE {
@@ -197,6 +214,12 @@ fn outline_module(module: &mut Module) {
         if budget.spend(structural_work).is_none() {
             return;
         }
+        let Some(verify_work) = function_verify_work(func) else {
+            return;
+        };
+        if budget.spend(verify_work).is_none() {
+            return;
+        }
         if func.verify().is_err() {
             continue;
         }
@@ -220,13 +243,16 @@ fn outline_module(module: &mut Module) {
             if budget.spend(nesting_work).is_none() {
                 return;
             }
-            let Some(nested_loops) = complete_nested_loops(&loop_info, loop_idx, &mut budget)
-            else {
-                continue;
+            let nested_loops = match complete_nested_loops(&loop_info, loop_idx, &mut budget) {
+                Some(nested_loops) => nested_loops,
+                None if budget.is_exhausted() => return,
+                None => continue,
             };
-            maximum_outer_loop_rank =
-                maximum_outer_loop_rank.max(nested_loops.len().saturating_add(1));
-            let Some(candidate) = match_candidate(
+            let Some(loop_rank) = nested_loops.len().checked_add(1) else {
+                return;
+            };
+            maximum_outer_loop_rank = maximum_outer_loop_rank.max(loop_rank);
+            let candidate = match match_candidate(
                 module,
                 func,
                 &cfg,
@@ -235,8 +261,10 @@ fn outline_module(module: &mut Module) {
                 &nested_loops,
                 &uses,
                 &mut budget,
-            ) else {
-                continue;
+            ) {
+                Some(candidate) => candidate,
+                None if budget.is_exhausted() => return,
+                None => continue,
             };
             let is_better = selected.as_ref().is_none_or(|best| {
                 candidate.parallel_threshold < best.parallel_threshold
@@ -266,17 +294,54 @@ fn outline_module(module: &mut Module) {
         {
             continue;
         }
-        let Some(helper) = build_range_helper(func, &candidate, range_symbol.clone(), &mut budget)
+        let Some(final_function_count) = original_function_count
+            .checked_add(pending.len())
+            .and_then(|count| count.checked_add(1))
         else {
+            return;
+        };
+        if final_function_count > MAX_FUNCTIONS {
             continue;
+        }
+        let helper = match build_range_helper(func, &candidate, range_symbol.clone(), &mut budget) {
+            Some(helper) => helper,
+            None if budget.is_exhausted() => return,
+            None => continue,
         };
         let Some(next_added_values) = added_values.checked_add(helper.values.len()) else {
             return;
         };
-        if next_added_values > MAX_ADDED_VALUES {
+        let split_block_count = usize::from(candidate.needs_split);
+        let Some(parent_block_count) = func.blocks.len().checked_add(split_block_count) else {
+            return;
+        };
+        let Some(candidate_added_blocks) = helper.blocks.len().checked_add(split_block_count)
+        else {
+            return;
+        };
+        let Some(next_added_blocks) = added_blocks.checked_add(candidate_added_blocks) else {
+            return;
+        };
+        if next_added_values > MAX_ADDED_VALUES
+            || next_added_blocks > MAX_ADDED_BLOCKS
+            || parent_block_count > MAX_BLOCKS
+            || helper.blocks.len() > MAX_BLOCKS
+        {
             continue;
         }
+
+        let (plan_preheader, parent_after_split) = if candidate.needs_split {
+            match prepare_parent_split(func, &candidate, &mut budget) {
+                Some((parent_after_split, split)) => (split, Some(parent_after_split)),
+                None if budget.is_exhausted() => return,
+                None => continue,
+            }
+        } else {
+            (candidate.entering_pred, None)
+        };
+
         added_values = next_added_values;
+        added_blocks = next_added_blocks;
         reserved_symbols.insert(range_symbol);
         reserved_symbols.insert(worker_symbol.clone());
         reserved_symbols.insert(context_symbol.clone());
@@ -285,23 +350,39 @@ fn outline_module(module: &mut Module) {
         // cannot overlap this per-site static context.
         pending.push(PendingOutline {
             parent: FunctionId(function_idx),
+            needs_split: candidate.needs_split,
+            entering_pred: candidate.entering_pred,
             candidate,
             helper,
+            plan_preheader,
+            parent_after_split,
             context_symbol,
             worker_symbol,
         });
     }
 
-    if module.funcs.len().checked_add(pending.len()).is_none() {
-        return;
-    }
     for outline in pending {
-        let helper = module.add_func(outline.helper);
-        let candidate = outline.candidate;
+        let PendingOutline {
+            parent,
+            candidate,
+            helper: helper_function,
+            plan_preheader,
+            parent_after_split,
+            needs_split,
+            entering_pred,
+            context_symbol,
+            worker_symbol,
+        } = outline;
+        debug_assert_eq!(needs_split, candidate.needs_split);
+        debug_assert_eq!(entering_pred, candidate.entering_pred);
+        if let Some(parent_after_split) = parent_after_split {
+            module.funcs[parent.0] = parent_after_split;
+        }
+        let helper = module.add_func(helper_function);
         module.aarch64_thread_plans.push(AArch64ThreadPlan {
-            parent: outline.parent,
+            parent,
             helper,
-            preheader: candidate.preheader,
+            preheader: plan_preheader,
             header: candidate.header,
             body: candidate.latch,
             exit: candidate.exit,
@@ -309,8 +390,8 @@ fn outline_module(module: &mut Module) {
             dispatch_setup: candidate.dispatch_setup,
             captures: candidate.captures,
             parallel_threshold: candidate.parallel_threshold,
-            context_symbol: outline.context_symbol,
-            worker_symbol: outline.worker_symbol,
+            context_symbol,
+            worker_symbol,
         });
     }
 }
@@ -364,13 +445,27 @@ fn match_candidate(
     if !(2..=MAX_REGION_BLOCKS).contains(&natural_loop.blocks.len()) {
         return None;
     }
-    let preheader = natural_loop.dedicated_preheader?;
     let header = natural_loop.header;
+    let entering_pred = natural_loop.unique_entering_pred?;
+    let needs_split = natural_loop.dedicated_preheader.is_none();
+    if natural_loop
+        .dedicated_preheader
+        .is_some_and(|preheader| preheader != entering_pred)
+        || func.blocks.get(header.0).is_none()
+        || func.blocks.get(entering_pred.0).is_none()
+    {
+        return None;
+    }
+    if needs_split {
+        validate_virtual_preheader(func, cfg, header, entering_pred, budget)?;
+    } else if func.blocks.get(entering_pred.0)?.terminator != Some(Terminator::Jump(header)) {
+        return None;
+    }
+
     let latch = natural_loop.unique_latch()?;
     let exit = natural_loop.unique_exit()?;
     if latch == header
         || natural_loop.exit_edges.as_slice() != [(header, exit)]
-        || func.blocks.get(preheader.0)?.terminator != Some(Terminator::Jump(header))
         || func.blocks.get(latch.0)?.terminator != Some(Terminator::Jump(header))
     {
         return None;
@@ -378,7 +473,7 @@ fn match_candidate(
 
     let header_predecessors = cfg.preds.get(header.0)?;
     if header_predecessors.len() != 2
-        || !header_predecessors.contains(&preheader)
+        || !header_predecessors.contains(&entering_pred)
         || !header_predecessors.contains(&latch)
     {
         return None;
@@ -489,7 +584,7 @@ fn match_candidate(
         budget,
     )?;
 
-    let dispatch_setup = if value_available_at(func, dom, bound, preheader) {
+    let dispatch_setup = if value_available_at(func, dom, bound, entering_pred) {
         if !setup_values.is_empty() {
             return None;
         }
@@ -511,7 +606,7 @@ fn match_candidate(
         func,
         dom,
         natural_loop,
-        preheader,
+        entering_pred,
         header,
         latch,
         counter,
@@ -529,12 +624,13 @@ fn match_candidate(
         bound,
         analysis.active_cost,
         budget,
-    );
+    )?;
 
     let mut region_blocks = natural_loop.blocks.iter().copied().collect::<Vec<_>>();
     region_blocks.sort_by_key(|block| (*block != header, block.0));
     Some(Candidate {
-        preheader,
+        entering_pred,
+        needs_split,
         header,
         latch,
         exit,
@@ -546,8 +642,80 @@ fn match_candidate(
         dispatch_setup,
         captures,
         parallel_threshold,
-        loop_rank: nested_loops.len().saturating_add(1),
+        loop_rank: nested_loops.len().checked_add(1)?,
     })
+}
+
+fn validate_virtual_preheader(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    header: BlockId,
+    entering_pred: BlockId,
+    budget: &mut WorkBudget,
+) -> Option<()> {
+    if entering_pred == header {
+        return None;
+    }
+    let successors = cfg.succs.get(entering_pred.0)?;
+    let predecessors = cfg.preds.get(header.0)?;
+    budget.spend(successors.len().checked_add(predecessors.len())?)?;
+    if successors
+        .iter()
+        .filter(|target| **target == header)
+        .count()
+        != 1
+        || predecessors
+            .iter()
+            .filter(|pred| **pred == entering_pred)
+            .count()
+            != 1
+    {
+        return None;
+    }
+
+    let terminator = func.blocks.get(entering_pred.0)?.terminator.as_ref()?;
+    let edge_slots = terminator_edge_slots(terminator);
+    budget.spend(edge_slots)?;
+    if terminator_target_count(terminator, header) == 0 {
+        return None;
+    }
+
+    for inst in &func.blocks.get(header.0)?.insts {
+        budget.spend(1)?;
+        let InstKind::Phi { incomings } = &inst.kind else {
+            continue;
+        };
+        budget.spend(incomings.len())?;
+        if incomings
+            .iter()
+            .filter(|(pred, _)| *pred == entering_pred)
+            .count()
+            != 1
+        {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn terminator_edge_slots(terminator: &Terminator) -> usize {
+    match terminator {
+        Terminator::Return(_) => 0,
+        Terminator::Jump(_) => 1,
+        Terminator::Branch { .. } => 2,
+    }
+}
+
+fn terminator_target_count(terminator: &Terminator, target: BlockId) -> usize {
+    match terminator {
+        Terminator::Return(_) => 0,
+        Terminator::Jump(destination) => usize::from(*destination == target),
+        Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        } => usize::from(*then_target == target) + usize::from(*else_target == target),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1257,18 +1425,14 @@ fn estimate_parallel_threshold(
     outer_bound: ValueId,
     active_cost: usize,
     budget: &mut WorkBudget,
-) -> i32 {
+) -> Option<i32> {
     if active_cost < MIN_ACTIVE_REGION_COST {
-        return DEFAULT_PARALLEL_THRESHOLD as i32;
+        return Some(DEFAULT_PARALLEL_THRESHOLD as i32);
     }
-    let Some(outer_latch) = outer.unique_latch() else {
-        return DEFAULT_PARALLEL_THRESHOLD as i32;
-    };
+    let outer_latch = outer.unique_latch()?;
     let mut threshold = DEFAULT_PARALLEL_THRESHOLD;
     for inner in nested_loops {
-        if budget.spend(inner.blocks.len()).is_none() {
-            break;
-        }
+        budget.spend(inner.blocks.len())?;
         let Some(entering) = inner.unique_entering_pred else {
             continue;
         };
@@ -1294,26 +1458,19 @@ fn estimate_parallel_threshold(
         }
         let mut nested_active = 0usize;
         for block in &inner.blocks {
-            let instructions = &func.blocks[block.0].insts;
-            if budget.spend(instructions.len()).is_none() {
-                return DEFAULT_PARALLEL_THRESHOLD as i32;
-            }
-            nested_active = nested_active.saturating_add(
+            let instructions = &func.blocks.get(block.0)?.insts;
+            budget.spend(instructions.len())?;
+            nested_active = nested_active.checked_add(
                 instructions
                     .iter()
                     .filter(|inst| !matches!(inst.kind, InstKind::Nop | InstKind::Phi { .. }))
                     .count(),
-            );
+            )?;
         }
         if nested_active < MIN_ACTIVE_REGION_COST {
             continue;
         }
-        if budget
-            .spend(func.blocks[inner.header.0].insts.len())
-            .is_none()
-        {
-            return DEFAULT_PARALLEL_THRESHOLD as i32;
-        }
+        budget.spend(func.blocks.get(inner.header.0)?.insts.len())?;
         for induction in func.blocks[inner.header.0]
             .insts
             .iter()
@@ -1336,7 +1493,7 @@ fn estimate_parallel_threshold(
             }
         }
     }
-    threshold.max(2) as i32
+    Some(threshold.max(2) as i32)
 }
 
 fn canonical_lt_bound(
@@ -1375,13 +1532,160 @@ fn ceil_sqrt(value: u32) -> u32 {
     let mut high = value;
     while low < high {
         let middle = low + (high - low) / 2;
-        if middle.saturating_mul(middle) >= value {
+        if u64::from(middle) * u64::from(middle) >= u64::from(value) {
             high = middle;
         } else {
             low = middle + 1;
         }
     }
     low
+}
+
+fn function_ir_work(func: &Function) -> Option<usize> {
+    let mut work = func.blocks.len().checked_add(func.values.len())?;
+    for block in &func.blocks {
+        work = work.checked_add(1)?.checked_add(block.insts.len())?;
+        for inst in &block.insts {
+            let operands = match &inst.kind {
+                InstKind::Nop | InstKind::Alloca { .. } => 0,
+                InstKind::Phi { incomings } => incomings.len().checked_mul(2)?,
+                InstKind::Load { .. }
+                | InstKind::MemZero { .. }
+                | InstKind::Unary { .. }
+                | InstKind::Cast { .. } => 1,
+                InstKind::Store { .. }
+                | InstKind::Binary { .. }
+                | InstKind::Icmp { .. }
+                | InstKind::Fcmp { .. } => 2,
+                InstKind::Gep { indices, .. } => indices.len().checked_add(1)?,
+                InstKind::Call { args, .. } => args.len(),
+            };
+            work = work.checked_add(operands)?;
+        }
+        let terminator_work = match block.terminator.as_ref() {
+            Some(Terminator::Return(Some(_))) => 1,
+            Some(Terminator::Return(None)) | None => 0,
+            Some(Terminator::Jump(_)) => 1,
+            Some(Terminator::Branch { .. }) => 3,
+        };
+        work = work.checked_add(terminator_work)?;
+    }
+    Some(work)
+}
+
+fn function_verify_work(func: &Function) -> Option<usize> {
+    function_ir_work(func)?.checked_add(func.blocks.len().checked_mul(func.blocks.len())?)
+}
+
+fn prepare_parent_split(
+    func: &Function,
+    candidate: &Candidate,
+    budget: &mut WorkBudget,
+) -> Option<(Function, BlockId)> {
+    if !candidate.needs_split
+        || candidate.entering_pred == candidate.header
+        || func.blocks.len().checked_add(1)? > MAX_BLOCKS
+    {
+        return None;
+    }
+
+    let terminator = func
+        .blocks
+        .get(candidate.entering_pred.0)?
+        .terminator
+        .as_ref()?;
+    budget.spend(terminator_edge_slots(terminator))?;
+    if terminator_target_count(terminator, candidate.header) == 0 {
+        return None;
+    }
+    for inst in &func.blocks.get(candidate.header.0)?.insts {
+        budget.spend(1)?;
+        let InstKind::Phi { incomings } = &inst.kind else {
+            continue;
+        };
+        budget.spend(incomings.len())?;
+        if incomings
+            .iter()
+            .filter(|(pred, _)| *pred == candidate.entering_pred)
+            .count()
+            != 1
+        {
+            return None;
+        }
+    }
+
+    let clone_work = function_ir_work(func)?;
+    let split_block_count = func.blocks.len().checked_add(1)?;
+    let verify_work = clone_work
+        .checked_add(3)?
+        .checked_add(split_block_count.checked_mul(split_block_count)?)?;
+    budget.spend(clone_work.checked_add(verify_work)?)?;
+
+    let mut transaction = func.clone();
+    let split = apply_preheader_split(&mut transaction, candidate.entering_pred, candidate.header)?;
+    if transaction.verify().is_err() {
+        return None;
+    }
+    Some((transaction, split))
+}
+
+fn apply_preheader_split(
+    func: &mut Function,
+    entering_pred: BlockId,
+    header: BlockId,
+) -> Option<BlockId> {
+    let expected_split = BlockId(func.blocks.len());
+    let split = func.add_block(format!("thread.preheader.{}", expected_split.0));
+    if split != expected_split {
+        return None;
+    }
+    func.blocks.get_mut(split.0)?.terminator = Some(Terminator::Jump(header));
+
+    let terminator = func.blocks.get_mut(entering_pred.0)?.terminator.as_mut()?;
+    let mut rewritten = 0usize;
+    match terminator {
+        Terminator::Return(_) => return None,
+        Terminator::Jump(target) => {
+            if *target == header {
+                *target = split;
+                rewritten = 1;
+            }
+        }
+        Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        } => {
+            if *then_target == header {
+                *then_target = split;
+                rewritten = rewritten.checked_add(1)?;
+            }
+            if *else_target == header {
+                *else_target = split;
+                rewritten = rewritten.checked_add(1)?;
+            }
+        }
+    }
+    if rewritten == 0 {
+        return None;
+    }
+
+    for inst in &mut func.blocks.get_mut(header.0)?.insts {
+        let InstKind::Phi { incomings } = &mut inst.kind else {
+            continue;
+        };
+        let mut repaired = 0usize;
+        for (pred, _) in incomings {
+            if *pred == entering_pred {
+                *pred = split;
+                repaired = repaired.checked_add(1)?;
+            }
+        }
+        if repaired != 1 {
+            return None;
+        }
+    }
+    Some(split)
 }
 
 fn build_range_helper(
@@ -1484,7 +1788,11 @@ fn build_range_helper(
         helper.set_terminator(cloned_block, terminator);
     }
     helper.set_terminator(helper_exit, Terminator::Return(None));
-    if helper.values.len() > MAX_ADDED_VALUES || helper.verify().is_err() {
+    if helper.values.len() > MAX_ADDED_VALUES {
+        return None;
+    }
+    budget.spend(function_verify_work(&helper)?)?;
+    if helper.verify().is_err() {
         return None;
     }
     Some(helper)
@@ -1509,7 +1817,7 @@ fn clone_inst_kind(
         let mut cloned = Vec::with_capacity(incomings.len());
         for (pred, value) in incomings {
             budget.spend(1)?;
-            if *pred == candidate.preheader {
+            if *pred == candidate.entering_pred {
                 if const_i32(source, *value) != Some(0) {
                     return None;
                 }
@@ -1845,6 +2153,31 @@ mod tests {
         }
     "#;
 
+    const SEQUENTIAL_LOOPS: &str = r#"
+        int first[1024];
+        int input[1024][1024];
+        int output[1024][1024];
+        int transform(int bound) {
+            int i = 0;
+            while (i < bound) {
+                int x = first[i];
+                first[i] = x * x + x * 3 + 1;
+                i = i + 1;
+            }
+            i = 0;
+            while (i < bound) {
+                int j = 0;
+                while (j < bound) {
+                    int x = input[i][j];
+                    output[i][j] = x * x + x * 3 + 1;
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            return 0;
+        }
+    "#;
+
     const MATRIX_REDUCTION: &str = r#"
         int left[64][64];
         int right[64][64];
@@ -1978,6 +2311,168 @@ mod tests {
                 .count()
                 > 1
         );
+    }
+
+    #[test]
+    fn splits_only_the_deeper_selected_virtual_preheader_and_repairs_phis() {
+        let original = optimize(SEQUENTIAL_LOOPS, false);
+        let mut module = optimize(SEQUENTIAL_LOOPS, true);
+        assert_eq!(module.aarch64_thread_plans.len(), 1);
+        let plan = &module.aarch64_thread_plans[0];
+        let original_parent = &original.funcs[plan.parent.0];
+        let parent = &module.funcs[plan.parent.0];
+        assert_eq!(parent.blocks.len(), original_parent.blocks.len() + 1);
+        assert_eq!(plan.preheader.0, original_parent.blocks.len());
+        assert_eq!(
+            parent.blocks[plan.preheader.0].terminator,
+            Some(Terminator::Jump(plan.header))
+        );
+        assert!(module.funcs[plan.helper.0].verify().is_ok());
+        assert!(parent.verify().is_ok());
+
+        let original_cfg = ControlFlowGraph::new(original_parent);
+        let original_dom = Dominators::new(original_parent, &original_cfg);
+        let original_loops = LoopInfo::new(&original_cfg, &original_dom);
+        let original_outer = original_loops
+            .loops()
+            .iter()
+            .find(|natural_loop| natural_loop.header == plan.header)
+            .unwrap();
+        assert!(original_outer.dedicated_preheader.is_none());
+        let entering_pred = original_outer.unique_entering_pred.unwrap();
+        assert_eq!(
+            terminator_target_count(
+                original_parent.blocks[entering_pred.0]
+                    .terminator
+                    .as_ref()
+                    .unwrap(),
+                plan.header,
+            ),
+            1
+        );
+        assert_eq!(
+            terminator_target_count(
+                parent.blocks[entering_pred.0].terminator.as_ref().unwrap(),
+                plan.header,
+            ),
+            0
+        );
+        assert_eq!(
+            terminator_target_count(
+                parent.blocks[entering_pred.0].terminator.as_ref().unwrap(),
+                plan.preheader,
+            ),
+            1
+        );
+
+        let original_phi_incomings = original_parent.blocks[plan.header.0]
+            .insts
+            .iter()
+            .filter_map(|inst| {
+                let InstKind::Phi { incomings } = &inst.kind else {
+                    return None;
+                };
+                Some((
+                    inst.result?,
+                    incomings
+                        .iter()
+                        .find_map(|(pred, value)| (*pred == entering_pred).then_some(*value))?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert!(!original_phi_incomings.is_empty());
+        for (result, original_value) in original_phi_incomings {
+            let repaired = parent.blocks[plan.header.0]
+                .insts
+                .iter()
+                .find(|inst| inst.result == Some(result))
+                .unwrap();
+            let InstKind::Phi { incomings } = &repaired.kind else {
+                panic!("original header phi must remain a phi");
+            };
+            assert!(incomings.contains(&(plan.preheader, original_value)));
+            assert!(!incomings.iter().any(|(pred, _)| *pred == entering_pred));
+        }
+
+        let cfg = ControlFlowGraph::new(parent);
+        let dom = Dominators::new(parent, &cfg);
+        let loops = LoopInfo::new(&cfg, &dom);
+        let selected = loops
+            .loops()
+            .iter()
+            .find(|natural_loop| natural_loop.header == plan.header)
+            .unwrap();
+        assert!(loops.loops().iter().any(|natural_loop| {
+            natural_loop.header != selected.header
+                && natural_loop.blocks.is_subset(&selected.blocks)
+                && natural_loop.blocks.len() < selected.blocks.len()
+        }));
+
+        let function_count = module.funcs.len();
+        let parent_id = plan.parent;
+        let parent_block_count = parent.blocks.len();
+        let split = plan.preheader;
+        run_pipeline(
+            &mut module,
+            OptLevel::O1,
+            PassOptions {
+                enable_simple_loop_unroll: false,
+                enable_aarch64_threading: true,
+            },
+        );
+        assert_eq!(module.funcs.len(), function_count);
+        assert_eq!(module.funcs[parent_id.0].blocks.len(), parent_block_count);
+        assert_eq!(module.aarch64_thread_plans.len(), 1);
+        assert_eq!(module.aarch64_thread_plans[0].preheader, split);
+    }
+
+    #[test]
+    fn rewrites_both_branch_slots_without_changing_phi_values() {
+        let mut func = Function::new("transaction", Type::I32);
+        let zero = func.add_const(Const::Int(0));
+        let condition = func.add_const(Const::Bool(true));
+        let header = func.add_block("header");
+        let exit = func.add_block("exit");
+        func.set_terminator(
+            func.entry,
+            Terminator::Branch {
+                cond: condition,
+                then_target: header,
+                else_target: header,
+            },
+        );
+        let phi = func
+            .append_inst(
+                header,
+                InstKind::Phi {
+                    incomings: vec![(func.entry, zero)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(header, Terminator::Jump(exit));
+        func.set_terminator(exit, Terminator::Return(Some(phi)));
+        assert!(func.verify().is_ok());
+
+        let entry = func.entry;
+        let split = apply_preheader_split(&mut func, entry, header).unwrap();
+        assert_eq!(
+            func.blocks[entry.0].terminator,
+            Some(Terminator::Branch {
+                cond: condition,
+                then_target: split,
+                else_target: split,
+            })
+        );
+        let InstKind::Phi { incomings } = &func.blocks[header.0].insts[0].kind else {
+            panic!("header instruction must remain a phi");
+        };
+        assert_eq!(incomings, &vec![(split, zero)]);
+        assert_eq!(
+            func.blocks[split.0].terminator,
+            Some(Terminator::Jump(header))
+        );
+        assert!(func.verify().is_ok());
     }
 
     #[test]
@@ -2174,6 +2669,49 @@ mod tests {
     }
 
     #[test]
+    fn rejected_candidate_does_not_change_any_parent_block() {
+        let source = r#"
+            int data[64][64];
+            int transform() {
+                int i = 0;
+                while (i < 64) {
+                    int j = 0;
+                    while (j < 64) {
+                        data[i][j] = 0 - data[j][i];
+                        j = j + 1;
+                    }
+                    i = i + 1;
+                }
+                return 0;
+            }
+        "#;
+        let without_threading = optimize(source, false);
+        let with_threading = optimize(source, true);
+        assert!(with_threading.aarch64_thread_plans.is_empty());
+        assert_eq!(with_threading, without_threading);
+    }
+
+    #[test]
+    fn proof_budget_rejection_keeps_the_module_byte_identical() {
+        let mut module = optimize(GLOBAL_MAP, false);
+        let func = &mut module.funcs[0];
+        let zero = func.add_const(Const::Int(0));
+        while func
+            .blocks
+            .len()
+            .checked_mul(func.blocks.len())
+            .is_some_and(|work| work <= MAX_PROOF_WORK)
+        {
+            let dead = func.add_block("budget.dead");
+            func.set_terminator(dead, Terminator::Return(Some(zero)));
+        }
+        assert!(func.blocks.len() <= MAX_BLOCKS);
+        let before = module.clone();
+        AArch64ThreadOutlinePass::new().run(&mut module);
+        assert_eq!(module, before);
+    }
+
+    #[test]
     fn keeps_helper_budget_checked() {
         let mut source = String::from(
             "int data[100000]; int transform(int n) { int i = 0; while (i < n) { int x = data[i];",
@@ -2210,9 +2748,25 @@ mod tests {
             DEFAULT_PARALLEL_THRESHOLD as i32
         );
         let functions = module.funcs.len();
+        let parent = module.aarch64_thread_plans[0].parent;
+        let parent_blocks = module.funcs[parent.0].blocks.len();
+        let preheader = module.aarch64_thread_plans[0].preheader;
         AArch64ThreadOutlinePass::new().run(&mut module);
         assert_eq!(module.funcs.len(), functions);
         assert_eq!(module.aarch64_thread_plans.len(), 1);
+
+        run_pipeline(
+            &mut module,
+            OptLevel::O1,
+            PassOptions {
+                enable_simple_loop_unroll: false,
+                enable_aarch64_threading: true,
+            },
+        );
+        assert_eq!(module.funcs.len(), functions);
+        assert_eq!(module.funcs[parent.0].blocks.len(), parent_blocks);
+        assert_eq!(module.aarch64_thread_plans.len(), 1);
+        assert_eq!(module.aarch64_thread_plans[0].preheader, preheader);
         assert!(module.funcs[module.aarch64_thread_plans[0].helper.0]
             .verify()
             .is_ok());

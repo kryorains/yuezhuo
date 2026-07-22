@@ -41,7 +41,7 @@
 7. Phi 在 terminator 边上生成并行 copy；同一物理位置的 incoming 不生成 copy。RISC-V64 以 regalloc 寄存器或唯一 layout 栈槽作为跨边位置，Const/Global 在需要时重新物化；预算内的无环 copy 按位置依赖顺序直接发射，环由保留的 `t2` 打断，不动态调整 `sp`；超出 copy 数量预算或无法证明位置/类型不变量时回退到全量快照。AArch64 与 RISC-V64 在布局分析预算内只发射入口可达块，并让规范化自然循环采用 `body .. latch, header, exit` 汇编布局：preheader 保留零次检查，热点回边由 latch fallthrough 和一条反向条件分支完成。多 latch、非专用入口或不规范循环保持原顺序。
 8. AArch64 和 RISC-V64 会识别只依赖寄存器参数的入口守卫；当一侧是无副作用且只有入口前驱的短返回表达式时，该路径会在函数序言前执行，只有慢路径才建立栈帧。有帧路径先生成原入口到慢分支的 phi copy，再绕过已执行的守卫；不满足结构、类型、ABI 寄存器或规模证明时完全保留普通发射。
 9. RISC-V64 的少量纯整数/指针调用参数从后向前直接装入 `a0-a7`，零比较直接选择 `beqz`/`bnez` 等分支指令；递归或大 CFG 函数使用 128 字节函数对齐，降低热点代码跨取指边界造成的波动。
-10. AArch64 O1 可为严格证明 slice 独立的多块 outer owner-computes region 发射一主一从双核路径；region 可完整包含 nested natural loop 和 diamond，普通 verified IR helper 克隆全部内部 CFG，并只接收 `begin/end` 与至多 6 个 i32/指针 capture。`pthread_t`、启动函数指针和静态 context 只存在于 AAPCS64 汇编胶水中。默认少于 65,536 次 outer iteration 时走原标量循环；只有证明必经内层的常量 trip count，或规范化 inner/outer 共用同一 SSA bound 时，plan 才按已证明总 work 保守降低该门槛。创建失败或任何证明失败也走原标量循环；join 失败时以 acquire load 等待 worker 的 release 完成标记，绝不重跑区间。隐式调用会强制 parent 的跨块值使用 callee-saved 寄存器或栈。
+10. AArch64 O1 可为严格证明 slice 独立的多块 outer owner-computes region 发射一主一从双核路径；region 可完整包含 nested natural loop 和 diamond，普通 verified IR helper 克隆全部内部 CFG，并只接收 `begin/end` 与至多 6 个 i32/指针 capture。缺少 dedicated preheader 但具有严格唯一 entering edge 的最终候选会先事务性拆边，因此 backend 始终只看到 `plan.preheader -> header` 的普通 jump。`pthread_t`、启动函数指针和静态 context 只存在于 AAPCS64 汇编胶水中。默认少于 65,536 次 outer iteration 时走原标量循环；只有证明必经内层的常量 trip count，或规范化 inner/outer 共用同一 SSA bound 时，plan 才按已证明总 work 保守降低该门槛。创建失败或任何证明失败也走原标量循环；join 失败时以 acquire load 等待 worker 的 release 完成标记，绝不重跑区间。隐式调用会强制 parent 的跨块值使用 callee-saved 寄存器或栈。
 
 ## AArch64 pthread 链接环境
 

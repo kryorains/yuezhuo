@@ -22,8 +22,19 @@ impl SimplifyCfgPass {
 
 impl ModulePass for SimplifyCfgPass {
     fn run(&mut self, module: &mut Module) {
-        for func in &mut module.funcs {
-            simplify_function(func);
+        let planned_parents = module
+            .aarch64_thread_plans
+            .iter()
+            .map(|plan| plan.parent.0)
+            .collect::<HashSet<_>>();
+        for (function_idx, func) in module.funcs.iter_mut().enumerate() {
+            // Thread plans contain stable BlockIds. In the first pipeline run
+            // no plan exists at earlier simplify-cfg stages; after outlining,
+            // preserve the verified dispatch edge rather than forwarding or
+            // renumbering one of its blocks.
+            if !planned_parents.contains(&function_idx) {
+                simplify_function(func);
+            }
         }
     }
 }

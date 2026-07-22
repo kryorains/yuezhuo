@@ -259,6 +259,44 @@ mod tests {
         module
     }
 
+    fn split_threaded_module() -> Module {
+        let source = r#"
+            int first[1024];
+            int input[4096][1024];
+            int output[4096][1024];
+            int transform(int bound) {
+                int i = 0;
+                while (i < bound) {
+                    int x = first[i];
+                    first[i] = x * x + x * 3 + 1;
+                    i = i + 1;
+                }
+                i = 0;
+                while (i < bound * 3) {
+                    int j = 0;
+                    while (j < bound) {
+                        int x = input[i][j];
+                        output[i][j] = x * x + x * 3 + 1;
+                        j = j + 1;
+                    }
+                    i = i + 1;
+                }
+                return 0;
+            }
+        "#;
+        let mut parser = Parser::new(source);
+        let mut module = crate::ir::lower::lower_program(&parser.parse_program()).unwrap();
+        run_pipeline(
+            &mut module,
+            OptLevel::O1,
+            PassOptions {
+                enable_simple_loop_unroll: false,
+                enable_aarch64_threading: true,
+            },
+        );
+        module
+    }
+
     #[test]
     fn emits_create_failure_scalar_edge_and_exact_pthread_abi() {
         let module = threaded_module();
@@ -279,6 +317,41 @@ mod tests {
             "b .L_{}_bb{}",
             module.funcs[plan.parent.0].name, plan.header.0
         )));
+    }
+
+    #[test]
+    fn split_preheader_create_failure_still_enters_the_original_header() {
+        let mut module = split_threaded_module();
+        assert_eq!(module.aarch64_thread_plans.len(), 1);
+        assert!(!module.aarch64_thread_plans[0].dispatch_setup.is_empty());
+        let before = super::super::emit_ir_asm(&module);
+        run_pipeline(
+            &mut module,
+            OptLevel::O1,
+            PassOptions {
+                enable_simple_loop_unroll: false,
+                enable_aarch64_threading: true,
+            },
+        );
+        let asm = super::super::emit_ir_asm(&module);
+        assert_eq!(asm, before);
+
+        let plan = &module.aarch64_thread_plans[0];
+        let parent = &module.funcs[plan.parent.0];
+        assert_eq!(
+            parent.blocks[plan.preheader.0].terminator,
+            Some(Terminator::Jump(plan.header))
+        );
+
+        let branch = asm
+            .lines()
+            .find(|line| line.trim_start().starts_with("cbnz w0, .L_thread_fallback"))
+            .unwrap();
+        let fallback_label = branch.split_whitespace().last().unwrap();
+        let fallback = asm
+            .find(&format!("{}:\n", fallback_label))
+            .expect("create-failure label must be emitted");
+        assert!(asm[fallback..].contains(&format!("b .L_{}_bb{}", parent.name, plan.header.0)));
     }
 
     #[test]
