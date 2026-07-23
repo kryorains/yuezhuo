@@ -31,3 +31,18 @@ struct Riscv64IrFuncEmitter<'a, 'b> {
 pub fn emit_ir_asm(module: &Module) -> String {
     emitter::emit_asm(module)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::regalloc::Riscv64FloatRegAlloc;
+    use crate::ir::{Function, Type, ValueId};
+
+    #[test]
+    fn float_regalloc_api_is_available_to_target_consumers() {
+        let func = Function::new("float_regalloc_visibility", Type::Void);
+        let regs = Riscv64FloatRegAlloc::new(&func);
+
+        assert_eq!(regs.reg(ValueId(0)), None);
+        assert!(regs.used_callee_saved().is_empty());
+    }
+}

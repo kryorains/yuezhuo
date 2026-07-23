@@ -17,7 +17,7 @@ pub(in crate::codegen::target::riscv64) struct Riscv64FloatRegAlloc {
 }
 
 impl Riscv64FloatRegAlloc {
-    pub(super) fn new(func: &Function) -> Self {
+    pub(in crate::codegen::target::riscv64) fn new(func: &Function) -> Self {
         let use_counts = ir_value_use_counts(func);
         let candidate_set = func
             .values
@@ -96,11 +96,11 @@ impl Riscv64FloatRegAlloc {
         }
     }
 
-    pub(super) fn reg(&self, value: ValueId) -> Option<&'static str> {
+    pub(in crate::codegen::target::riscv64) fn reg(&self, value: ValueId) -> Option<&'static str> {
         self.regs.get(&value).copied()
     }
 
-    pub(super) fn used_callee_saved(&self) -> &[&'static str] {
+    pub(in crate::codegen::target::riscv64) fn used_callee_saved(&self) -> &[&'static str] {
         &self.used_callee_saved
     }
 }
@@ -130,7 +130,9 @@ mod tests {
 
         let regs = Riscv64FloatRegAlloc::new(&func);
 
-        assert!(regs.reg(result).is_some_and(|reg| reg.starts_with("ft")));
+        let reg = regs.reg(result).expect("result should receive a register");
+        assert!(CALLER_SAVED_REGS.contains(&reg));
+        assert_ne!(reg, "ft0");
     }
 
     #[test]
