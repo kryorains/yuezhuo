@@ -23,7 +23,12 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     }
                 }
                 IrArgLocation::FloatReg(reg_idx) => {
-                    self.store_frame_s(&format!("fa{}", reg_idx), offset);
+                    let src = format!("fa{}", reg_idx);
+                    if let Some(reg) = self.float_regalloc.reg(*param) {
+                        self.body.push_str(&format!("  fmv.s {}, {}\n", reg, src));
+                    } else {
+                        self.store_frame_s(&src, offset);
+                    }
                 }
                 IrArgLocation::Stack => {
                     let src = 16 + (stack_idx as i32) * 8;
@@ -35,8 +40,12 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                             self.store_frame_x("a0", offset);
                         }
                     } else if param_sig.ty == Type::F32 {
-                        self.load_raw_frame_s("fa0", src);
-                        self.store_frame_s("fa0", offset);
+                        if let Some(reg) = self.float_regalloc.reg(*param) {
+                            self.load_raw_frame_s(reg, src);
+                        } else {
+                            self.load_raw_frame_s("fa0", src);
+                            self.store_frame_s("fa0", offset);
+                        }
                     } else {
                         self.load_raw_frame_w("a0", src);
                         if let Some(reg) = assigned_reg {

@@ -8,7 +8,7 @@ mod regalloc;
 
 use crate::codegen::common::{IrFuncLayout, IrLocalRegs};
 use crate::ir::{Function, Module, ValueId};
-use regalloc::Riscv64RegAlloc;
+use regalloc::{Riscv64FloatRegAlloc, Riscv64RegAlloc};
 use std::collections::HashMap;
 
 struct Riscv64IrEmitter<'a> {
@@ -21,6 +21,8 @@ struct Riscv64IrFuncEmitter<'a, 'b> {
     func: &'b Function,
     layout: IrFuncLayout,
     regalloc: Riscv64RegAlloc,
+    float_regalloc: Riscv64FloatRegAlloc,
+    saved_area_size: i32,
     local_regs: IrLocalRegs,
     value_use_counts: Vec<usize>,
     folded_memory_geps: HashMap<ValueId, memory::FoldedMemoryGep>,
@@ -33,16 +35,4 @@ pub fn emit_ir_asm(module: &Module) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::regalloc::Riscv64FloatRegAlloc;
-    use crate::ir::{Function, Type, ValueId};
-
-    #[test]
-    fn float_regalloc_api_is_available_to_target_consumers() {
-        let func = Function::new("float_regalloc_visibility", Type::Void);
-        let regs = Riscv64FloatRegAlloc::new(&func);
-
-        assert_eq!(regs.reg(ValueId(0)), None);
-        assert!(regs.used_callee_saved().is_empty());
-    }
-}
+mod tests;

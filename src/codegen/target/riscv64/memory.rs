@@ -504,7 +504,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn frame_slot_offset(&self, offset: i32) -> i32 {
-        offset - self.regalloc.saved_area_size()
+        offset - self.saved_area_size
     }
 }
 
