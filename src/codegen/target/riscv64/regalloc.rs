@@ -162,10 +162,6 @@ impl Riscv64RegAlloc {
     pub(super) fn used_regs(&self) -> &[&'static str] {
         &self.used_regs
     }
-
-    pub(super) fn saved_area_size(&self) -> i32 {
-        align_to((self.used_regs.len() as i32) * 8, 16)
-    }
 }
 
 fn register_allowed(
@@ -644,10 +640,6 @@ fn cross_block_memory_candidates(
     candidates
         .sort_by_key(|(value, score)| (std::cmp::Reverse(*score), std::cmp::Reverse(value.0)));
     candidates.into_iter().map(|(value, _)| value).collect()
-}
-
-fn align_to(value: i32, align: i32) -> i32 {
-    (value + align - 1) / align * align
 }
 
 #[cfg(test)]

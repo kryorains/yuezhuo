@@ -26,9 +26,8 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     let src = format!("fa{}", reg_idx);
                     if let Some(reg) = self.float_regalloc.reg(*param) {
                         self.body.push_str(&format!("  fmv.s {}, {}\n", reg, src));
-                    } else {
-                        self.store_frame_s(&src, offset);
                     }
+                    self.store_frame_s(&src, offset);
                 }
                 IrArgLocation::Stack => {
                     let src = 16 + (stack_idx as i32) * 8;
@@ -42,6 +41,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     } else if param_sig.ty == Type::F32 {
                         if let Some(reg) = self.float_regalloc.reg(*param) {
                             self.load_raw_frame_s(reg, src);
+                            self.store_frame_s(reg, offset);
                         } else {
                             self.load_raw_frame_s("fa0", src);
                             self.store_frame_s("fa0", offset);
