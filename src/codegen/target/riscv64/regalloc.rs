@@ -2,6 +2,10 @@ use crate::codegen::common::{ir_value_use_counts, natural_loop_depths};
 use crate::ir::{Function, InstKind, Terminator, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
+mod float;
+#[allow(unused_imports)]
+pub(super) use float::Riscv64FloatRegAlloc;
+
 const INT_REGS: [&str; 11] = [
     "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
 ];
@@ -277,13 +281,13 @@ fn value_owner_block(func: &Function, value: ValueId) -> Option<usize> {
     }
 }
 
-struct InterferenceAnalysis {
-    interference: Vec<HashSet<ValueId>>,
-    call_operands: HashSet<ValueId>,
-    live_across_calls: HashSet<ValueId>,
+pub(super) struct InterferenceAnalysis {
+    pub(super) interference: Vec<HashSet<ValueId>>,
+    pub(super) call_operands: HashSet<ValueId>,
+    pub(super) live_across_calls: HashSet<ValueId>,
 }
 
-fn interference_graph(
+pub(super) fn interference_graph(
     func: &Function,
     candidates: &HashSet<ValueId>,
 ) -> Option<InterferenceAnalysis> {
@@ -472,7 +476,7 @@ fn interference_graph(
     })
 }
 
-fn phi_affinities(
+pub(super) fn phi_affinities(
     func: &Function,
     candidates: &HashSet<ValueId>,
     interference: &[HashSet<ValueId>],
@@ -558,7 +562,7 @@ fn call_crossing_candidates(
     candidates.into_iter().map(|(value, _, _)| value).collect()
 }
 
-fn weighted_use_scores(func: &Function) -> Vec<usize> {
+pub(super) fn weighted_use_scores(func: &Function) -> Vec<usize> {
     let loop_depths = natural_loop_depths(func);
     let weight_for = |block_idx: usize| 1usize << loop_depths[block_idx].saturating_mul(4).min(20);
     let mut scores = vec![0usize; func.values.len()];
