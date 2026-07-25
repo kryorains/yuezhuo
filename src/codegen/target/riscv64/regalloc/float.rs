@@ -9,7 +9,11 @@ const CALLER_SAVED_REGS: [&str; 11] = [
 const CALLEE_SAVED_REGS: [&str; 12] = [
     "fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11",
 ];
-const MIN_CALLEE_SAVED_SCORE: usize = 16;
+const MAX_BLOCKS: usize = 1024;
+const MAX_VALUES: usize = 8192;
+const MAX_CANDIDATES: usize = 512;
+const MAX_LIVENESS_CELLS: usize = 262_144;
+const CALLEE_SAVED_SAVE_RESTORE_COST: usize = 16;
 
 pub(in crate::codegen::target::riscv64) struct Riscv64FloatRegAlloc {
     regs: HashMap<ValueId, &'static str>,
@@ -18,6 +22,10 @@ pub(in crate::codegen::target::riscv64) struct Riscv64FloatRegAlloc {
 
 impl Riscv64FloatRegAlloc {
     pub(in crate::codegen::target::riscv64) fn new(func: &Function) -> Self {
+        if func.blocks.len() > MAX_BLOCKS || func.values.len() > MAX_VALUES {
+            return Self::empty();
+        }
+
         let use_counts = ir_value_use_counts(func);
         let candidate_set = func
             .values
@@ -38,6 +46,11 @@ impl Riscv64FloatRegAlloc {
             })
             .collect::<HashSet<_>>();
         if candidate_set.is_empty() {
+            return Self::empty();
+        }
+        if candidate_set.len() > MAX_CANDIDATES
+            || func.blocks.len().saturating_mul(candidate_set.len()) > MAX_LIVENESS_CELLS
+        {
             return Self::empty();
         }
 
@@ -64,14 +77,14 @@ impl Riscv64FloatRegAlloc {
                         && !analysis.live_across_calls.contains(&value)
                         || CALLEE_SAVED_REGS.contains(&reg)
                             && (analysis.live_across_calls.contains(&value)
-                                || score >= MIN_CALLEE_SAVED_SCORE))
+                                || score >= CALLEE_SAVED_SAVE_RESTORE_COST))
             };
             let preferred = affinities[value.0]
                 .iter()
-                .find_map(|neighbor| regs.get(neighbor).copied().filter(|reg| allowed(*reg)));
+                .find_map(|neighbor| regs.get(neighbor).copied().filter(|reg| allowed(reg)));
             let selected = preferred
-                .or_else(|| CALLER_SAVED_REGS.iter().copied().find(|reg| allowed(*reg)))
-                .or_else(|| CALLEE_SAVED_REGS.iter().copied().find(|reg| allowed(*reg)));
+                .or_else(|| CALLER_SAVED_REGS.iter().copied().find(|reg| allowed(reg)))
+                .or_else(|| CALLEE_SAVED_REGS.iter().copied().find(|reg| allowed(reg)));
             if let Some(reg) = selected {
                 regs.insert(value, reg);
             }
@@ -133,6 +146,61 @@ mod tests {
         let reg = regs.reg(result).expect("result should receive a register");
         assert!(CALLER_SAVED_REGS.contains(&reg));
         assert_ne!(reg, "ft0");
+    }
+
+    #[test]
+    fn does_not_pay_callee_saved_cost_for_cold_single_use_value() {
+        let mut func = Function::new("cold_pressure", Type::F32);
+        let params = (0..12)
+            .map(|idx| func.add_param(format!("value_{idx}"), Type::F32))
+            .collect::<Vec<_>>();
+        let sums = params
+            .chunks_exact(2)
+            .map(|pair| {
+                func.append_inst(
+                    func.entry,
+                    InstKind::Binary {
+                        op: BinaryOp::Fadd,
+                        lhs: pair[0],
+                        rhs: pair[1],
+                    },
+                    Some(Type::F32),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        func.set_terminator(func.entry, Terminator::Return(Some(sums[0])));
+
+        let regs = Riscv64FloatRegAlloc::new(&func);
+
+        assert!(regs.used_callee_saved().is_empty());
+        assert!(params.iter().any(|param| regs.reg(*param).is_none()));
+    }
+
+    #[test]
+    fn falls_back_to_stack_when_float_candidate_budget_is_exceeded() {
+        let mut func = Function::new("float_budget", Type::Void);
+        let zero = func.add_const(Const::Float(0.0f32.to_bits()));
+        let params = (0..=MAX_CANDIDATES)
+            .map(|idx| {
+                let param = func.add_param(format!("value_{idx}"), Type::F32);
+                func.append_inst(
+                    func.entry,
+                    InstKind::Binary {
+                        op: BinaryOp::Fadd,
+                        lhs: param,
+                        rhs: zero,
+                    },
+                    Some(Type::F32),
+                );
+                param
+            })
+            .collect::<Vec<_>>();
+        func.set_terminator(func.entry, Terminator::Return(None));
+
+        let regs = Riscv64FloatRegAlloc::new(&func);
+
+        assert!(params.iter().all(|param| regs.reg(*param).is_none()));
     }
 
     #[test]

@@ -36,6 +36,34 @@ fn float_regalloc_api_is_available_to_target_consumers() {
 }
 
 #[test]
+fn does_not_add_float_frame_to_integer_only_function() {
+    let mut function = Function::new("integer_only", Type::I32);
+    let lhs = function.add_param("lhs", Type::I32);
+    let rhs = function.add_param("rhs", Type::I32);
+    let sum = function
+        .append_inst(
+            function.entry,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs,
+                rhs,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    function.set_terminator(function.entry, Terminator::Return(Some(sum)));
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let function_asm = function_asm(&asm, "integer_only");
+
+    assert!(function_asm.contains("addw"));
+    assert!(!function_asm.contains("fsw fs"));
+    assert!(!function_asm.contains("flw fs"));
+}
+
+#[test]
 fn keeps_straight_line_float_intermediates_in_registers() {
     let mut function = Function::new("float_expr", Type::I32);
     let lhs = function.add_param("lhs", Type::F32);
