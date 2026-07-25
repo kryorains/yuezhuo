@@ -76,15 +76,23 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     self.load_value(base);
                     let ty = self.func.value(result).ty.clone();
                     self.load_indirect(&ty, offset);
-                    self.store_result(result);
+                    if ty == Type::F32 {
+                        self.store_float_result(result, "fa0");
+                    } else {
+                        self.store_result(result);
+                    }
                 }
             }
             InstKind::Store { ptr, value } => {
                 if !self.emit_assigned_store(*ptr, *value) {
                     let (base, offset) = self.memory_address(*ptr);
                     self.load_value_into(base, "a1");
-                    self.load_value(*value);
                     let ty = self.func.value(*value).ty.clone();
+                    if ty == Type::F32 {
+                        self.load_float_value(*value, "fa0");
+                    } else {
+                        self.load_value(*value);
+                    }
                     self.store_indirect(&ty, offset);
                 }
             }
@@ -93,14 +101,25 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 let result = inst.result.unwrap();
                 if !self.emit_assigned_unary(result, *op, *value) {
                     self.emit_unary(*op, *value);
-                    self.store_result(result);
+                    if *op == UnaryOp::Fneg {
+                        self.store_float_result(result, "fa0");
+                    } else {
+                        self.store_result(result);
+                    }
                 }
             }
             InstKind::Binary { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
                 if !self.emit_assigned_binary(result, *op, *lhs, *rhs) {
                     self.emit_binary(*op, *lhs, *rhs);
-                    self.store_result(result);
+                    if matches!(
+                        op,
+                        BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv
+                    ) {
+                        self.store_float_result(result, "fa0");
+                    } else {
+                        self.store_result(result);
+                    }
                 }
             }
             InstKind::Icmp { op, lhs, rhs } => {
@@ -123,7 +142,11 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 let result = inst.result.unwrap();
                 if !self.emit_assigned_cast(result, *op, *value) {
                     self.emit_cast(*op, *value);
-                    self.store_result(result);
+                    if *op == CastOp::I32ToF32 {
+                        self.store_float_result(result, "fa0");
+                    } else {
+                        self.store_result(result);
+                    }
                 }
             }
             InstKind::Gep { base, indices } => {
@@ -137,11 +160,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 }
             }
             InstKind::Call { name, args } => {
-                let ret = self.emit_call(name, args);
+                let ret = self.emit_call(name, args, inst.result);
                 if let Some(result) = inst.result {
-                    if ret == Type::F32 {
-                        self.store_frame_s("fa0", self.layout.offset(result));
-                    } else {
+                    if ret != Type::F32 {
                         self.store_result(result);
                     }
                 }
@@ -158,9 +179,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         match terminator {
             Terminator::Return(value) => {
                 if let Some(value) = value {
-                    self.load_value(*value);
                     if self.func.value(*value).ty == Type::F32 {
-                        self.body.push_str("  fmv.w.x fa0, a0\n");
+                        self.load_float_value(*value, "fa0");
+                    } else {
+                        self.load_value(*value);
                     }
                 }
                 if next_block.is_some() {
@@ -563,13 +585,19 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_unary(&mut self, op: UnaryOp, value: ValueId) {
-        self.load_value(value);
         match op {
-            UnaryOp::Ineg => self.body.push_str("  negw a0, a0\n"),
-            UnaryOp::Fneg => self
-                .body
-                .push_str("  fmv.w.x fa0, a0\n  fneg.s fa0, fa0\n  fmv.x.w a0, fa0\n"),
-            UnaryOp::Not => self.body.push_str("  seqz a0, a0\n"),
+            UnaryOp::Ineg => {
+                self.load_value(value);
+                self.body.push_str("  negw a0, a0\n");
+            }
+            UnaryOp::Fneg => {
+                self.load_float_value(value, "fa0");
+                self.body.push_str("  fneg.s fa0, fa0\n");
+            }
+            UnaryOp::Not => {
+                self.load_value(value);
+                self.body.push_str("  seqz a0, a0\n");
+            }
         }
     }
 
@@ -790,7 +818,6 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     BinaryOp::Fdiv => self.body.push_str("  fdiv.s fa0, fa1, fa0\n"),
                     _ => unreachable!(),
                 }
-                self.body.push_str("  fmv.x.w a0, fa0\n");
             }
             BinaryOp::And | BinaryOp::Or => {
                 self.load_value_into(lhs, "a1");
@@ -1269,9 +1296,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             CastOp::I32ToF32 | CastOp::BoolToI32 | CastOp::I32ToBool => {
                 self.load_value(value);
                 match op {
-                    CastOp::I32ToF32 => self
-                        .body
-                        .push_str("  fcvt.s.w fa0, a0\n  fmv.x.w a0, fa0\n"),
+                    CastOp::I32ToF32 => self.body.push_str("  fcvt.s.w fa0, a0\n"),
                     CastOp::BoolToI32 => {}
                     CastOp::I32ToBool => self.body.push_str("  snez a0, a0\n"),
                     _ => unreachable!(),

@@ -49,7 +49,23 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             .or_else(|| self.local_regs.reg(value))
     }
 
+    pub(super) fn assigned_float_reg(&self, value: ValueId) -> Option<&'static str> {
+        self.float_regalloc.reg(value)
+    }
+
     pub(super) fn emit_assigned_load(&mut self, result: ValueId, ptr: ValueId) -> bool {
+        if self.func.value(result).ty == Type::F32 {
+            let (base, offset) = self.memory_address(ptr);
+            let Some(pointer) = self.assigned_reg(base) else {
+                return false;
+            };
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            self.body
+                .push_str(&format!("  flw {}, {}({})\n", destination, offset, pointer));
+            return true;
+        }
         let Some(destination) = self.assigned_reg(result) else {
             return false;
         };
@@ -68,6 +84,17 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
     pub(super) fn emit_assigned_store(&mut self, ptr: ValueId, value: ValueId) -> bool {
         let (base, offset) = self.memory_address(ptr);
+        if self.func.value(value).ty == Type::F32 {
+            let Some(pointer) = self.assigned_reg(base) else {
+                return false;
+            };
+            let Some(source) = self.assigned_float_reg(value) else {
+                return false;
+            };
+            self.body
+                .push_str(&format!("  fsw {}, {}({})\n", source, offset, pointer));
+            return true;
+        }
         let pointer = self.assigned_reg(base);
         let source = self.assigned_reg(value);
         if pointer.is_none() && source.is_none() {
@@ -279,6 +306,13 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_float_value(&mut self, value: ValueId, reg: &str) {
+        if let Some(source) = self.assigned_float_reg(value) {
+            if source != reg {
+                self.body
+                    .push_str(&format!("  fmv.s {}, {}\n", reg, source));
+            }
+            return;
+        }
         match &self.func.value(value).kind {
             ValueKind::Const(Const::Float(bits)) => {
                 let label = self.parent.ctx.fresh_label("float");
@@ -294,6 +328,17 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 self.body.push_str(&format!("  fmv.w.x {}, a0\n", reg));
             }
         }
+    }
+
+    pub(super) fn store_float_result(&mut self, value: ValueId, source: &str) {
+        if let Some(destination) = self.assigned_float_reg(value) {
+            if destination != source {
+                self.body
+                    .push_str(&format!("  fmv.s {}, {}\n", destination, source));
+            }
+            return;
+        }
+        self.store_frame_s(source, self.layout.offset(value));
     }
 
     pub(super) fn rematerialize_into(&mut self, value: ValueId, destination: &str) -> bool {
@@ -321,6 +366,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     pub(super) fn load_indirect(&mut self, ty: &Type, offset: i32) {
         match ty {
             Type::Ptr(_) => self.body.push_str(&format!("  ld a0, {}(a0)\n", offset)),
+            Type::F32 => self.body.push_str(&format!("  flw fa0, {}(a0)\n", offset)),
             _ => self.body.push_str(&format!("  lw a0, {}(a0)\n", offset)),
         }
     }
@@ -328,6 +374,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     pub(super) fn store_indirect(&mut self, ty: &Type, offset: i32) {
         match ty {
             Type::Ptr(_) => self.body.push_str(&format!("  sd a0, {}(a1)\n", offset)),
+            Type::F32 => self.body.push_str(&format!("  fsw fa0, {}(a1)\n", offset)),
             _ => self.body.push_str(&format!("  sw a0, {}(a1)\n", offset)),
         }
     }
