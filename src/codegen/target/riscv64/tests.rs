@@ -372,3 +372,146 @@ fn keeps_stack_slots_below_float_callee_save_area() {
     assert!(caller_asm.contains("fsw fs0, -8(s0)"));
     assert!(caller_asm.contains("sw a0, -32(s0)"));
 }
+
+#[test]
+fn keeps_float_accumulator_phi_off_the_stack() {
+    let mut function = Function::new("float_loop", Type::F32);
+    let initial = function.add_param("initial", Type::F32);
+    let count = function.add_param("count", Type::I32);
+    let zero_i = function.add_const(Const::Int(0));
+    let one_i = function.add_const(Const::Int(1));
+    let one_f = function.add_const(Const::Float(1.0f32.to_bits()));
+    let header = function.add_block("header");
+    let exit = function.add_block("exit");
+    function.set_terminator(function.entry, Terminator::Jump(header));
+
+    let acc = function
+        .append_inst(
+            header,
+            InstKind::Phi {
+                incomings: vec![(function.entry, initial)],
+            },
+            Some(Type::F32),
+        )
+        .unwrap();
+    let index = function
+        .append_inst(
+            header,
+            InstKind::Phi {
+                incomings: vec![(function.entry, zero_i)],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let next_acc = function
+        .append_inst(
+            header,
+            InstKind::Binary {
+                op: BinaryOp::Fadd,
+                lhs: acc,
+                rhs: one_f,
+            },
+            Some(Type::F32),
+        )
+        .unwrap();
+    let next_index = function
+        .append_inst(
+            header,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: index,
+                rhs: one_i,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let cond = function
+        .append_inst(
+            header,
+            InstKind::Icmp {
+                op: crate::ir::CmpOp::Lt,
+                lhs: next_index,
+                rhs: count,
+            },
+            Some(Type::I1),
+        )
+        .unwrap();
+    let InstKind::Phi { incomings } = &mut function.block_mut(header).insts[0].kind else {
+        unreachable!();
+    };
+    incomings.push((header, next_acc));
+    let InstKind::Phi { incomings } = &mut function.block_mut(header).insts[1].kind else {
+        unreachable!();
+    };
+    incomings.push((header, next_index));
+    function.set_terminator(
+        header,
+        Terminator::Branch {
+            cond,
+            then_target: header,
+            else_target: exit,
+        },
+    );
+    function.set_terminator(exit, Terminator::Return(Some(next_acc)));
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let function_asm = function_asm(&asm, "float_loop");
+    let emitted_blocks = &function_asm[function_asm.find("\n.L_float_loop_bb").unwrap()..];
+
+    assert!(function_asm.contains("fadd.s"));
+    assert!(function_asm.contains("fmv.s ft"));
+    assert!(!emitted_blocks.contains("fsw fa0"));
+    assert!(
+        !emitted_blocks
+            .lines()
+            .any(|line| line.trim_start().starts_with("sw ")),
+        "{emitted_blocks}"
+    );
+}
+
+#[test]
+fn breaks_float_phi_copy_cycle_with_ft0() {
+    let mut function = Function::new("float_swap", Type::Void);
+    let lhs = function.add_param("lhs", Type::F32);
+    let rhs = function.add_param("rhs", Type::F32);
+    let header = function.add_block("header");
+    function.set_terminator(function.entry, Terminator::Jump(header));
+
+    let left_phi = function
+        .append_inst(
+            header,
+            InstKind::Phi {
+                incomings: vec![(function.entry, lhs)],
+            },
+            Some(Type::F32),
+        )
+        .unwrap();
+    let right_phi = function
+        .append_inst(
+            header,
+            InstKind::Phi {
+                incomings: vec![(function.entry, rhs)],
+            },
+            Some(Type::F32),
+        )
+        .unwrap();
+    let InstKind::Phi { incomings } = &mut function.block_mut(header).insts[0].kind else {
+        unreachable!();
+    };
+    incomings.push((header, right_phi));
+    let InstKind::Phi { incomings } = &mut function.block_mut(header).insts[1].kind else {
+        unreachable!();
+    };
+    incomings.push((header, left_phi));
+    function.set_terminator(header, Terminator::Jump(header));
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let function_asm = function_asm(&asm, "float_swap");
+
+    assert!(function_asm.contains("fmv.s ft0,"));
+    assert!(function_asm.lines().any(|line| line.ends_with(", ft0")));
+}
