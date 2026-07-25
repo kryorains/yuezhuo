@@ -514,13 +514,15 @@ fn const_gep_offset(func: &crate::ir::Function, index: ValueId, stride: i32) -> 
     Some(i64::from(index) * i64::from(stride))
 }
 
+// Keep the modulo form to support Rust toolchains predating u64::is_multiple_of in 1.87.
+#[allow(clippy::manual_is_multiple_of)]
 fn aarch64_addsub_immediate(magnitude: u64) -> Option<(u64, bool)> {
     const MAX_IMMEDIATE: u64 = (1 << 12) - 1;
     const SHIFTED_UNIT: u64 = 1 << 12;
 
     if magnitude <= MAX_IMMEDIATE {
         Some((magnitude, false))
-    } else if magnitude.is_multiple_of(SHIFTED_UNIT) && magnitude / SHIFTED_UNIT <= MAX_IMMEDIATE {
+    } else if magnitude % SHIFTED_UNIT == 0 && magnitude / SHIFTED_UNIT <= MAX_IMMEDIATE {
         Some((magnitude / SHIFTED_UNIT, true))
     } else {
         None
