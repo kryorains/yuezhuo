@@ -249,7 +249,6 @@ fn transfer_load_state(
 /// intervening store also writes `v`. Exact pointer identity is required only
 /// for the store being removed; an intervening `store q, v` is harmless even
 /// when `q` aliases `p`.
-
 fn eliminate_redundant_writebacks(func: &mut Function) -> bool {
     let pointer_roots = func
         .values

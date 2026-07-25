@@ -6,7 +6,7 @@ pub(crate) fn emit_ir_data_section(module: &Module, word_directive: &str) -> Str
     let mut current_section = None;
 
     for global in &module.globals {
-        let section = if global.init.as_ref().map_or(true, is_zero_const) {
+        let section = if global.init.as_ref().is_none_or(is_zero_const) {
             ".bss"
         } else {
             ".data"

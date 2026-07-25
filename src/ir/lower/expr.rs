@@ -39,7 +39,7 @@ impl<'a> FunctionLowerer<'a> {
                 }
             },
             AstUnaryOp::Not => {
-                let value = self.to_bool(value)?;
+                let value = self.lower_to_bool(value)?;
                 Ok(self.unary(IrUnaryOp::Not, value, Type::I1))
             }
         }
@@ -259,10 +259,10 @@ impl<'a> FunctionLowerer<'a> {
 
     pub(super) fn lower_bool_expr(&mut self, expr: &Expr) -> Result<ValueId, LowerError> {
         let value = self.lower_expr(expr)?;
-        self.to_bool(value)
+        self.lower_to_bool(value)
     }
 
-    fn to_bool(&mut self, value: ValueId) -> Result<ValueId, LowerError> {
+    fn lower_to_bool(&mut self, value: ValueId) -> Result<ValueId, LowerError> {
         match self.value_type(value) {
             Type::I1 => Ok(value),
             Type::I32 => {

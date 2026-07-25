@@ -82,9 +82,9 @@ impl Riscv64RegAlloc {
             };
             let preferred = affinities[value.0]
                 .iter()
-                .find_map(|neighbor| regs.get(neighbor).copied().filter(|reg| allowed(*reg)));
+                .find_map(|neighbor| regs.get(neighbor).copied().filter(|reg| allowed(reg)));
             if let Some(reg) =
-                preferred.or_else(|| available.iter().copied().find(|reg| allowed(*reg)))
+                preferred.or_else(|| available.iter().copied().find(|reg| allowed(reg)))
             {
                 regs.insert(value, reg);
             }
