@@ -515,3 +515,75 @@ fn breaks_float_phi_copy_cycle_with_ft0() {
     assert!(function_asm.contains("fmv.s ft0,"));
     assert!(function_asm.lines().any(|line| line.ends_with(", ft0")));
 }
+
+#[test]
+fn snapshots_large_mixed_phi_copy_sets_with_typed_stack_records() {
+    const COPY_COUNT: usize = 129;
+    const FLOAT_COPY_COUNT: usize = 65;
+    const INT_COPY_COUNT: usize = 64;
+
+    let mut function = Function::new("mixed_phi_snapshot", Type::Void);
+    let integer = function.add_const(Const::Int(37));
+    let float_bits = 2.5f32.to_bits();
+    let float = function.add_const(Const::Float(float_bits));
+    let target = function.add_block("target");
+    function.set_terminator(function.entry, Terminator::Jump(target));
+
+    for index in 0..COPY_COUNT {
+        let (incoming, ty) = if index % 2 == 0 {
+            (float, Type::F32)
+        } else {
+            (integer, Type::I32)
+        };
+        function.append_inst(
+            target,
+            InstKind::Phi {
+                incomings: vec![(function.entry, incoming)],
+            },
+            Some(ty),
+        );
+    }
+    function.set_terminator(target, Terminator::Return(None));
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let function_asm = function_asm(&asm, "mixed_phi_snapshot");
+    let edge_asm = entry_block_asm(function_asm, "mixed_phi_snapshot");
+
+    assert!(asm.contains(&format!("  .word {float_bits}")));
+    assert!(edge_asm.contains("  la t0, .L_float_"));
+    assert!(edge_asm.contains("  flw fa0, 0(t0)\n"));
+    assert_eq!(edge_asm.matches("  sd a0, 0(sp)\n").count(), INT_COPY_COUNT);
+    assert_eq!(
+        edge_asm.matches("  sd zero, 0(sp)\n").count(),
+        FLOAT_COPY_COUNT
+    );
+    assert_eq!(
+        edge_asm.matches("  fsw fa0, 0(sp)\n").count(),
+        FLOAT_COPY_COUNT
+    );
+    assert_eq!(edge_asm.matches("  addi sp, sp, -16\n").count(), COPY_COUNT);
+    assert_eq!(edge_asm.matches("  addi sp, sp, 16\n").count(), COPY_COUNT);
+    assert_eq!(
+        edge_asm.matches("  flw fa0, 0(sp)\n").count(),
+        FLOAT_COPY_COUNT
+    );
+    assert_eq!(edge_asm.matches("  ld a1, 0(sp)\n").count(), INT_COPY_COUNT);
+
+    let first_restore = edge_asm.find("  flw fa0, 0(sp)\n").unwrap();
+    let restores = &edge_asm[first_restore..];
+    assert!(restores.starts_with("  flw fa0, 0(sp)\n  addi sp, sp, 16\n"));
+    let first_int_restore = restores.find("  ld a1, 0(sp)\n").unwrap();
+    assert!(restores[..first_int_restore].contains("  fsw fa0, "));
+    let next_float_restore = restores[first_int_restore..]
+        .find("  flw fa0, 0(sp)\n")
+        .map(|offset| offset + first_int_restore)
+        .unwrap();
+    let int_restore = &restores[first_int_restore..next_float_restore];
+    assert!(int_restore.starts_with("  ld a1, 0(sp)\n  addi sp, sp, 16\n  mv a0, a1\n"));
+
+    assert!(!edge_asm.contains("fmv.w.x"));
+    assert!(!edge_asm.contains("fmv.x.w"));
+    assert!(!edge_asm.lines().any(|line| line.contains("mv a0, ft")));
+}
