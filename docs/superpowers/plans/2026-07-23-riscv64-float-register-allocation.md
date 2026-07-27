@@ -1058,3 +1058,12 @@ Expected: all commands PASS.
 - [ ] **Step 5: Repeat the RISC-V64 functional and paired performance acceptance**
 
 Run the Task 6 O0/O1 functional commands and the five baseline/candidate pairs for `h-2-01`, `h-2-02`, and `h-2-03`. The original acceptance remains unchanged: at least two cases improve by 20%, the geometric mean improves by at least 15%, and the full performance set has no new output, crash, or timeout regression.
+
+Verification on 2026-07-27:
+
+- RISC-V64 O0 and O1 functional output: 143/143 after normalizing the Windows CR byte emitted by `68_brainfk`.
+- `h-2-01` median: 899 ms baseline, 680 ms candidate, 24.36% improvement.
+- `h-2-02` median: 819 ms baseline, 627 ms candidate, 23.44% improvement.
+- `h-2-03` median: 1165 ms baseline, 905 ms candidate, 22.32% improvement.
+- Three-case geometric mean improvement: 23.38%.
+- Full O1 performance set: no new compile, link, output, or timeout regression. The existing `fft0`, `if-combine2`, and `if-combine3` mismatches have byte-identical actual output and assembly versus the pre-optimization candidate; `03_sort1` still times out with byte-identical assembly.
