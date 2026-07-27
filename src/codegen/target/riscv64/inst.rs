@@ -720,6 +720,16 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_assigned_unary(&mut self, result: ValueId, op: UnaryOp, value: ValueId) -> bool {
+        if op == UnaryOp::Fneg {
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            self.load_float_value(value, "fa0");
+            self.body
+                .push_str(&format!("  fneg.s {}, fa0\n", destination));
+            return true;
+        }
+
         let Some(destination) = self.assigned_reg(result) else {
             return false;
         };
@@ -743,6 +753,27 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         lhs: ValueId,
         rhs: ValueId,
     ) -> bool {
+        if matches!(
+            op,
+            BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv
+        ) {
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            self.load_float_value(lhs, "fa1");
+            self.load_float_value(rhs, "fa0");
+            let instruction = match op {
+                BinaryOp::Fadd => "fadd.s",
+                BinaryOp::Fsub => "fsub.s",
+                BinaryOp::Fmul => "fmul.s",
+                BinaryOp::Fdiv => "fdiv.s",
+                _ => unreachable!(),
+            };
+            self.body
+                .push_str(&format!("  {} {}, fa1, fa0\n", instruction, destination));
+            return true;
+        }
+
         let Some(destination) = self.assigned_reg(result) else {
             return false;
         };
@@ -1376,6 +1407,16 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_assigned_cast(&mut self, result: ValueId, op: CastOp, value: ValueId) -> bool {
+        if op == CastOp::I32ToF32 {
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            let source = self.load_or_assigned(value, "a0");
+            self.body
+                .push_str(&format!("  fcvt.s.w {}, {}\n", destination, source));
+            return true;
+        }
+
         let Some(destination) = self.assigned_reg(result) else {
             return false;
         };

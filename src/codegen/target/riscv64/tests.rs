@@ -111,8 +111,66 @@ fn keeps_straight_line_float_intermediates_in_registers() {
 
     assert!(body.contains("fmul.s"));
     assert!(body.contains("fadd.s"));
-    assert!(body.contains("fmv.s ft"));
+    assert!(body.lines().any(|line| line.starts_with("  fmul.s ft")));
+    assert!(body.lines().any(|line| line.starts_with("  fadd.s ft")));
+    assert!(!body.lines().any(|line| line.starts_with("  fmv.s ft")));
     assert!(!body.contains("fsw fa0"));
+}
+
+#[test]
+fn emits_float_results_directly_into_assigned_registers() {
+    let mut function = Function::new("direct_float_results", Type::F32);
+    let integer = function.add_param("integer", Type::I32);
+    let addend = function.add_param("addend", Type::F32);
+    let converted = function
+        .append_inst(
+            function.entry,
+            InstKind::Cast {
+                op: CastOp::I32ToF32,
+                value: integer,
+            },
+            Some(Type::F32),
+        )
+        .unwrap();
+    let negated = function
+        .append_inst(
+            function.entry,
+            InstKind::Unary {
+                op: UnaryOp::Fneg,
+                value: converted,
+            },
+            Some(Type::F32),
+        )
+        .unwrap();
+    let sum = function
+        .append_inst(
+            function.entry,
+            InstKind::Binary {
+                op: BinaryOp::Fadd,
+                lhs: negated,
+                rhs: addend,
+            },
+            Some(Type::F32),
+        )
+        .unwrap();
+    function.set_terminator(function.entry, Terminator::Return(Some(sum)));
+
+    let regs = Riscv64FloatRegAlloc::new(&function);
+    let converted_reg = regs.reg(converted).unwrap();
+    let negated_reg = regs.reg(negated).unwrap();
+    let sum_reg = regs.reg(sum).unwrap();
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let function_asm = function_asm(&asm, "direct_float_results");
+    let body = entry_block_asm(function_asm, "direct_float_results");
+
+    assert!(body.contains(&format!("fcvt.s.w {converted_reg},")));
+    assert!(body.contains(&format!("fneg.s {negated_reg},")));
+    assert!(body.contains(&format!("fadd.s {sum_reg},")));
+    assert!(!body.contains(&format!("fmv.s {converted_reg}, fa0")));
+    assert!(!body.contains(&format!("fmv.s {negated_reg}, fa0")));
+    assert!(!body.contains(&format!("fmv.s {sum_reg}, fa0")));
 }
 
 #[test]
@@ -273,10 +331,11 @@ fn routes_float_call_arguments_and_results_through_assigned_registers() {
     let caller_asm = function_asm(&asm, "float_call_pipeline");
     let body = entry_block_asm(caller_asm, "float_call_pipeline");
 
-    assert!(body.contains("fcvt.s.w fa0"));
+    assert!(body.lines().any(|line| line.starts_with("  fcvt.s.w ft")));
     assert!(body.contains("fmv.s fa0, ft"));
     assert!(body.contains("call float_identity\n  fmv.s ft"));
-    assert!(body.contains("fneg.s fa0, fa0\n  fmv.s ft"));
+    assert!(body.lines().any(|line| line.starts_with("  fneg.s ft")));
+    assert!(!body.contains("fneg.s fa0"));
     assert!(!body.contains("fmv.x.w"));
 }
 
@@ -317,7 +376,7 @@ fn preserves_call_crossing_float_parameter() {
 
     assert!(caller_asm.contains("fmv.s fs0, fa0"));
     assert!(caller_asm.contains("fmv.s fa1, fs0"));
-    assert!(caller_asm.contains("fmv.s ft1, fa0"));
+    assert!(caller_asm.contains("fadd.s ft1, fa1, fa0"));
     assert!(caller_asm.contains("fmv.s fa0, ft1"));
     assert!(!caller_asm.contains("lw a0, -24(s0)"));
     assert!(caller_asm.contains("fsw fs0, -8(s0)"));
