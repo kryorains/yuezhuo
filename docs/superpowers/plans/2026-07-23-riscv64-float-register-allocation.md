@@ -1021,3 +1021,40 @@ git log --oneline origin/feat/matrix-foundation..HEAD
 ```
 
 Expected: no whitespace errors, only planned source/docs changes, and one focused commit per completed task.
+
+### Task 7: Emit assigned float results directly when required by performance acceptance
+
+**Files:**
+- Modify: `src/codegen/target/riscv64/inst.rs`
+- Test: `src/codegen/target/riscv64/tests.rs`
+
+- [ ] **Step 1: Add a failing assembly regression test**
+
+Extend the straight-line float emission coverage so an assigned `Fadd` result and an assigned `I32ToF32` result must be the destination of `fadd.s` and `fcvt.s.w` respectively. Reject an immediately following `fmv.s` from `fa0` into that result register.
+
+- [ ] **Step 2: Run the focused test and verify RED**
+
+```bash
+cargo test codegen::target::riscv64::tests::emits_float_results_directly_into_assigned_registers --locked
+```
+
+Expected: FAIL because the current emitter computes in `fa0` and copies the result afterward.
+
+- [ ] **Step 3: Implement the minimal direct-destination path**
+
+Teach `emit_assigned_binary`, `emit_assigned_unary`, and `emit_assigned_cast` to query `assigned_float_reg(result)` for `F32` results. Continue loading binary operands through `fa0/fa1`, but emit the arithmetic, `fneg.s`, or `fcvt.s.w` with the assigned result register as destination. Return `false` for unassigned results so the existing `fa0` and stack fallback remains unchanged.
+
+- [ ] **Step 4: Verify GREEN and the full local suite**
+
+```bash
+cargo test codegen::target::riscv64::tests::emits_float_results_directly_into_assigned_registers --locked
+cargo test --locked
+cargo fmt -- --check
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+Expected: all commands PASS.
+
+- [ ] **Step 5: Repeat the RISC-V64 functional and paired performance acceptance**
+
+Run the Task 6 O0/O1 functional commands and the five baseline/candidate pairs for `h-2-01`, `h-2-02`, and `h-2-03`. The original acceptance remains unchanged: at least two cases improve by 20%, the geometric mean improves by at least 15%, and the full performance set has no new output, crash, or timeout regression.
