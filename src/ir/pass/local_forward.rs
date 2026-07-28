@@ -477,10 +477,10 @@ fn within_budget(func: &Function) -> bool {
                 InstKind::Call { args, .. } => {
                     operand_edges = operand_edges.saturating_add(args.len());
                 }
-                InstKind::Alloca { ty } => {
-                    if !spend_type_budget(ty, &mut type_nodes, &mut proof_work, MAX_TYPE_NODES) {
-                        return false;
-                    }
+                InstKind::Alloca { ty }
+                    if !spend_type_budget(ty, &mut type_nodes, &mut proof_work, MAX_TYPE_NODES) =>
+                {
+                    return false;
                 }
                 _ => {}
             }
