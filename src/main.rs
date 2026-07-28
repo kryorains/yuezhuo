@@ -118,7 +118,17 @@ fn main() {
         // bodies slower; keep the transform behind a target profitability gate.
         enable_simple_loop_unroll: target != codegen::Target::AArch64,
     };
-    ir::pass::run_pipeline(&mut module, opt_level, pass_options);
+    let max_reduction_jam_factor = if target == codegen::Target::Riscv64 {
+        4
+    } else {
+        2
+    };
+    ir::pass::run_pipeline_with_reduction_jam_factor(
+        &mut module,
+        opt_level,
+        pass_options,
+        max_reduction_jam_factor,
+    );
 
     if emit_ir {
         fs::write(&output, format!("{:#?}", module))

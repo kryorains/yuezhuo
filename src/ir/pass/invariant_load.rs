@@ -4,7 +4,7 @@ use self::analysis::WholeProgramAliasInfo;
 use super::dominators::{ControlFlowGraph, Dominators};
 use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
-use crate::ir::{BlockId, Function, InstKind, Module, ValueId};
+use crate::ir::{BlockId, Function, InstKind, Module, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
 const MAX_BLOCKS: usize = 2048;
@@ -16,6 +16,12 @@ const MAX_INSTRUCTIONS: usize = 65_536;
 /// Loads stay at their original control-flow points: only a dominating earlier
 /// load of the exact same (normally GEP-CSE'd) pointer value can be reused.
 pub(super) struct InvariantLoadForwardPass;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LoadLocation {
+    Exact(ValueId),
+    DirectGlobal(usize),
+}
 
 impl InvariantLoadForwardPass {
     pub(super) fn new() -> Self {
@@ -79,12 +85,13 @@ fn forward_invariant_loads(
 
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
-    let mut available = HashMap::<ValueId, ValueId>::new();
+    let mut available = HashMap::<LoadLocation, ValueId>::new();
     let mut replacements = ValueReplacements::new();
     visit_dom_tree(
         func,
         func.entry,
         &dom,
+        alias_info,
         &readonly_ptrs,
         &mut available,
         &mut replacements,
@@ -106,8 +113,9 @@ fn visit_dom_tree(
     func: &mut Function,
     block: BlockId,
     dom: &Dominators,
+    alias_info: &WholeProgramAliasInfo,
     readonly_ptrs: &HashSet<ValueId>,
-    available: &mut HashMap<ValueId, ValueId>,
+    available: &mut HashMap<LoadLocation, ValueId>,
     replacements: &mut ValueReplacements,
 ) {
     let mut introduced = Vec::new();
@@ -119,8 +127,15 @@ fn visit_dom_tree(
         if !readonly_ptrs.contains(ptr) {
             continue;
         }
+        let location = match func.value(*ptr).kind {
+            ValueKind::Global(_) => match alias_info.root(func, *ptr) {
+                analysis::MemoryRoot::Global(global) => LoadLocation::DirectGlobal(global),
+                _ => LoadLocation::Exact(*ptr),
+            },
+            _ => LoadLocation::Exact(*ptr),
+        };
 
-        if let Some(previous) = available.get(ptr).copied() {
+        if let Some(previous) = available.get(&location).copied() {
             // The pointer identity is exact and `previous` dominates this load.
             // Keep the earlier load where it was, and remove only the duplicate.
             if func.value(previous).ty == func.value(result).ty {
@@ -130,16 +145,24 @@ fn visit_dom_tree(
                 duplicate.kind = InstKind::Nop;
             }
         } else {
-            available.insert(*ptr, result);
-            introduced.push(*ptr);
+            available.insert(location, result);
+            introduced.push(location);
         }
     }
 
     for child in &dom.children[block.0] {
-        visit_dom_tree(func, *child, dom, readonly_ptrs, available, replacements);
+        visit_dom_tree(
+            func,
+            *child,
+            dom,
+            alias_info,
+            readonly_ptrs,
+            available,
+            replacements,
+        );
     }
 
-    for ptr in introduced {
-        available.remove(&ptr);
+    for location in introduced {
+        available.remove(&location);
     }
 }

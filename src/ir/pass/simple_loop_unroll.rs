@@ -7,29 +7,37 @@ use crate::ir::{
 };
 use std::collections::{HashMap, HashSet};
 
-const UNROLL_FACTOR: usize = 2;
 const MAX_BLOCKS: usize = 1024;
 const MAX_VALUES: usize = 8192;
 const MAX_ACTIVE_BODY_INSTS: usize = 16;
+const MAX_FACTOR_FOUR_BODY_INSTS: usize = 8;
 const MAX_CLONED_INSTS_PER_FUNCTION: usize = 256;
+const MAX_FUNCTION_INSTRUCTIONS: usize = 32_768;
 
 /// Unrolls a deliberately narrow class of single-block counted loops.
 ///
-/// The original loop remains as a scalar remainder. A two-lane fast loop is
-/// inserted in front of it, so dynamic odd bounds retain the source program's
-/// exact iteration order.
-pub(super) struct SimpleLoopUnrollPass;
+/// The original loop remains as a scalar remainder. A target-configured two-
+/// or four-lane fast loop is inserted in front of it, so dynamic tails retain
+/// the source program's exact iteration order.
+pub(super) struct SimpleLoopUnrollPass {
+    factor: usize,
+}
 
 impl SimpleLoopUnrollPass {
-    pub(super) fn new() -> Self {
-        Self
+    pub(super) fn new(factor: usize) -> Self {
+        assert!(matches!(factor, 2 | 4));
+        Self { factor }
     }
 }
 
 impl ModulePass for SimpleLoopUnrollPass {
     fn run(&mut self, module: &mut Module) {
         for func in &mut module.funcs {
-            unroll_simple_loops(func);
+            if func.simple_loop_unroll_decided() {
+                continue;
+            }
+            unroll_simple_loops(func, self.factor);
+            func.mark_simple_loop_unroll_decided();
         }
     }
 }
@@ -48,8 +56,18 @@ struct UnrollCandidate {
     active_body_insts: usize,
 }
 
-fn unroll_simple_loops(func: &mut Function) {
-    if func.blocks.len() > MAX_BLOCKS || func.values.len() > MAX_VALUES {
+fn unroll_simple_loops(func: &mut Function, factor: usize) {
+    let Some(mut instruction_count) = func
+        .blocks
+        .iter()
+        .try_fold(0usize, |total, block| total.checked_add(block.insts.len()))
+    else {
+        return;
+    };
+    if func.blocks.len() > MAX_BLOCKS
+        || func.values.len() > MAX_VALUES
+        || instruction_count > MAX_FUNCTION_INSTRUCTIONS
+    {
         return;
     }
 
@@ -63,14 +81,60 @@ fn unroll_simple_loops(func: &mut Function) {
         .collect::<Vec<_>>();
 
     let mut cloned_insts = 0usize;
+    let mut projected_values = func.values.len();
+    let mut projected_blocks = func.blocks.len();
     let mut changed = false;
     for candidate in candidates {
-        let growth = candidate.active_body_insts * UNROLL_FACTOR;
-        if cloned_insts + growth > MAX_CLONED_INSTS_PER_FUNCTION {
+        if factor == 4
+            && (candidate.active_body_insts > MAX_FACTOR_FOUR_BODY_INSTS
+                || candidate.body_insts.iter().any(|inst| {
+                    matches!(
+                        inst.kind,
+                        InstKind::Binary {
+                            op: BinaryOp::Idiv | BinaryOp::Imod | BinaryOp::Fdiv,
+                            ..
+                        }
+                    )
+                }))
+        {
             continue;
         }
-        apply_unroll(func, &candidate);
-        cloned_insts += growth;
+        let Some(growth) = candidate.active_body_insts.checked_mul(factor) else {
+            continue;
+        };
+        let Some(next_cloned) = cloned_insts.checked_add(growth) else {
+            continue;
+        };
+        // Four control/setup results and at most two newly interned constants
+        // accompany every transformed loop. Charging every cloned instruction
+        // as value-producing is conservative for stores.
+        let Some(value_growth) = growth.checked_add(6) else {
+            continue;
+        };
+        let Some(next_values) = projected_values.checked_add(value_growth) else {
+            continue;
+        };
+        let Some(next_blocks) = projected_blocks.checked_add(2) else {
+            continue;
+        };
+        let Some(next_instructions) = instruction_count
+            .checked_add(growth)
+            .and_then(|count| count.checked_add(4))
+        else {
+            continue;
+        };
+        if next_cloned > MAX_CLONED_INSTS_PER_FUNCTION
+            || next_values > MAX_VALUES
+            || next_blocks > MAX_BLOCKS
+            || next_instructions > MAX_FUNCTION_INSTRUCTIONS
+        {
+            continue;
+        }
+        apply_unroll(func, &candidate, factor);
+        cloned_insts = next_cloned;
+        projected_values = next_values;
+        projected_blocks = next_blocks;
+        instruction_count = next_instructions;
         changed = true;
     }
 
@@ -327,9 +391,9 @@ fn body_values_escape(
     false
 }
 
-fn apply_unroll(func: &mut Function, candidate: &UnrollCandidate) {
-    let cutoff_delta = get_or_add_i32_const(func, (UNROLL_FACTOR - 1) as i32);
-    let minimum_bound = get_or_add_i32_const(func, UNROLL_FACTOR as i32);
+fn apply_unroll(func: &mut Function, candidate: &UnrollCandidate, factor: usize) {
+    let cutoff_delta = get_or_add_i32_const(func, (factor - 1) as i32);
+    let minimum_bound = get_or_add_i32_const(func, factor as i32);
     let cutoff = func
         .append_inst(
             candidate.preheader,
@@ -353,14 +417,8 @@ fn apply_unroll(func: &mut Function, candidate: &UnrollCandidate) {
         )
         .unwrap();
 
-    let fast_header = func.add_block(format!(
-        "unroll{}.header.{}",
-        UNROLL_FACTOR, candidate.header.0
-    ));
-    let fast_body = func.add_block(format!(
-        "unroll{}.body.{}",
-        UNROLL_FACTOR, candidate.header.0
-    ));
+    let fast_header = func.add_block(format!("unroll{}.header.{}", factor, candidate.header.0));
+    let fast_body = func.add_block(format!("unroll{}.body.{}", factor, candidate.header.0));
     let fast_counter = func
         .append_inst(
             fast_header,
@@ -386,7 +444,7 @@ fn apply_unroll(func: &mut Function, candidate: &UnrollCandidate) {
         .unwrap();
 
     let mut current_counter = fast_counter;
-    for _ in 0..UNROLL_FACTOR {
+    for _ in 0..factor {
         current_counter = clone_body_lane(func, fast_body, candidate, current_counter);
     }
 

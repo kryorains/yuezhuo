@@ -7,8 +7,9 @@ mod memory;
 mod regalloc;
 
 use crate::codegen::common::{IrFuncLayout, IrLocalRegs};
-use crate::ir::{Function, Module};
+use crate::ir::{Function, Module, ValueId};
 use regalloc::Riscv64RegAlloc;
+use std::collections::HashMap;
 
 struct Riscv64IrEmitter<'a> {
     ctx: crate::codegen::common::IrModuleCtx<'a>,
@@ -22,6 +23,7 @@ struct Riscv64IrFuncEmitter<'a, 'b> {
     regalloc: Riscv64RegAlloc,
     local_regs: IrLocalRegs,
     value_use_counts: Vec<usize>,
+    folded_memory_geps: HashMap<ValueId, memory::FoldedMemoryGep>,
     body: String,
     return_label: String,
 }

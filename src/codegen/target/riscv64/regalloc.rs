@@ -5,21 +5,22 @@ use std::collections::{HashMap, HashSet};
 const INT_REGS: [&str; 11] = [
     "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
 ];
-const LEAF_CROSS_REGS: [&str; 6] = ["a2", "a3", "a4", "a5", "a6", "a7"];
+const CALLER_SAVED_REGS: [&str; 6] = ["a2", "a3", "a4", "a5", "a6", "a7"];
 const MAX_INTERFERENCE_BLOCKS: usize = 1024;
 const MAX_INTERFERENCE_VALUES: usize = 8192;
 const MAX_INTERFERENCE_CANDIDATES: usize = 512;
 const MAX_LIVENESS_CELLS: usize = 262_144;
 const MAX_LIVENESS_ITERATIONS: usize = 128;
+const MAX_CALL_LIVENESS_WORK: usize = 262_144;
 
 /// RISC-V64 的简化整数寄存器分配。
 ///
-/// 这里先不引入机器 IR，而是直接给 IR value 分配 callee-saved `s` 寄存器：
+/// 这里先不引入机器 IR，而是直接给 IR value 分配整数寄存器：
 /// - `s1..s11` 跨 call 保持，所以 non-leaf function 也能安全使用；
 /// - 只分配 i1/i32/ptr，不碰 f32；
 /// - 在固定编译预算内用 CFG liveness、phi-edge interference 与 copy affinity 安全复用寄存器；
+/// - 精确分析时，不跨 call 且不是参数或 call operand 的值还可使用 `a2..a7`；
 /// - 超出预算时只让热点 phi 与少量唯一跨块值独占寄存器，不执行不精确的区间复用；
-/// - 叶函数的非参数值还可把 `a2..a7` 用作无需保存的跨块寄存器；
 /// - 没有寄存器时回退到原来的栈槽路径。
 pub(super) struct Riscv64RegAlloc {
     regs: HashMap<ValueId, &'static str>,
@@ -44,18 +45,15 @@ impl Riscv64RegAlloc {
             return Self::new_conservative(func);
         }
 
-        let leaf = is_leaf(func);
         let mut available = Vec::new();
-        if leaf {
-            available.extend(LEAF_CROSS_REGS);
-        }
+        available.extend(CALLER_SAVED_REGS);
         available.extend(INT_REGS);
 
         let scores = weighted_use_scores(func);
-        let Some(interference) = interference_graph(func, &candidate_set) else {
+        let Some(analysis) = interference_graph(func, &candidate_set) else {
             return Self::new_conservative(func);
         };
-        let affinities = phi_affinities(func, &candidate_set, &interference);
+        let affinities = phi_affinities(func, &candidate_set, &analysis.interference);
         let mut candidates = candidate_set
             .into_iter()
             .map(|value| (value, scores[value.0]))
@@ -64,21 +62,26 @@ impl Riscv64RegAlloc {
 
         let mut regs = HashMap::<ValueId, &'static str>::new();
         for (value, _) in candidates {
-            let unavailable = interference[value.0]
+            let unavailable = analysis.interference[value.0]
                 .iter()
                 .filter_map(|neighbor| regs.get(neighbor).copied())
                 .collect::<HashSet<_>>();
-            let preferred = affinities[value.0].iter().find_map(|neighbor| {
-                regs.get(neighbor)
-                    .copied()
-                    .filter(|reg| !unavailable.contains(reg) && register_allowed(func, value, reg))
-            });
-            if let Some(reg) = preferred.or_else(|| {
-                available
-                    .iter()
-                    .copied()
-                    .find(|reg| !unavailable.contains(reg) && register_allowed(func, value, reg))
-            }) {
+            let allowed = |reg: &'static str| {
+                !unavailable.contains(reg)
+                    && register_allowed(
+                        func,
+                        value,
+                        reg,
+                        &analysis.call_operands,
+                        &analysis.live_across_calls,
+                    )
+            };
+            let preferred = affinities[value.0]
+                .iter()
+                .find_map(|neighbor| regs.get(neighbor).copied().filter(|reg| allowed(*reg)));
+            if let Some(reg) =
+                preferred.or_else(|| available.iter().copied().find(|reg| allowed(*reg)))
+            {
                 regs.insert(value, reg);
             }
         }
@@ -96,7 +99,7 @@ impl Riscv64RegAlloc {
             let leaf = is_leaf(func);
             let mut available = Vec::new();
             if leaf {
-                available.extend(LEAF_CROSS_REGS);
+                available.extend(CALLER_SAVED_REGS);
             }
             available.extend(INT_REGS);
             let scores = ir_value_use_counts(func);
@@ -161,8 +164,18 @@ impl Riscv64RegAlloc {
     }
 }
 
-fn register_allowed(func: &Function, value: ValueId, reg: &'static str) -> bool {
-    !matches!(func.value(value).kind, ValueKind::Param) || !LEAF_CROSS_REGS.contains(&reg)
+fn register_allowed(
+    func: &Function,
+    value: ValueId,
+    reg: &'static str,
+    call_operands: &HashSet<ValueId>,
+    live_across_calls: &HashSet<ValueId>,
+) -> bool {
+    !CALLER_SAVED_REGS.contains(&reg)
+        || (matches!(func.value(value).ty, Type::I1 | Type::I32 | Type::Ptr(_))
+            && !matches!(func.value(value).kind, ValueKind::Param)
+            && !call_operands.contains(&value)
+            && !live_across_calls.contains(&value))
 }
 
 fn is_leaf(func: &Function) -> bool {
@@ -264,15 +277,23 @@ fn value_owner_block(func: &Function, value: ValueId) -> Option<usize> {
     }
 }
 
+struct InterferenceAnalysis {
+    interference: Vec<HashSet<ValueId>>,
+    call_operands: HashSet<ValueId>,
+    live_across_calls: HashSet<ValueId>,
+}
+
 fn interference_graph(
     func: &Function,
     candidates: &HashSet<ValueId>,
-) -> Option<Vec<HashSet<ValueId>>> {
+) -> Option<InterferenceAnalysis> {
     let block_count = func.blocks.len();
     let mut defs = vec![HashSet::new(); block_count];
     let mut uses = vec![HashSet::new(); block_count];
     let mut phi_defs = vec![HashSet::new(); block_count];
     let mut edge_phi_uses = HashMap::<(usize, usize), Vec<ValueId>>::new();
+    let mut call_operands = HashSet::new();
+    let mut call_liveness_work = 0usize;
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for inst in &block.insts {
@@ -292,7 +313,20 @@ fn interference_graph(
                 }
                 continue;
             }
-            for operand in inst_uses(&inst.kind)
+            let operands = inst_uses(&inst.kind);
+            if matches!(inst.kind, InstKind::Call { .. }) {
+                call_liveness_work = call_liveness_work.saturating_add(operands.len());
+                if call_liveness_work > MAX_CALL_LIVENESS_WORK {
+                    return None;
+                }
+                call_operands.extend(
+                    operands
+                        .iter()
+                        .copied()
+                        .filter(|operand| candidates.contains(operand)),
+                );
+            }
+            for operand in operands
                 .into_iter()
                 .filter(|operand| candidates.contains(operand))
             {
@@ -375,6 +409,7 @@ fn interference_graph(
     }
 
     let mut graph = vec![HashSet::new(); func.values.len()];
+    let mut live_across_calls = HashSet::new();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let mut live = live_out[block_idx].clone();
         if let Some(terminator) = &block.terminator {
@@ -385,20 +420,29 @@ fn interference_graph(
             );
         }
         for inst in block.insts.iter().rev() {
-            if let Some(result) = inst.result {
-                if candidates.contains(&result) {
-                    for other in live
-                        .iter()
-                        .copied()
-                        .filter(|value| candidates.contains(value))
-                    {
-                        if other != result {
-                            graph[result.0].insert(other);
-                            graph[other.0].insert(result);
-                        }
-                    }
-                }
+            let result = inst.result;
+            if let Some(result) = result {
                 live.remove(&result);
+            }
+            if matches!(inst.kind, InstKind::Call { .. }) {
+                call_liveness_work = call_liveness_work.saturating_add(live.len());
+                if call_liveness_work > MAX_CALL_LIVENESS_WORK {
+                    return None;
+                }
+                // After removing the call result and before adding its
+                // arguments, this is exactly the set that must survive the
+                // caller-saved clobber on at least one CFG path.
+                live_across_calls.extend(live.iter().copied());
+            }
+            if let Some(result) = result.filter(|result| candidates.contains(result)) {
+                for other in live
+                    .iter()
+                    .copied()
+                    .filter(|value| candidates.contains(value))
+                {
+                    graph[result.0].insert(other);
+                    graph[other.0].insert(result);
+                }
             }
             if !matches!(inst.kind, InstKind::Phi { .. }) {
                 live.extend(
@@ -421,7 +465,11 @@ fn interference_graph(
             graph[rhs.0].insert(lhs);
         }
     }
-    Some(graph)
+    Some(InterferenceAnalysis {
+        interference: graph,
+        call_operands,
+        live_across_calls,
+    })
 }
 
 fn phi_affinities(

@@ -1,6 +1,7 @@
 mod structural;
 
 use super::dominators::{ControlFlowGraph, Dominators};
+use super::loop_analysis::LoopInfo;
 use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
 use crate::ir::{
@@ -8,27 +9,44 @@ use crate::ir::{
     ValueKind,
 };
 use std::collections::HashSet;
-use structural::{forward_empty_jump_block, merge_linear_block, remove_unreachable_blocks};
+use structural::{
+    forward_empty_jump_block, forward_empty_jump_block_except, merge_linear_block,
+    remove_unreachable_blocks,
+};
 
-pub(super) struct SimplifyCfgPass;
+pub(super) struct SimplifyCfgPass {
+    preserve_loop_preheaders: bool,
+}
 
 const MAX_IF_CONVERSIONS: usize = 64;
+const MAX_PREHEADER_ANALYSIS_BLOCKS: usize = 256;
 
 impl SimplifyCfgPass {
     pub(super) fn new() -> Self {
-        Self
+        Self {
+            preserve_loop_preheaders: false,
+        }
+    }
+
+    /// Keeps empty dedicated loop preheaders until shape-sensitive loop
+    /// transforms have consumed them. A later full CFG simplification still
+    /// forwards the remaining empty blocks.
+    pub(super) fn preserving_loop_preheaders() -> Self {
+        Self {
+            preserve_loop_preheaders: true,
+        }
     }
 }
 
 impl ModulePass for SimplifyCfgPass {
     fn run(&mut self, module: &mut Module) {
         for func in &mut module.funcs {
-            simplify_function(func);
+            simplify_function(func, self.preserve_loop_preheaders);
         }
     }
 }
 
-fn simplify_function(func: &mut Function) {
+fn simplify_function(func: &mut Function, preserve_loop_preheaders: bool) {
     let mut changed = false;
     loop {
         let mut round_changed = remove_unreachable_blocks(func);
@@ -37,7 +55,18 @@ fn simplify_function(func: &mut Function) {
         round_changed |= if_convert_conditional_updates(func);
         round_changed |= thread_boolean_phi_branches(func);
         round_changed |= simplify_trivial_phis(func);
-        round_changed |= forward_empty_jump_block(func);
+        if preserve_loop_preheaders && func.blocks.len() <= MAX_PREHEADER_ANALYSIS_BLOCKS {
+            let cfg = ControlFlowGraph::new(func);
+            let dom = Dominators::new(func, &cfg);
+            let protected = LoopInfo::new(&cfg, &dom)
+                .loops()
+                .iter()
+                .filter_map(|natural_loop| natural_loop.dedicated_preheader)
+                .collect();
+            round_changed |= forward_empty_jump_block_except(func, &protected);
+        } else if !preserve_loop_preheaders {
+            round_changed |= forward_empty_jump_block(func);
+        }
         round_changed |= merge_linear_block(func);
         changed |= round_changed;
         if !round_changed {

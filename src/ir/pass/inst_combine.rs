@@ -1,24 +1,45 @@
 use super::util::{const_i32, defining_inst, get_or_add_i32_const};
 use super::ModulePass;
 use crate::ir::{BinaryOp, CmpOp, Function, InstKind, Module, Terminator, ValueId};
+use std::collections::HashMap;
 
 /// Canonicalizes and combines local integer instructions.
 ///
 /// Every rule is based only on an instruction and the definitions of its
 /// operands. In particular, this pass does not inspect source names, block
 /// names, or whole-function control-flow shapes.
-pub(super) struct InstCombinePass;
+pub(super) struct InstCombinePass {
+    divisibility_only: bool,
+}
 
 impl InstCombinePass {
     pub(super) fn new() -> Self {
-        Self
+        Self {
+            divisibility_only: false,
+        }
+    }
+
+    pub(super) fn divisibility_only() -> Self {
+        Self {
+            divisibility_only: true,
+        }
     }
 }
 
 impl ModulePass for InstCombinePass {
     fn run(&mut self, module: &mut Module) {
         for func in &mut module.funcs {
-            combine_function(func);
+            if self.divisibility_only {
+                combine_divisibility_remainders(func);
+                if let Err(errors) = func.verify() {
+                    panic!(
+                        "divisibility combining produced invalid IR in {}: {:?}",
+                        func.name, errors
+                    );
+                }
+            } else {
+                combine_function(func);
+            }
         }
     }
 }
@@ -58,7 +79,31 @@ fn combine_function(func: &mut Function) {
 /// divisibility for positive and negative dividends without changing the
 /// remainder value in contexts where its sign would matter.
 fn combine_divisibility_remainders(func: &mut Function) {
-    let mut candidates = Vec::new();
+    const MAX_VALUES: usize = 16_384;
+    const MAX_INSTRUCTIONS: usize = 65_536;
+    const MAX_OPERAND_WORK: usize = 262_144;
+
+    let instruction_count = func
+        .blocks
+        .iter()
+        .try_fold(0usize, |total, block| total.checked_add(block.insts.len()));
+    if func.values.len() > MAX_VALUES
+        || instruction_count.is_none_or(|count| count > MAX_INSTRUCTIONS)
+    {
+        return;
+    }
+
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        block: usize,
+        inst: usize,
+        dividend: ValueId,
+        mask: i32,
+        found_use: bool,
+        valid: bool,
+    }
+
+    let mut candidates = vec![None; func.values.len()];
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.insts.iter().enumerate() {
             let (
@@ -79,49 +124,76 @@ fn combine_divisibility_remainders(func: &mut Function) {
                 continue;
             }
             let magnitude = divisor.wrapping_abs() as u32;
-            if magnitude.is_power_of_two() && remainder_has_only_zero_tests(func, result) {
-                candidates.push((block_idx, inst_idx, *lhs, magnitude.wrapping_sub(1) as i32));
+            if magnitude.is_power_of_two() {
+                candidates[result.0] = Some(Candidate {
+                    block: block_idx,
+                    inst: inst_idx,
+                    dividend: *lhs,
+                    mask: magnitude.wrapping_sub(1) as i32,
+                    found_use: false,
+                    valid: true,
+                });
             }
         }
     }
 
-    for (block_idx, inst_idx, dividend, mask) in candidates {
-        let mask = get_or_add_i32_const(func, mask);
-        func.blocks[block_idx].insts[inst_idx].kind = InstKind::Binary {
+    let mut operand_work = 0usize;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let operands = inst_operands(&inst.kind);
+            operand_work = operand_work.saturating_add(operands.len());
+            if operand_work > MAX_OPERAND_WORK {
+                return;
+            }
+            for remainder in operands {
+                let Some(candidate) = candidates.get_mut(remainder.0).and_then(Option::as_mut)
+                else {
+                    continue;
+                };
+                candidate.found_use = true;
+                let valid = matches!(
+                    &inst.kind,
+                    InstKind::Icmp { op, lhs, rhs }
+                        if matches!(*op, CmpOp::Eq | CmpOp::Ne)
+                            && ((*lhs == remainder && const_i32(func, *rhs) == Some(0))
+                                || (*rhs == remainder && const_i32(func, *lhs) == Some(0)))
+                );
+                candidate.valid &= valid;
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            let operands = terminator_operands(terminator);
+            operand_work = operand_work.saturating_add(operands.len());
+            if operand_work > MAX_OPERAND_WORK {
+                return;
+            }
+            for remainder in operands {
+                if let Some(candidate) = candidates.get_mut(remainder.0).and_then(Option::as_mut) {
+                    candidate.found_use = true;
+                    candidate.valid = false;
+                }
+            }
+        }
+    }
+
+    let mut mask_values = HashMap::<i32, ValueId>::new();
+    for candidate in candidates.into_iter().flatten() {
+        if !candidate.found_use || !candidate.valid {
+            continue;
+        }
+        let mask = if let Some(mask) = mask_values.get(&candidate.mask).copied() {
+            mask
+        } else {
+            let mask = get_or_add_i32_const(func, candidate.mask);
+            mask_values.insert(candidate.mask, mask);
+            mask
+        };
+        func.blocks[candidate.block].insts[candidate.inst].kind = InstKind::Binary {
             op: BinaryOp::Iand,
-            lhs: dividend,
+            lhs: candidate.dividend,
             rhs: mask,
         };
     }
-}
-
-fn remainder_has_only_zero_tests(func: &Function, remainder: ValueId) -> bool {
-    let mut found_use = false;
-    for block in &func.blocks {
-        for inst in &block.insts {
-            if !inst_operands(&inst.kind).contains(&remainder) {
-                continue;
-            }
-            found_use = true;
-            let InstKind::Icmp { op, lhs, rhs } = &inst.kind else {
-                return false;
-            };
-            if !matches!(*op, CmpOp::Eq | CmpOp::Ne)
-                || !((*lhs == remainder && const_i32(func, *rhs) == Some(0))
-                    || (*rhs == remainder && const_i32(func, *lhs) == Some(0)))
-            {
-                return false;
-            }
-        }
-        if block
-            .terminator
-            .as_ref()
-            .is_some_and(|terminator| terminator_operands(terminator).contains(&remainder))
-        {
-            return false;
-        }
-    }
-    found_use
 }
 
 fn inst_operands(kind: &InstKind) -> Vec<ValueId> {

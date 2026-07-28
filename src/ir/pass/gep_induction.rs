@@ -7,7 +7,15 @@ use super::util::{
 };
 use super::ModulePass;
 use crate::ir::{BlockId, CmpOp, Function, InstKind, Module, Terminator, Type, ValueId, ValueKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+const MAX_FUNCTION_BLOCKS: usize = 1024;
+const MAX_FUNCTION_VALUES: usize = 8192;
+const MAX_FUNCTION_INSTRUCTIONS: usize = 32_768;
+const MAX_CANDIDATES: usize = 128;
+const MAX_NEW_VALUES: usize = 1024;
+const MAX_GEP_CHAIN_DEPTH: usize = 64;
+const MAX_GEP_INDICES: usize = 128;
 
 /// Replaces an affine loop-varying address with a pointer recurrence.
 ///
@@ -47,10 +55,18 @@ struct Candidate {
     latch: BlockId,
     pointer_ty: Type,
     step_index: i32,
+    affine_indices: HashMap<ValueId, i32>,
 }
 
 fn strength_reduce_function(func: &mut Function) {
-    if func.blocks.len() > 1024 || func.values.len() > 8192 {
+    let instruction_count = func
+        .blocks
+        .iter()
+        .try_fold(0usize, |total, block| total.checked_add(block.insts.len()));
+    if func.blocks.len() > MAX_FUNCTION_BLOCKS
+        || func.values.len() > MAX_FUNCTION_VALUES
+        || instruction_count.is_none_or(|count| count > MAX_FUNCTION_INSTRUCTIONS)
+    {
         return;
     }
 
@@ -120,6 +136,9 @@ fn strength_reduce_function(func: &mut Function) {
                         latch,
                         target,
                     ) {
+                        if candidates.len().saturating_add(affine.len()) >= MAX_CANDIDATES {
+                            return;
+                        }
                         affine.push(candidate);
                     }
                 }
@@ -143,6 +162,45 @@ fn strength_reduce_function(func: &mut Function) {
     }
 
     if candidates.is_empty() {
+        return;
+    }
+    let projection =
+        candidates
+            .iter()
+            .try_fold((0usize, 0usize), |(values, instructions), candidate| {
+                let affine_starts = candidate
+                    .affine_indices
+                    .values()
+                    .copied()
+                    .filter(|offset| *offset != 0)
+                    .collect::<HashSet<_>>()
+                    .len();
+                let new_instructions = candidate
+                    .chain
+                    .len()
+                    .checked_add(2)?
+                    .checked_add(affine_starts)?;
+                let new_values = new_instructions
+                    // Conservatively charge one step constant and one constant
+                    // for every rebuilt affine start even when already interned.
+                    .checked_add(1)?
+                    .checked_add(affine_starts)?;
+                Some((
+                    values.checked_add(new_values)?,
+                    instructions.checked_add(new_instructions)?,
+                ))
+            });
+    if projection.is_none_or(|(values, instructions)| {
+        values > MAX_NEW_VALUES
+            || func
+                .values
+                .len()
+                .checked_add(values)
+                .is_none_or(|total| total > MAX_FUNCTION_VALUES)
+            || instruction_count
+                .and_then(|count| count.checked_add(instructions))
+                .is_none_or(|total| total > MAX_FUNCTION_INSTRUCTIONS)
+    }) {
         return;
     }
 
@@ -182,11 +240,20 @@ fn analyze_candidate(
     let mut current = target;
     let mut reverse_chain = Vec::new();
     let mut coefficient = 0i64;
+    let mut affine_indices = HashMap::new();
+    let mut chain_depth = 0usize;
+    let mut index_count = 0usize;
     let root = loop {
         let InstKind::Gep { base, indices } = defining_inst(func, current)? else {
             return None;
         };
-        if indices.is_empty() || !matches!(func.values.get(base.0)?.ty, Type::Ptr(_)) {
+        chain_depth = chain_depth.checked_add(1)?;
+        index_count = index_count.checked_add(indices.len())?;
+        if chain_depth > MAX_GEP_CHAIN_DEPTH
+            || index_count > MAX_GEP_INDICES
+            || indices.is_empty()
+            || !matches!(func.values.get(base.0)?.ty, Type::Ptr(_))
+        {
             return None;
         }
         let result_ty = func.values.get(current.0)?.ty.clone();
@@ -195,8 +262,13 @@ fn analyze_candidate(
             if func.values.get(index.0)?.ty != Type::I32 {
                 return None;
             }
-            if *index == induction.phi {
+            if let Some(offset) =
+                affine_induction_offset(func, *index, induction.phi).filter(|offset| {
+                    derived_index_does_not_wrap(func, natural_loop, induction, *offset)
+                })
+            {
                 coefficient = coefficient.checked_add(stride)?;
+                affine_indices.insert(*index, offset);
             } else if !is_loop_invariant(func, natural_loop, *index)
                 || !value_available_at(func, dom, *index, preheader)
             {
@@ -243,7 +315,88 @@ fn analyze_candidate(
         latch,
         pointer_ty,
         step_index,
+        affine_indices,
     })
+}
+
+fn affine_induction_offset(func: &Function, value: ValueId, induction: ValueId) -> Option<i32> {
+    if value == induction {
+        return Some(0);
+    }
+    match defining_inst(func, value)? {
+        InstKind::Binary {
+            op: crate::ir::BinaryOp::Iadd,
+            lhs,
+            rhs,
+        } if *lhs == induction => const_i32(func, *rhs),
+        InstKind::Binary {
+            op: crate::ir::BinaryOp::Iadd,
+            lhs,
+            rhs,
+        } if *rhs == induction => const_i32(func, *lhs),
+        InstKind::Binary {
+            op: crate::ir::BinaryOp::Isub,
+            lhs,
+            rhs,
+        } if *lhs == induction => const_i32(func, *rhs)?.checked_neg(),
+        _ => None,
+    }
+}
+
+/// Proves that sign-extending `iv + offset` is equivalent to adding the
+/// mathematical offset. Exact finite trip counts use checked endpoints;
+/// otherwise a constant-start addrec must avoid signed overflow over its
+/// complete modulo-2^32 congruence class.
+fn derived_index_does_not_wrap(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    induction: InductionVariable,
+    offset: i32,
+) -> bool {
+    if offset == 0 {
+        return true;
+    }
+    let Some(initial) = const_i32(func, induction.initial).map(i64::from) else {
+        return false;
+    };
+    if let Some(trip_count) = analyze_const_i32_trip_count(func, natural_loop, induction) {
+        let Some(last) = i64::from(induction.step)
+            .checked_mul(i64::from(trip_count))
+            .and_then(|distance| initial.checked_add(distance))
+        else {
+            return false;
+        };
+        let minimum = initial.min(last);
+        let maximum = initial.max(last);
+        return minimum
+            .checked_add(i64::from(offset))
+            .zip(maximum.checked_add(i64::from(offset)))
+            .is_some_and(|(minimum, maximum)| {
+                minimum >= i64::from(i32::MIN) && maximum <= i64::from(i32::MAX)
+            });
+    }
+
+    let modulus = gcd_u64(induction.step.unsigned_abs() as u64, 1u64 << 32) as i64;
+    if modulus == 0 {
+        return false;
+    }
+    let signed_minimum = i64::from(i32::MIN);
+    let signed_maximum = i64::from(i32::MAX);
+    let minimum = signed_minimum + (initial - signed_minimum).rem_euclid(modulus);
+    let maximum = signed_maximum - (signed_maximum - initial).rem_euclid(modulus);
+    minimum
+        .checked_add(i64::from(offset))
+        .zip(maximum.checked_add(i64::from(offset)))
+        .is_some_and(|(minimum, maximum)| minimum >= signed_minimum && maximum <= signed_maximum)
+}
+
+fn gcd_u64(mut lhs: u64, mut rhs: u64) -> u64 {
+    while rhs != 0 {
+        let remainder = lhs % rhs;
+        lhs = rhs;
+        rhs = remainder;
+    }
+    lhs
 }
 
 /// A pointer recurrence is valid only while the sign-extended i32 induction
@@ -316,17 +469,34 @@ fn induction_does_not_wrap(
 }
 
 fn build_pointer_recurrence(func: &mut Function, candidate: &Candidate) -> ValueId {
+    let mut affine_initials = HashMap::<i32, ValueId>::new();
+    affine_initials.insert(0, candidate.induction.initial);
     let mut initial_pointer = candidate.root;
     for node in &candidate.chain {
         let indices = node
             .indices
             .iter()
             .map(|index| {
-                if *index == candidate.induction.phi {
-                    candidate.induction.initial
-                } else {
-                    *index
+                let Some(offset) = candidate.affine_indices.get(index).copied() else {
+                    return *index;
+                };
+                if let Some(initial) = affine_initials.get(&offset).copied() {
+                    return initial;
                 }
+                let offset_value = get_or_add_i32_const(func, offset);
+                let initial = func
+                    .append_inst(
+                        candidate.preheader,
+                        InstKind::Binary {
+                            op: crate::ir::BinaryOp::Iadd,
+                            lhs: candidate.induction.initial,
+                            rhs: offset_value,
+                        },
+                        Some(Type::I32),
+                    )
+                    .expect("an affine recurrence start must produce i32");
+                affine_initials.insert(offset, initial);
+                initial
             })
             .collect();
         initial_pointer = func

@@ -13,6 +13,7 @@ mod invariant_load;
 mod licm;
 mod local_forward;
 mod loop_analysis;
+mod pointer_recurrence_coalesce;
 mod recursive_inline;
 mod reduction_jam;
 mod repeat_reduction;
@@ -35,6 +36,7 @@ use inst_combine::InstCombinePass;
 use invariant_load::InvariantLoadForwardPass;
 use licm::LicmPass;
 use local_forward::LocalForwardPass;
+use pointer_recurrence_coalesce::PointerRecurrenceCoalescePass;
 use recursive_inline::{CfgInlinePass, RecursiveInlinePass};
 use reduction_jam::ReductionJamPass;
 use repeat_reduction::RepeatReductionPass;
@@ -55,6 +57,16 @@ pub struct PassOptions {
 }
 
 pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptions) {
+    run_pipeline_with_reduction_jam_factor(module, opt_level, options, 2);
+}
+
+pub fn run_pipeline_with_reduction_jam_factor(
+    module: &mut Module,
+    opt_level: OptLevel,
+    options: PassOptions,
+    max_reduction_jam_factor: usize,
+) {
+    assert!(matches!(max_reduction_jam_factor, 2 | 4));
     // 所有优化 pass 都在这里排队，方便统一调整执行顺序。
     let mut pipeline = PassPipeline::new();
     match opt_level {
@@ -70,7 +82,7 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(GlobalConstPropPass::new());
             pipeline.add(ConstFoldPass::new());
             pipeline.add(DcePass::new());
-            pipeline.add(SimplifyCfgPass::new());
+            pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
             pipeline.add(TailRecursionPass::new());
             pipeline.add(GlobalScalarLocalizePass::new());
             pipeline.add(ScalarPromotePass::new());
@@ -78,7 +90,7 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(ConstSpecializePass::new());
             pipeline.add(ConstFoldPass::new());
-            pipeline.add(SimplifyCfgPass::new());
+            pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
             pipeline.add(DcePass::new());
             pipeline.add(RecursiveInlinePass::new());
             pipeline.add(InlineSmallExprPass::new());
@@ -87,15 +99,18 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             pipeline.add(CsePass::new());
             pipeline.add(LicmPass::new());
             pipeline.add(InvariantLoadForwardPass::new());
+            pipeline.add(InstCombinePass::divisibility_only());
+            pipeline.add(ConstFoldPass::new());
             pipeline.add(DcePass::new());
-            pipeline.add(ReductionJamPass::new());
+            pipeline.add(ReductionJamPass::new(max_reduction_jam_factor));
             pipeline.add(CsePass::new());
             pipeline.add(LocalForwardPass::new());
+            pipeline.add(CsePass::new());
             pipeline.add(InvariantLoadForwardPass::new());
             pipeline.add(DcePass::new());
             pipeline.add(RepeatReductionPass::new());
             if options.enable_simple_loop_unroll {
-                pipeline.add(SimpleLoopUnrollPass::new());
+                pipeline.add(SimpleLoopUnrollPass::new(max_reduction_jam_factor));
             }
             pipeline.add(InstCombinePass::new());
             pipeline.add(ConstFoldPass::new());
@@ -103,6 +118,12 @@ pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptio
             // intentionally expects the source loop-phi set. In particular,
             // this preserves the existing simple-unroll profitability gate.
             pipeline.add(GepInductionPass::new());
+            pipeline.add(PointerRecurrenceCoalescePass::new());
+            pipeline.add(DcePass::new());
+            pipeline.add(CsePass::new());
+            pipeline.add(LocalForwardPass::new());
+            pipeline.add(CsePass::new());
+            pipeline.add(DcePass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());
         }
