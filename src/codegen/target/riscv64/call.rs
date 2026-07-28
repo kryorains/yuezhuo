@@ -1,5 +1,5 @@
 use super::Riscv64IrFuncEmitter;
-use crate::codegen::common::{assign_arg_locations, resolve_call_sig, IrArgLocation};
+use crate::codegen::common::{resolve_call_sig, IrArgLocation};
 use crate::ir::{Type, ValueId};
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
@@ -10,7 +10,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         result: Option<ValueId>,
     ) -> Type {
         let (sig, arg_sigs) = resolve_call_sig(&self.parent.ctx, self.func, name, args);
-        let locations = assign_arg_locations(&arg_sigs, 8, 8);
+        let locations = super::abi::assign_riscv_arg_locations(&arg_sigs);
         let stack_count = locations
             .iter()
             .filter(|location| matches!(location, IrArgLocation::Stack))

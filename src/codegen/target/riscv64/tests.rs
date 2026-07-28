@@ -1,5 +1,6 @@
 use super::emit_ir_asm;
 use super::regalloc::Riscv64FloatRegAlloc;
+use crate::codegen::common::{IrArgLocation, IrParamSig};
 use crate::ir::{
     BinaryOp, CastOp, Const, Function, InstKind, Module, Terminator, Type, UnaryOp, ValueId,
 };
@@ -33,6 +34,26 @@ fn float_regalloc_api_is_available_to_target_consumers() {
 
     assert_eq!(regs.reg(ValueId(0)), None);
     assert!(regs.used_callee_saved().is_empty());
+}
+
+#[test]
+fn assigns_float_overflow_to_integer_registers_before_the_stack() {
+    let params = (0..17)
+        .map(|_| IrParamSig {
+            ty: Type::F32,
+            is_pointer: false,
+        })
+        .collect::<Vec<_>>();
+
+    let locations = super::abi::assign_riscv_arg_locations(&params);
+
+    for (index, location) in locations.iter().take(8).enumerate() {
+        assert!(matches!(location, IrArgLocation::FloatReg(reg) if *reg == index));
+    }
+    for (index, location) in locations.iter().skip(8).take(8).enumerate() {
+        assert!(matches!(location, IrArgLocation::IntReg(reg) if *reg == index));
+    }
+    assert!(matches!(locations[16], IrArgLocation::Stack));
 }
 
 #[test]
@@ -379,8 +400,10 @@ fn preserves_call_crossing_float_parameter() {
     assert!(caller_asm.contains("fadd.s ft1, fa1, fa0"));
     assert!(caller_asm.contains("fmv.s fa0, ft1"));
     assert!(!caller_asm.contains("lw a0, -24(s0)"));
-    assert!(caller_asm.contains("fsw fs0, -8(s0)"));
-    assert!(caller_asm.contains("flw fs0, -8(s0)"));
+    assert!(caller_asm.contains("fsd fs0, -8(s0)"));
+    assert!(caller_asm.contains("fld fs0, -8(s0)"));
+    assert!(!caller_asm.contains("fsw fs0, -8(s0)"));
+    assert!(!caller_asm.contains("flw fs0, -8(s0)"));
 }
 
 #[test]
@@ -401,7 +424,7 @@ fn stores_assigned_float_parameter_for_direct_return() {
 }
 
 #[test]
-fn stores_assigned_stack_float_parameter_in_frame_slot() {
+fn receives_ninth_float_parameter_from_integer_fallback_register() {
     let mut function = Function::new("return_ninth_float_parameter", Type::F32);
     let mut value = None;
     for index in 0..9 {
@@ -414,10 +437,30 @@ fn stores_assigned_stack_float_parameter_in_frame_slot() {
     let asm = emit_ir_asm(&module);
     let function_asm = function_asm(&asm, "return_ninth_float_parameter");
 
-    assert!(function_asm.contains("flw ft1, 16(s0)"));
+    assert!(function_asm.contains("fmv.w.x ft1, a0"));
     assert!(function_asm.contains("fsw ft1, -72(s0)"));
     assert!(function_asm.contains("fmv.s fa0, ft1"));
+    assert!(!function_asm.contains("flw ft1, 16(s0)"));
     assert!(!function_asm.contains("lw a0, -72(s0)"));
+}
+
+#[test]
+fn receives_seventeenth_float_parameter_from_stack() {
+    let mut function = Function::new("return_seventeenth_float_parameter", Type::F32);
+    let mut value = None;
+    for index in 0..17 {
+        value = Some(function.add_param(format!("value_{index}"), Type::F32));
+    }
+    function.set_terminator(function.entry, Terminator::Return(value));
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let function_asm = function_asm(&asm, "return_seventeenth_float_parameter");
+
+    assert!(function_asm.contains("flw ft1, 16(s0)"));
+    assert!(function_asm.contains("fsw ft1, -136(s0)"));
+    assert!(function_asm.contains("fmv.s fa0, ft1"));
 }
 
 #[test]
@@ -456,7 +499,7 @@ fn keeps_stack_slots_below_float_callee_save_area() {
     let asm = emit_ir_asm(&module);
     let caller_asm = function_asm(&asm, "float_caller_with_stack_slot");
 
-    assert!(caller_asm.contains("fsw fs0, -8(s0)"));
+    assert!(caller_asm.contains("fsd fs0, -8(s0)"));
     assert!(caller_asm.contains("sw a0, -32(s0)"));
 }
 

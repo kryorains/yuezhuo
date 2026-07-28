@@ -1,11 +1,31 @@
 use super::Riscv64IrFuncEmitter;
-use crate::codegen::common::{assign_arg_locations, IrArgLocation};
+use crate::codegen::common::{IrArgLocation, IrParamSig};
 use crate::ir::Type;
+
+pub(super) fn assign_riscv_arg_locations(arg_sigs: &[IrParamSig]) -> Vec<IrArgLocation> {
+    let mut int_idx = 0usize;
+    let mut float_idx = 0usize;
+    let mut locations = Vec::with_capacity(arg_sigs.len());
+    for arg in arg_sigs {
+        if !arg.is_pointer && arg.ty == Type::F32 && float_idx < 8 {
+            locations.push(IrArgLocation::FloatReg(float_idx));
+            float_idx += 1;
+        } else if int_idx < 8 {
+            // The hard-float RISC-V psABI falls back to the integer calling
+            // convention after fa0-fa7 are exhausted.
+            locations.push(IrArgLocation::IntReg(int_idx));
+            int_idx += 1;
+        } else {
+            locations.push(IrArgLocation::Stack);
+        }
+    }
+    locations
+}
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     pub(super) fn emit_params(&mut self) {
         let sig = self.parent.ctx.funcs.get(&self.func.name).cloned().unwrap();
-        let locations = assign_arg_locations(&sig.params, 8, 8);
+        let locations = assign_riscv_arg_locations(&sig.params);
         let mut stack_idx = 0usize;
         for (idx, param) in self.func.params.iter().enumerate() {
             let param_sig = &sig.params[idx];
@@ -14,7 +34,14 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             match locations[idx] {
                 IrArgLocation::IntReg(reg_idx) => {
                     let src = format!("a{}", reg_idx);
-                    if let Some(reg) = assigned_reg {
+                    if param_sig.ty == Type::F32 && !param_sig.is_pointer {
+                        if let Some(reg) = self.float_regalloc.reg(*param) {
+                            self.body.push_str(&format!("  fmv.w.x {}, {}\n", reg, src));
+                            self.store_frame_s(reg, offset);
+                        } else {
+                            self.store_frame_w(&src, offset);
+                        }
+                    } else if let Some(reg) = assigned_reg {
                         self.body.push_str(&format!("  mv {}, {}\n", reg, src));
                     } else if param_sig.is_pointer {
                         self.store_frame_x(&src, offset);

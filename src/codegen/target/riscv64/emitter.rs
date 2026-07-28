@@ -219,7 +219,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             let slot = saved_int_regs.len() + idx + 1;
             self.parent
                 .out
-                .push_str(&format!("  fsw {}, -{}(s0)\n", reg, slot * 8));
+                .push_str(&format!("  fsd {}, -{}(s0)\n", reg, slot * 8));
         }
         self.parent.out.push_str(&setup);
         self.parent.out.push_str(&blocks);
@@ -235,7 +235,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             let slot = saved_int_regs.len() + idx + 1;
             self.parent
                 .out
-                .push_str(&format!("  flw {}, -{}(s0)\n", reg, slot * 8));
+                .push_str(&format!("  fld {}, -{}(s0)\n", reg, slot * 8));
         }
         self.parent.out.push_str("  mv sp, s0\n");
         if !leaf {

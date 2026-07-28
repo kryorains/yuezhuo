@@ -370,8 +370,8 @@ fn preserves_call_crossing_float_parameter() {
     let caller_asm = function_asm(&asm, "float_caller");
 
     assert!(caller_asm.contains("fmv.s fs0, fa0"));
-    assert!(caller_asm.contains("fsw fs0, -8(s0)"));
-    assert!(caller_asm.contains("flw fs0, -8(s0)"));
+    assert!(caller_asm.contains("fsd fs0, -8(s0)"));
+    assert!(caller_asm.contains("fld fs0, -8(s0)"));
 }
 ```
 
@@ -434,7 +434,7 @@ Run:
 cargo test codegen::target::riscv64 --locked
 ```
 
-Expected: PASS, including matching `fsw/flw` save slots.
+Expected: PASS, including matching `fsd/fld` save slots.
 
 - [ ] **Step 7: Commit ABI integration**
 
@@ -554,7 +554,7 @@ Keep comparisons and `F32ToI32/F32ToBool` on the integer result path. For float 
 
 - [ ] **Step 6: Keep float call operands and results type-correct**
 
-In `call.rs`, continue assigning ABI operands to `fa0-fa7`, but let `load_float_value` source them from `ft*`/`fs*`. After a float-returning call, immediately call `store_float_result(result, "fa0")`; never write the result unconditionally to its stack slot.
+In `call.rs`, assign ABI operands to `fa0-fa7`, then fall back to available `a0-a7` before using stack slots, while letting `load_float_value` source them from `ft*`/`fs*`. After a float-returning call, immediately call `store_float_result(result, "fa0")`; never write the result unconditionally to its stack slot.
 
 - [ ] **Step 7: Run focused and full Rust tests**
 
@@ -1067,3 +1067,13 @@ Verification on 2026-07-27:
 - `h-2-03` median: 1165 ms baseline, 905 ms candidate, 22.32% improvement.
 - Three-case geometric mean improvement: 23.38%.
 - Full O1 performance set: no new compile, link, output, or timeout regression. The existing `fft0`, `if-combine2`, and `if-combine3` mismatches have byte-identical actual output and assembly versus the pre-optimization candidate; `03_sort1` still times out with byte-identical assembly.
+
+Rebase and LP64D ABI verification on 2026-07-28:
+
+- Rebased the 16 feature commits onto `main@8d95cc38` with `701084f3` as the old-base boundary; the two base commits have the same source tree because PR #30 was squash-merged.
+- Test data: `pref/test-set@b39932239c50915e70b8e2037b673df0e31fb49c`.
+- `cargo test --locked`: 52/52; strict Clippy and formatting checks pass with Rust 1.96.0.
+- RISC-V64 O0 and O1 functional output: 143/143.
+- LP64D interoperability: a generated callee preserves all 64 bits of an incoming `fs0`; GCC and generated callers/callees agree on the ninth `F32` in `a0` and the seventeenth `F32` on the stack.
+- Five paired O1 samples against `main`: `h-2-01` median 410→301 ms (26.59%), `h-2-02` 403→295 ms (26.80%), and `h-2-03` 580→433 ms (25.34%). The three-case geometric-mean reduction is 26.25%.
+- Adjacent full O1 runs: 55 common passing cases total 31.014→30.505 seconds (1.64% reduction), with assembly lines reduced by 4.84%. The four non-passing cases are the existing malformed-data cases `03_sort1`, `fft0`, `if-combine2`, and `if-combine3`; there are no status transitions.
