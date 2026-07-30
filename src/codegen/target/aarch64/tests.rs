@@ -58,15 +58,16 @@ fn keeps_straight_line_float_intermediates_in_registers() {
     let asm = emit_ir_asm(&module);
     let body = block_asm(function_asm(&asm, "float_expr"), "float_expr", 0);
 
-    assert!(body.contains(&format!("fmadd {sum_reg},")));
-    assert!(!body.contains(&format!("fmul {product_reg},")));
+    assert!(body.contains(&format!("fmul {product_reg},")));
+    assert!(body.contains(&format!("fadd {sum_reg},")));
+    assert!(!body.contains("fmadd"));
     assert!(!body.contains(&format!("fmov {product_reg}, s0")));
     assert!(!body.contains(&format!("fmov {sum_reg}, s0")));
     assert!(!function_asm(&asm, "float_expr").contains("stp x29, x30"));
 }
 
 #[test]
-fn contracts_float_subtract_of_product() {
+fn preserves_float_subtract_rounding() {
     let mut function = Function::new("float_sub_product", Type::F32);
     let lhs = function.add_param("lhs", Type::F32);
     let rhs = function.add_param("rhs", Type::F32);
@@ -100,8 +101,10 @@ fn contracts_float_subtract_of_product() {
     let asm = emit_ir_asm(&module);
     let body = function_asm(&asm, "float_sub_product");
 
-    assert!(body.contains("fmsub"));
-    assert!(!body.contains("fmul"));
+    assert!(body.contains("fmul"));
+    assert!(body.contains("fsub"));
+    assert!(!body.contains("fmsub"));
+    assert!(!body.contains("fnmsub"));
 }
 
 #[test]

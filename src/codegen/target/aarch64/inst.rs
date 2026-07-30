@@ -1,6 +1,7 @@
 use super::imm::mov_w_imm;
 use super::AArch64IrFuncEmitter;
 use crate::codegen::common::signed_magic_positive;
+use crate::codegen::Target;
 use crate::ir::{
     BinaryOp, BlockId, CastOp, CmpOp, Const, Inst, InstKind, Terminator, Type, UnaryOp, ValueId,
     ValueKind,
@@ -57,7 +58,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     return;
                 }
                 if (*op == BinaryOp::Imul && self.fused_madd_user(result).is_some())
-                    || (*op == BinaryOp::Fmul
+                    || (Target::AArch64.cost_model().contract_float_madd()
+                        && *op == BinaryOp::Fmul
                         && (self.fused_float_madd_user(result).is_some()
                             || self.fused_float_msub_user(result).is_some()))
                     || (*op == BinaryOp::Iand && self.fused_bit_test_branch_user(result))
@@ -88,7 +90,7 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                         return;
                     }
                 }
-                if *op == BinaryOp::Fadd {
+                if Target::AArch64.cost_model().contract_float_madd() && *op == BinaryOp::Fadd {
                     if let Some((mul_lhs, mul_rhs, addend)) =
                         self.fused_float_madd_operands(result, *lhs, *rhs)
                     {
@@ -106,7 +108,7 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                         return;
                     }
                 }
-                if *op == BinaryOp::Fsub {
+                if Target::AArch64.cost_model().contract_float_madd() && *op == BinaryOp::Fsub {
                     if let Some((instruction, mul_lhs, mul_rhs, addend)) =
                         self.fused_float_msub_operands(result, *lhs, *rhs)
                     {
