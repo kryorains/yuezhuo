@@ -2,23 +2,40 @@ use super::ModulePass;
 use crate::ir::{Function, Inst, InstKind, Module, Terminator, ValueId, ValueKind};
 use std::collections::HashSet;
 
-pub(super) struct DcePass;
+pub(super) struct DcePass {
+    remove_write_only_allocas: bool,
+}
 
 impl DcePass {
     pub(super) fn new() -> Self {
-        Self
+        Self {
+            remove_write_only_allocas: true,
+        }
+    }
+
+    pub(super) fn preserving_write_only_allocas() -> Self {
+        Self {
+            remove_write_only_allocas: false,
+        }
     }
 }
 
 impl ModulePass for DcePass {
     fn run(&mut self, module: &mut Module) {
         for func in &mut module.funcs {
-            eliminate_dead_code(func);
+            eliminate_dead_code_with_alloca_cleanup(func, self.remove_write_only_allocas);
         }
     }
 }
 
 fn eliminate_dead_code(func: &mut Function) {
+    eliminate_dead_code_with_alloca_cleanup(func, true);
+}
+
+fn eliminate_dead_code_with_alloca_cleanup(func: &mut Function, cleanup_write_only_allocas: bool) {
+    if cleanup_write_only_allocas {
+        remove_write_only_allocas(func);
+    }
     let live = collect_live_values(func);
     for block in &mut func.blocks {
         for inst in &mut block.insts {
@@ -34,6 +51,56 @@ fn eliminate_dead_code(func: &mut Function) {
             inst.kind = InstKind::Nop;
         }
     }
+}
+
+/// Removes writes to local stack objects whose address never escapes and whose
+/// value is never read. A store through such an alloca has no observable
+/// effect, so treating it as an unconditional DCE root needlessly keeps both
+/// the store and the stack object alive.
+fn remove_write_only_allocas(func: &mut Function) {
+    let write_only = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter_map(|inst| match inst {
+            Inst {
+                result: Some(slot),
+                kind: InstKind::Alloca { .. },
+            } if alloca_is_write_only(func, *slot) => Some(*slot),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    if write_only.is_empty() {
+        return;
+    }
+
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            if matches!(inst.kind, InstKind::Store { ptr, .. } if write_only.contains(&ptr)) {
+                inst.result = None;
+                inst.kind = InstKind::Nop;
+            }
+        }
+    }
+}
+
+fn alloca_is_write_only(func: &Function, slot: ValueId) -> bool {
+    func.blocks.iter().all(|block| {
+        block.insts.iter().all(|inst| match &inst.kind {
+            InstKind::Store { ptr, value } if *ptr == slot => *value != slot,
+            _ => {
+                let mut operands = HashSet::new();
+                collect_inst_operands(inst, &mut operands);
+                !operands.contains(&slot)
+            }
+        }) && {
+            let mut operands = HashSet::new();
+            if let Some(terminator) = &block.terminator {
+                collect_terminator_operands(terminator, &mut operands);
+            }
+            !operands.contains(&slot)
+        }
+    })
 }
 
 /// Marks values reachable from observable side effects and terminators.
@@ -210,6 +277,69 @@ mod tests {
                 InstKind::Nop
             ));
         }
+        assert!(func.verify().is_ok());
+    }
+
+    #[test]
+    fn removes_a_non_escaping_write_only_alloca_and_its_stores() {
+        let mut func = Function::new("write_only", Type::I32);
+        let slot = func
+            .append_inst(
+                func.entry,
+                InstKind::Alloca { ty: Type::I32 },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        let one = func.add_const(Const::Int(1));
+        func.append_inst(
+            func.entry,
+            InstKind::Store {
+                ptr: slot,
+                value: one,
+            },
+            None,
+        );
+        func.set_terminator(func.entry, Terminator::Return(Some(one)));
+
+        eliminate_dead_code(&mut func);
+
+        assert!(func.blocks[0]
+            .insts
+            .iter()
+            .all(|inst| matches!(inst.kind, InstKind::Nop)));
+        assert!(func.verify().is_ok());
+    }
+
+    #[test]
+    fn keeps_an_alloca_that_is_read() {
+        let mut func = Function::new("read_local", Type::I32);
+        let slot = func
+            .append_inst(
+                func.entry,
+                InstKind::Alloca { ty: Type::I32 },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        let one = func.add_const(Const::Int(1));
+        func.append_inst(
+            func.entry,
+            InstKind::Store {
+                ptr: slot,
+                value: one,
+            },
+            None,
+        );
+        let loaded = func
+            .append_inst(func.entry, InstKind::Load { ptr: slot }, Some(Type::I32))
+            .unwrap();
+        func.set_terminator(func.entry, Terminator::Return(Some(loaded)));
+
+        eliminate_dead_code(&mut func);
+
+        assert!(func.blocks[0]
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::Store { ptr, .. } if ptr == slot)));
         assert!(func.verify().is_ok());
     }
 }

@@ -277,13 +277,13 @@ fn value_owner_block(func: &Function, value: ValueId) -> Option<usize> {
     }
 }
 
-pub(super) struct InterferenceAnalysis {
-    pub(super) interference: Vec<HashSet<ValueId>>,
-    pub(super) call_operands: HashSet<ValueId>,
-    pub(super) live_across_calls: HashSet<ValueId>,
+pub(in crate::codegen::target) struct InterferenceAnalysis {
+    pub(in crate::codegen::target) interference: Vec<HashSet<ValueId>>,
+    pub(in crate::codegen::target) call_operands: HashSet<ValueId>,
+    pub(in crate::codegen::target) live_across_calls: HashSet<ValueId>,
 }
 
-pub(super) fn interference_graph(
+pub(in crate::codegen::target) fn interference_graph(
     func: &Function,
     candidates: &HashSet<ValueId>,
 ) -> Option<InterferenceAnalysis> {
@@ -472,7 +472,7 @@ pub(super) fn interference_graph(
     })
 }
 
-pub(super) fn phi_affinities(
+pub(in crate::codegen::target) fn phi_affinities(
     func: &Function,
     candidates: &HashSet<ValueId>,
     interference: &[HashSet<ValueId>],
@@ -558,7 +558,7 @@ fn call_crossing_candidates(
     candidates.into_iter().map(|(value, _, _)| value).collect()
 }
 
-pub(super) fn weighted_use_scores(func: &Function) -> Vec<usize> {
+pub(in crate::codegen::target) fn weighted_use_scores(func: &Function) -> Vec<usize> {
     let loop_depths = natural_loop_depths(func);
     let weight_for = |block_idx: usize| 1usize << loop_depths[block_idx].saturating_mul(4).min(20);
     let mut scores = vec![0usize; func.values.len()];

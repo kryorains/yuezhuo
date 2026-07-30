@@ -28,7 +28,25 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         self.assigned_x_reg(value).map(w_reg)
     }
 
+    pub(super) fn assigned_float_reg(&self, value: ValueId) -> Option<&'static str> {
+        self.float_regs.reg(value)
+    }
+
     pub(super) fn emit_assigned_load(&mut self, result: ValueId, ptr: ValueId) -> bool {
+        if self.func.value(result).ty == Type::F32 {
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            let pointer = if let Some(pointer) = self.assigned_x_reg(ptr) {
+                pointer
+            } else {
+                self.load_value_into(ptr, "x1");
+                "x1"
+            };
+            self.body
+                .push_str(&format!("  ldr {}, [{}]\n", destination, pointer));
+            return true;
+        }
         let (Some(destination), Some(pointer)) =
             (self.assigned_x_reg(result), self.assigned_x_reg(ptr))
         else {
@@ -46,6 +64,20 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn emit_assigned_store(&mut self, ptr: ValueId, value: ValueId) -> bool {
+        if self.func.value(value).ty == Type::F32 {
+            let Some(source) = self.assigned_float_reg(value) else {
+                return false;
+            };
+            let pointer = if let Some(pointer) = self.assigned_x_reg(ptr) {
+                pointer
+            } else {
+                self.load_value_into(ptr, "x1");
+                "x1"
+            };
+            self.body
+                .push_str(&format!("  str {}, [{}]\n", source, pointer));
+            return true;
+        }
         let (Some(pointer), Some(source)) = (self.assigned_x_reg(ptr), self.assigned_x_reg(value))
         else {
             return false;
@@ -212,6 +244,11 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             w_reg(x_reg)
         };
 
+        if let Some(float_reg) = self.assigned_float_reg(value) {
+            self.body
+                .push_str(&format!("  fmov {}, {}\n", value_reg, float_reg));
+            return;
+        }
         if let Some(phi_reg) = self.phi_regs.reg(value) {
             let phi_reg = if is_pointer {
                 phi_reg.to_string()
@@ -251,6 +288,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_float_value(&mut self, value: ValueId, reg: &str) {
+        if let Some(source) = self.assigned_float_reg(value) {
+            if source != reg {
+                self.body.push_str(&format!("  fmov {}, {}\n", reg, source));
+            }
+            return;
+        }
         match &self.func.value(value).kind {
             ValueKind::Const(Const::Float(bits)) => {
                 let label = self.parent.ctx.fresh_label("float");
@@ -267,6 +310,17 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 self.load_value(value);
                 self.body.push_str(&format!("  fmov {}, w0\n", reg));
             }
+        }
+    }
+
+    pub(super) fn store_float_result(&mut self, value: ValueId, source: &str) {
+        if let Some(destination) = self.assigned_float_reg(value) {
+            if destination != source {
+                self.body
+                    .push_str(&format!("  fmov {}, {}\n", destination, source));
+            }
+        } else {
+            self.store_frame_s(source, self.layout.offset(value));
         }
     }
 
@@ -298,6 +352,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn store_result(&mut self, value: ValueId) {
+        if let Some(reg) = self.assigned_float_reg(value) {
+            self.body.push_str(&format!("  fmov {}, w0\n", reg));
+            return;
+        }
         if let Some(reg) = self.phi_regs.reg(value) {
             match self.func.value(value).ty {
                 Type::Ptr(_) => self.body.push_str(&format!("  mov {}, x0\n", reg)),

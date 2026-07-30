@@ -3,7 +3,12 @@ use crate::codegen::common::{assign_arg_locations, resolve_call_sig, IrArgLocati
 use crate::ir::{Type, ValueId};
 
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
-    pub(super) fn emit_call(&mut self, name: &str, args: &[ValueId]) -> Type {
+    pub(super) fn emit_call(
+        &mut self,
+        name: &str,
+        args: &[ValueId],
+        result: Option<ValueId>,
+    ) -> Type {
         let (sig, arg_sigs) = resolve_call_sig(&self.parent.ctx, self.func, name, args);
         let locations = assign_arg_locations(&arg_sigs, 8, 8);
         let stack_count = locations
@@ -30,6 +35,11 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 }
             }
             self.body.push_str(&format!("  bl {}\n", name));
+            if sig.ret == Type::F32 {
+                if let Some(result) = result {
+                    self.store_float_result(result, "s0");
+                }
+            }
             return sig.ret;
         }
 
@@ -74,6 +84,11 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         }
 
         self.body.push_str(&format!("  bl {}\n", name));
+        if sig.ret == Type::F32 {
+            if let Some(result) = result {
+                self.store_float_result(result, "s0");
+            }
+        }
         let cleanup = saved_bytes + stack_bytes + pad;
         if cleanup != 0 {
             self.adjust_sp(cleanup);

@@ -4,7 +4,7 @@ mod early_return;
 mod emitter;
 mod inst;
 mod memory;
-mod regalloc;
+pub(in crate::codegen::target) mod regalloc;
 
 use crate::codegen::common::{IrFuncLayout, IrLocalRegs};
 use crate::ir::{Function, Module, ValueId};
