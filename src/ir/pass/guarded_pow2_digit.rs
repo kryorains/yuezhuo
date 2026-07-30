@@ -1,4 +1,4 @@
-use super::util::{const_i32, defining_inst};
+use super::util::{const_i32, defining_inst, rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
 use crate::ir::{BinaryOp, BlockId, CmpOp, Function, InstKind, Module, Terminator, Type, ValueId};
 use std::collections::{HashSet, VecDeque};
@@ -20,6 +20,69 @@ impl ModulePass for GuardedPow2DigitPass {
                 func.mark_guarded_pow2_digit(shift);
             }
         }
+        let guarded = module
+            .funcs
+            .iter()
+            .filter_map(|func| {
+                func.guarded_pow2_digit_shift()
+                    .map(|shift| (func.name.clone(), shift))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for func in &mut module.funcs {
+            fold_universally_zero_calls(func, &guarded);
+        }
+    }
+}
+
+fn fold_universally_zero_calls(
+    func: &mut Function,
+    guarded: &std::collections::HashMap<String, u32>,
+) {
+    let mut sites = Vec::new();
+    for (block_index, block) in func.blocks.iter().enumerate() {
+        for (inst_index, inst) in block.insts.iter().enumerate() {
+            let (Some(result), InstKind::Call { name, args }) = (inst.result, &inst.kind) else {
+                continue;
+            };
+            let Some(shift) = guarded.get(name).copied() else {
+                continue;
+            };
+            let [_, position] = args.as_slice() else {
+                continue;
+            };
+            let Some(position) = const_i32(func, *position) else {
+                continue;
+            };
+            if position >= 0 && (position as u32) >= 32u32.div_ceil(shift) {
+                sites.push((BlockId(block_index), inst_index, result));
+            }
+        }
+    }
+    if sites.is_empty() {
+        return;
+    }
+    let zero = func
+        .values
+        .iter()
+        .enumerate()
+        .find_map(|(index, value)| {
+            matches!(
+                value.kind,
+                crate::ir::ValueKind::Const(crate::ir::Const::Int(0))
+                    | crate::ir::ValueKind::Const(crate::ir::Const::Zero(Type::I32))
+            )
+            .then_some(ValueId(index))
+        })
+        .unwrap_or_else(|| func.add_const(crate::ir::Const::Int(0)));
+    let replacements = sites
+        .iter()
+        .map(|(_, _, result)| (*result, zero))
+        .collect::<ValueReplacements>();
+    rewrite_function_uses(func, &replacements);
+    for (block, inst_index, _) in sites {
+        let inst = &mut func.blocks[block.0].insts[inst_index];
+        inst.result = None;
+        inst.kind = InstKind::Nop;
     }
 }
 
@@ -175,7 +238,7 @@ fn reachable_blocks(func: &Function) -> Vec<BlockId> {
 #[cfg(test)]
 mod tests {
     use super::super::{run_pipeline, OptLevel, PassOptions};
-    use crate::ir::{lower::lower_program, InstKind};
+    use crate::ir::{lower::lower_program, Const, InstKind, Terminator, ValueKind};
     use crate::parser::Parser;
 
     fn optimized(source: &str) -> crate::ir::Module {
@@ -186,12 +249,19 @@ mod tests {
             OptLevel::O1,
             PassOptions {
                 enable_simple_loop_unroll: false,
+                small_expr_inline_rounds: 1,
                 cfg_inline_rounds: 1,
                 cfg_inline_global_loads: false,
+                enable_constant_address_count_reduction: false,
+                enable_recursive_const_specialization: false,
                 enable_loop_call_memoize: false,
+                enable_loop_invariant_call_memoize: false,
                 enable_repeated_overwrite_elision: false,
                 enable_guarded_mulmod_idiom: false,
                 enable_guarded_pow2_digit_idiom: true,
+                enable_regional_global_scalar_promotion: false,
+                enable_producer_consumer_fusion: false,
+                enable_periodic_reduction_memoize: false,
                 enable_write_only_alloca_cleanup_before_inline: true,
             },
         );
@@ -254,5 +324,42 @@ mod tests {
             .find(|func| func.name == "digit")
             .unwrap();
         assert_eq!(func.guarded_pow2_digit_shift(), None);
+    }
+
+    #[test]
+    fn folds_a_position_beyond_the_complete_i32_width_to_zero() {
+        let module = optimized(
+            r#"
+            const int base = 16;
+            int digit(int num, int pos) {
+                int i = 0;
+                while (i < pos) {
+                    num = num / base;
+                    i = i + 1;
+                }
+                return num % base;
+            }
+            int main() { return digit(-123, 8); }
+            "#,
+        );
+        let main = module
+            .funcs
+            .iter()
+            .find(|func| func.name == "main")
+            .unwrap();
+        assert!(main
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .all(|inst| !matches!(inst.kind, InstKind::Call { .. })));
+        let Terminator::Return(Some(result)) =
+            main.blocks[main.entry.0].terminator.as_ref().unwrap()
+        else {
+            panic!("main must directly return the folded digit");
+        };
+        assert!(matches!(
+            main.value(*result).kind,
+            ValueKind::Const(Const::Int(0) | Const::Zero(crate::ir::Type::I32))
+        ));
     }
 }

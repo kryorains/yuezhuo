@@ -76,7 +76,18 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         });
         self.emit_params();
         if let Some((plan, _)) = &early_return {
-            self.emit_phi_copies(self.func.entry.0, plan.slow_block.0);
+            for inst in &self.func.blocks[self.func.entry.0].insts {
+                self.emit_inst(inst);
+            }
+            if let Some(chain) = plan.chained {
+                for inst in &self.func.blocks[chain.guard_block.0].insts {
+                    self.emit_inst(inst);
+                }
+            }
+            let slow_predecessor = plan
+                .chained
+                .map_or(self.func.entry, |chain| chain.guard_block);
+            self.emit_phi_copies(slow_predecessor.0, plan.slow_block.0);
             self.body
                 .push_str(&format!("  b {}\n", self.block_label(plan.slow_block.0)));
         }
@@ -85,7 +96,11 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             .into_iter()
             .filter(|block_idx| {
                 !early_return.as_ref().is_some_and(|(plan, _)| {
-                    *block_idx == self.func.entry.0 || *block_idx == plan.fast_block.0
+                    *block_idx == self.func.entry.0
+                        || plan
+                            .chained
+                            .is_some_and(|chain| *block_idx == chain.guard_block.0)
+                        || (plan.fast_block_exclusive && *block_idx == plan.fast_block.0)
                 })
             })
             .collect::<Vec<_>>();

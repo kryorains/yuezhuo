@@ -1,22 +1,25 @@
+use super::const_fold::ConstFoldPass;
 use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
 use crate::ir::{Const, Function, FunctionId, InstKind, Module, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
 const MAX_FUNCTION_BLOCKS: usize = 32;
-const MAX_FUNCTION_INSTS: usize = 96;
-const MAX_FUNCTION_INST_SLOTS: usize = 512;
-const MAX_VARIANTS_PER_FUNCTION: usize = 4;
+const MAX_FUNCTION_INSTS: usize = 256;
+const MAX_FUNCTION_INST_SLOTS: usize = 1024;
+const MAX_VARIANTS_PER_FUNCTION: usize = 9;
 const MAX_ADDED_FUNCTIONS: usize = 32;
 const MAX_ADDED_BLOCKS: usize = 256;
 const MAX_ADDED_INST_SLOTS: usize = 4096;
-const MAX_SPECIALIZATION_ROUNDS: usize = 3;
+const MAX_SPECIALIZATION_ROUNDS: usize = 9;
 
-pub(super) struct ConstSpecializePass;
+pub(super) struct ConstSpecializePass {
+    allow_recursive: bool,
+}
 
 impl ConstSpecializePass {
-    pub(super) fn new() -> Self {
-        Self
+    pub(super) fn new(allow_recursive: bool) -> Self {
+        Self { allow_recursive }
     }
 }
 
@@ -34,7 +37,10 @@ impl ModulePass for ConstSpecializePass {
                 .iter()
                 .map(parameter_use_counts)
                 .collect::<Vec<_>>();
-            let eligible = snapshots.iter().map(specializable).collect::<Vec<_>>();
+            let eligible = snapshots
+                .iter()
+                .map(|func| specializable(func, self.allow_recursive))
+                .collect::<Vec<_>>();
             let mut variants = Vec::<Variant>::new();
             let mut sites = Vec::<Site>::new();
 
@@ -150,6 +156,11 @@ impl ModulePass for ConstSpecializePass {
             if !rewrote {
                 break;
             }
+            // Expose constants in recursive call arguments before taking the
+            // next snapshot. Cloned variants keep self-calls directed at the
+            // original function, so each round specializes exactly one
+            // additional constant recursion state without recursive cloning.
+            ConstFoldPass::new().run(module);
         }
     }
 }
@@ -167,17 +178,17 @@ struct Site {
     variant_idx: usize,
 }
 
-fn specializable(func: &Function) -> bool {
+fn specializable(func: &Function, allow_recursive: bool) -> bool {
     !func.blocks.is_empty()
         && func.blocks.len() <= MAX_FUNCTION_BLOCKS
         && active_inst_count(func) <= MAX_FUNCTION_INSTS
         && inst_slot_count(func) <= MAX_FUNCTION_INST_SLOTS
-        && !func.blocks.iter().any(|block| {
-            block
-                .insts
-                .iter()
-                .any(|inst| matches!(&inst.kind, InstKind::Call { name, .. } if name == &func.name))
-        })
+        && (allow_recursive
+            || !func.blocks.iter().any(|block| {
+                block.insts.iter().any(
+                    |inst| matches!(&inst.kind, InstKind::Call { name, .. } if name == &func.name),
+                )
+            }))
         && func.verify().is_ok()
 }
 
@@ -283,5 +294,97 @@ fn fresh_variant_name(module: &Module, callee: FunctionId, variant: usize) -> St
             return candidate;
         }
         suffix += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{BinaryOp, Function, InstKind, Module, Terminator, Type};
+
+    #[test]
+    fn recursively_specializes_a_constant_state_chain_only_when_enabled() {
+        let mut enabled = recursive_module();
+        ConstSpecializePass::new(true).run(&mut enabled);
+
+        let variants = enabled
+            .funcs
+            .iter()
+            .filter(|func| func.name.starts_with("countdown.specialized."))
+            .collect::<Vec<_>>();
+        assert_eq!(variants.len(), MAX_VARIANTS_PER_FUNCTION);
+        assert!(variants[0].blocks.iter().any(|block| {
+            block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.kind,
+                    InstKind::Call { name, .. }
+                        if name.starts_with("countdown.specialized.") && name != &variants[0].name
+                )
+            })
+        }));
+        assert!(enabled.funcs.iter().all(|func| func.verify().is_ok()));
+
+        let mut disabled = recursive_module();
+        ConstSpecializePass::new(false).run(&mut disabled);
+        assert!(disabled
+            .funcs
+            .iter()
+            .all(|func| !func.name.starts_with("countdown.specialized.")));
+    }
+
+    fn recursive_module() -> Module {
+        let mut countdown = Function::new("countdown", Type::I32);
+        let depth = countdown.add_param("depth", Type::I32);
+        let one = countdown.add_const(Const::Int(1));
+        let next = countdown
+            .append_inst(
+                countdown.entry,
+                InstKind::Binary {
+                    op: BinaryOp::Isub,
+                    lhs: depth,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        countdown.append_inst(
+            countdown.entry,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: depth,
+                rhs: one,
+            },
+            Some(Type::I32),
+        );
+        let recursive = countdown
+            .append_inst(
+                countdown.entry,
+                InstKind::Call {
+                    name: "countdown".to_string(),
+                    args: vec![next],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        countdown.set_terminator(countdown.entry, Terminator::Return(Some(recursive)));
+
+        let mut main = Function::new("main", Type::I32);
+        let three = main.add_const(Const::Int(3));
+        let result = main
+            .append_inst(
+                main.entry,
+                InstKind::Call {
+                    name: "countdown".to_string(),
+                    args: vec![three],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        main.set_terminator(main.entry, Terminator::Return(Some(result)));
+
+        let mut module = Module::new();
+        module.add_func(countdown);
+        module.add_func(main);
+        module
     }
 }

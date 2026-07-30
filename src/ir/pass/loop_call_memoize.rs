@@ -1,4 +1,5 @@
 use super::dominators::{ControlFlowGraph, Dominators};
+use super::function_effects::FunctionEffects;
 use super::loop_analysis::{analyze_i32_induction, LoopInfo, NaturalLoop};
 use super::util::{const_i32, defining_inst, rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
@@ -18,11 +19,24 @@ const MAX_POINTER_DEPTH: usize = 64;
 /// object it reads is initialized by a persistent inner induction exactly
 /// once. This covers source loops whose initialization counter is deliberately
 /// not reset by the outer loop.
-pub(super) struct LoopCallMemoizePass;
+pub(super) struct LoopCallMemoizePass {
+    persistent_initialization: bool,
+    invariant_calls: bool,
+}
 
 impl LoopCallMemoizePass {
     pub(super) fn new() -> Self {
-        Self
+        Self {
+            persistent_initialization: true,
+            invariant_calls: false,
+        }
+    }
+
+    pub(super) fn new_invariant_calls() -> Self {
+        Self {
+            persistent_initialization: false,
+            invariant_calls: true,
+        }
     }
 }
 
@@ -32,6 +46,7 @@ impl ModulePass for LoopCallMemoizePass {
             return;
         }
         let snapshots = module.funcs.clone();
+        let effects = FunctionEffects::analyze(module);
         let targets = unique_targets(&snapshots);
         let readonly = snapshots
             .iter()
@@ -39,9 +54,15 @@ impl ModulePass for LoopCallMemoizePass {
             .collect::<Vec<_>>();
 
         for func_idx in 0..module.funcs.len() {
-            let Some(candidate) =
-                find_candidate(&snapshots[func_idx], &snapshots, &targets, &readonly)
-            else {
+            let candidate = self
+                .persistent_initialization
+                .then(|| find_candidate(&snapshots[func_idx], &snapshots, &targets, &readonly))
+                .flatten()
+                .or_else(|| {
+                    self.invariant_calls
+                        .then(|| find_invariant_call_candidate(&snapshots[func_idx], &effects))?
+                });
+            let Some(candidate) = candidate else {
                 continue;
             };
             apply_candidate(&mut module.funcs[func_idx], candidate);
@@ -53,6 +74,122 @@ impl ModulePass for LoopCallMemoizePass {
             }
         }
     }
+}
+
+fn find_invariant_call_candidate(func: &Function, effects: &FunctionEffects) -> Option<Candidate> {
+    if func.blocks.is_empty() || func.blocks.len() > MAX_BLOCKS || func.values.len() > MAX_VALUES {
+        return None;
+    }
+    let cfg = ControlFlowGraph::new(func);
+    let dom = Dominators::new(func, &cfg);
+    let loop_info = LoopInfo::new(&cfg, &dom);
+    for natural_loop in loop_info.loops() {
+        let (Some(outer_entering), Some(outer_latch)) = (
+            natural_loop.unique_entering_pred,
+            natural_loop.unique_latch(),
+        ) else {
+            continue;
+        };
+        let Some((outer_counter, outer_initial)) = canonical_outer_counter(func, natural_loop)
+        else {
+            continue;
+        };
+        for (call_idx, inst) in func.blocks[outer_latch.0].insts.iter().enumerate() {
+            let (Some(call_result), InstKind::Call { name, args }) = (inst.result, &inst.kind)
+            else {
+                continue;
+            };
+            if !matches!(func.value(call_result).ty, Type::I1 | Type::I32 | Type::F32)
+                || effects
+                    .resolve_no_memory_call(func, name, call_result, args)
+                    .is_none()
+                || args
+                    .iter()
+                    .any(|arg| !value_is_loop_invariant(func, natural_loop, *arg, effects))
+            {
+                continue;
+            }
+            return Some(Candidate {
+                outer_header: natural_loop.header,
+                outer_entering,
+                outer_latch,
+                outer_counter,
+                outer_initial,
+                call_idx,
+                call_result,
+            });
+        }
+    }
+    None
+}
+
+fn value_is_loop_invariant(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    value: ValueId,
+    effects: &FunctionEffects,
+) -> bool {
+    let Some(value_data) = func.values.get(value.0) else {
+        return false;
+    };
+    let ValueKind::Inst(block, inst_idx) = value_data.kind else {
+        return true;
+    };
+    if !natural_loop.blocks.contains(&block) {
+        return true;
+    }
+    let Some(InstKind::Load { ptr }) = func
+        .blocks
+        .get(block.0)
+        .and_then(|block| block.insts.get(inst_idx))
+        .map(|inst| &inst.kind)
+    else {
+        return false;
+    };
+    let Some(global) = direct_global_name(func, *ptr) else {
+        return false;
+    };
+    natural_loop.blocks.iter().all(|block| {
+        func.blocks[block.0]
+            .insts
+            .iter()
+            .all(|inst| match &inst.kind {
+                InstKind::Store { ptr, .. } | InstKind::MemZero { ptr, .. } => {
+                    pointer_root_global(func, *ptr).is_some_and(|root| root != global)
+                }
+                InstKind::Call { name, args } => inst.result.is_some_and(|result| {
+                    effects
+                        .resolve_no_memory_call(func, name, result, args)
+                        .is_some()
+                }),
+                _ => true,
+            })
+    })
+}
+
+fn direct_global_name(func: &Function, value: ValueId) -> Option<&str> {
+    match &func.values.get(value.0)?.kind {
+        ValueKind::Global(name) => Some(name),
+        _ => None,
+    }
+}
+
+fn pointer_root_global(func: &Function, mut value: ValueId) -> Option<&str> {
+    for _ in 0..MAX_POINTER_DEPTH {
+        match &func.values.get(value.0)?.kind {
+            ValueKind::Global(name) => return Some(name),
+            ValueKind::Inst(block, inst_idx) => {
+                let InstKind::Gep { base, .. } =
+                    &func.blocks.get(block.0)?.insts.get(*inst_idx)?.kind
+                else {
+                    return None;
+                };
+                value = *base;
+            }
+            ValueKind::Param | ValueKind::Const(_) => return None,
+        }
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -694,12 +831,19 @@ int main() {
             OptLevel::O1,
             PassOptions {
                 enable_simple_loop_unroll: false,
+                small_expr_inline_rounds: 1,
                 cfg_inline_rounds: 0,
                 cfg_inline_global_loads: false,
+                enable_constant_address_count_reduction: false,
+                enable_recursive_const_specialization: false,
                 enable_loop_call_memoize,
+                enable_loop_invariant_call_memoize: false,
                 enable_repeated_overwrite_elision: false,
                 enable_guarded_mulmod_idiom: false,
                 enable_guarded_pow2_digit_idiom: false,
+                enable_regional_global_scalar_promotion: false,
+                enable_producer_consumer_fusion: false,
+                enable_periodic_reduction_memoize: false,
                 enable_write_only_alloca_cleanup_before_inline: false,
             },
         );

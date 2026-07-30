@@ -52,8 +52,17 @@ struct UnrollCandidate {
     counter_next: ValueId,
     bound: ValueId,
     header_phi_inst: usize,
+    accumulator: Option<Accumulator>,
     body_insts: Vec<Inst>,
     active_body_insts: usize,
+}
+
+#[derive(Clone)]
+struct Accumulator {
+    value: ValueId,
+    initial: ValueId,
+    next: ValueId,
+    header_phi_inst: usize,
 }
 
 fn unroll_simple_loops(func: &mut Function, factor: usize) {
@@ -191,16 +200,13 @@ fn match_candidate(
         return None;
     }
 
-    let mut phi = None;
+    let mut phis = Vec::new();
     let mut condition = None;
     for (inst_idx, inst) in header.insts.iter().enumerate() {
         match &inst.kind {
             InstKind::Nop => {}
             InstKind::Phi { incomings } => {
-                if phi.is_some() {
-                    return None;
-                }
-                phi = Some((inst_idx, inst.result?, incomings));
+                phis.push((inst_idx, inst.result?, incomings));
             }
             InstKind::Icmp {
                 op: CmpOp::Lt,
@@ -215,8 +221,11 @@ fn match_candidate(
         }
     }
 
-    let (header_phi_inst, counter, _) = phi?;
     let (condition_counter, bound) = condition?;
+    let (header_phi_inst, counter, _) = phis
+        .iter()
+        .find(|(_, result, _)| *result == condition_counter)
+        .copied()?;
     if counter != condition_counter
         || func.values.get(counter.0)?.ty != Type::I32
         || func.values.get(bound.0)?.ty != Type::I32
@@ -237,6 +246,39 @@ fn match_candidate(
     }
     let counter_initial = induction.initial;
     let counter_next = induction.next;
+    let mut other_phis = phis.into_iter().filter(|(_, result, _)| *result != counter);
+    let accumulator = if let Some((header_phi_inst, value, incomings)) = other_phis.next() {
+        if func.values.get(value.0)?.ty != Type::F32 || incomings.len() != 2 {
+            return None;
+        }
+        let initial = incomings
+            .iter()
+            .find_map(|(pred, value)| (*pred == preheader_id).then_some(*value))?;
+        let next = incomings
+            .iter()
+            .find_map(|(pred, value)| (*pred == *body_id).then_some(*value))?;
+        if func.values.get(initial.0)?.ty != Type::F32
+            || func.values.get(next.0)?.ty != Type::F32
+            || !matches!(
+                func.values.get(next.0)?.kind,
+                ValueKind::Inst(owner, _) if owner == *body_id
+            )
+            || !value_available_at_preheader(func, dom, initial, preheader_id)
+        {
+            return None;
+        }
+        Some(Accumulator {
+            value,
+            initial,
+            next,
+            header_phi_inst,
+        })
+    } else {
+        None
+    };
+    if other_phis.next().is_some() {
+        return None;
+    }
 
     let active_body_insts = body
         .insts
@@ -267,9 +309,21 @@ fn match_candidate(
             return None;
         }
     }
-    if !has_store
-        || !body_instructions_are_ordered(func, *body_id, header_id, counter)
-        || body_values_escape(func, *body_id, header_id, counter_next)
+    if (!has_store && accumulator.is_none())
+        || !body_instructions_are_ordered(
+            func,
+            *body_id,
+            header_id,
+            counter,
+            accumulator.as_ref().map(|accumulator| accumulator.value),
+        )
+        || body_values_escape(
+            func,
+            *body_id,
+            header_id,
+            counter_next,
+            accumulator.as_ref().map(|accumulator| accumulator.next),
+        )
     {
         return None;
     }
@@ -283,6 +337,7 @@ fn match_candidate(
         counter_next,
         bound,
         header_phi_inst,
+        accumulator,
         body_insts: body.insts.clone(),
         active_body_insts,
     })
@@ -325,6 +380,7 @@ fn body_instructions_are_ordered(
     body: BlockId,
     header: BlockId,
     counter: ValueId,
+    accumulator: Option<ValueId>,
 ) -> bool {
     let mut defined = HashSet::new();
     for inst in &func.blocks[body.0].insts {
@@ -333,7 +389,9 @@ fn body_instructions_are_ordered(
                 func.values.get(operand.0).map(|value| &value.kind),
                 Some(ValueKind::Inst(owner, _))
                     if (*owner == body && !defined.contains(&operand))
-                        || (*owner == header && operand != counter)
+                        || (*owner == header
+                            && operand != counter
+                            && Some(operand) != accumulator)
             )
         }) {
             return false;
@@ -350,6 +408,7 @@ fn body_values_escape(
     body: BlockId,
     header: BlockId,
     counter_next: ValueId,
+    accumulator_next: Option<ValueId>,
 ) -> bool {
     let body_values = func.blocks[body.0]
         .insts
@@ -365,7 +424,9 @@ fn body_values_escape(
             match &inst.kind {
                 InstKind::Phi { incomings } if block_idx == header.0 => {
                     for (pred, value) in incomings {
-                        if body_values.contains(value) && !(*pred == body && *value == counter_next)
+                        if body_values.contains(value)
+                            && !(*pred == body
+                                && (*value == counter_next || Some(*value) == accumulator_next))
                         {
                             return true;
                         }
@@ -431,6 +492,19 @@ fn apply_unroll(func: &mut Function, candidate: &UnrollCandidate, factor: usize)
             Some(Type::I32),
         )
         .unwrap();
+    let fast_accumulator = candidate.accumulator.as_ref().map(|accumulator| {
+        func.append_inst(
+            fast_header,
+            InstKind::Phi {
+                incomings: vec![
+                    (candidate.preheader, accumulator.initial),
+                    (fast_body, accumulator.initial),
+                ],
+            },
+            Some(Type::F32),
+        )
+        .expect("fast-loop accumulator must produce a value")
+    });
     let run_batch = func
         .append_inst(
             fast_header,
@@ -444,8 +518,15 @@ fn apply_unroll(func: &mut Function, candidate: &UnrollCandidate, factor: usize)
         .unwrap();
 
     let mut current_counter = fast_counter;
+    let mut current_accumulator = fast_accumulator;
     for _ in 0..factor {
-        current_counter = clone_body_lane(func, fast_body, candidate, current_counter);
+        (current_counter, current_accumulator) = clone_body_lane(
+            func,
+            fast_body,
+            candidate,
+            current_counter,
+            current_accumulator,
+        );
     }
 
     func.blocks[candidate.preheader.0].terminator = Some(Terminator::Branch {
@@ -467,6 +548,24 @@ fn apply_unroll(func: &mut Function, candidate: &UnrollCandidate, factor: usize)
         unreachable!("new fast-loop counter must be a phi");
     };
     incomings[1].1 = current_counter;
+    if let (Some(accumulator), Some(current_accumulator)) =
+        (&candidate.accumulator, current_accumulator)
+    {
+        let InstKind::Phi { incomings } = &mut func.blocks[fast_header.0].insts[1].kind else {
+            unreachable!("new fast-loop accumulator must be a phi");
+        };
+        incomings[1].1 = current_accumulator;
+
+        let InstKind::Phi { incomings } =
+            &mut func.blocks[candidate.header.0].insts[accumulator.header_phi_inst].kind
+        else {
+            unreachable!("matched loop accumulator must remain a phi");
+        };
+        incomings.push((
+            fast_header,
+            fast_accumulator.expect("candidate accumulator needs a fast-loop phi"),
+        ));
+    }
 
     let InstKind::Phi { incomings } =
         &mut func.blocks[candidate.header.0].insts[candidate.header_phi_inst].kind
@@ -486,8 +585,12 @@ fn clone_body_lane(
     destination: BlockId,
     candidate: &UnrollCandidate,
     current_counter: ValueId,
-) -> ValueId {
+    current_accumulator: Option<ValueId>,
+) -> (ValueId, Option<ValueId>) {
     let mut values = HashMap::from([(candidate.counter, current_counter)]);
+    if let (Some(accumulator), Some(current)) = (&candidate.accumulator, current_accumulator) {
+        values.insert(accumulator.value, current);
+    }
     for inst in &candidate.body_insts {
         if matches!(inst.kind, InstKind::Nop) {
             continue;
@@ -502,7 +605,13 @@ fn clone_body_lane(
             );
         }
     }
-    values[&candidate.counter_next]
+    (
+        values[&candidate.counter_next],
+        candidate
+            .accumulator
+            .as_ref()
+            .map(|accumulator| values[&accumulator.next]),
+    )
 }
 
 fn remap_inst(kind: &InstKind, values: &HashMap<ValueId, ValueId>) -> InstKind {

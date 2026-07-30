@@ -23,6 +23,14 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             return;
         }
         const CHUNK_BYTES: usize = 8;
+        let is_aligned_alloca = matches!(
+            self.func.value(ptr).kind,
+            ValueKind::Inst(block, inst_index)
+                if matches!(
+                    self.func.blocks[block.0].insts[inst_index].kind,
+                    InstKind::Alloca { .. }
+                )
+        );
         self.load_value(ptr);
         let chunks = bytes / CHUNK_BYTES;
         let tail = bytes % CHUNK_BYTES;
@@ -30,8 +38,12 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             let loop_label = self.parent.ctx.fresh_label("memzero");
             self.body.push_str(&format!("  li a1, {}\n", chunks));
             self.body.push_str(&format!("{}:\n", loop_label));
-            for offset in 0..CHUNK_BYTES {
-                self.body.push_str(&format!("  sb zero, {}(a0)\n", offset));
+            if is_aligned_alloca {
+                self.body.push_str("  sd zero, 0(a0)\n");
+            } else {
+                for offset in 0..CHUNK_BYTES {
+                    self.body.push_str(&format!("  sb zero, {}(a0)\n", offset));
+                }
             }
             self.body.push_str(&format!(
                 "  addi a0, a0, {}\n  addi a1, a1, -1\n  bnez a1, {}\n",

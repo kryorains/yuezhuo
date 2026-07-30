@@ -9,6 +9,21 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     pub(super) fn pre_prologue_early_return(&self, plan: &EntryEarlyReturn) -> Option<String> {
         let frame_label = format!(".L_frame_{}", self.func.name);
         let mut out = String::new();
+        if let Some(chain) = plan.chained {
+            let return_label = format!(".L_preframe_return_{}", self.func.name);
+            self.emit_guard_branch(plan.condition, plan.fast_when_true, &return_label, &mut out)?;
+            self.emit_guard_branch(
+                chain.condition,
+                chain.fast_when_true,
+                &return_label,
+                &mut out,
+            )?;
+            out.push_str(&format!("  b {frame_label}\n{return_label}:\n"));
+            self.emit_fast_result(plan.result, &mut out)?;
+            out.push_str("  ret\n");
+            out.push_str(&format!("{frame_label}:\n"));
+            return Some(out);
+        }
         self.emit_guard_branch(plan.condition, !plan.fast_when_true, &frame_label, &mut out)?;
         self.emit_fast_result(plan.result, &mut out)?;
         out.push_str("  ret\n");
@@ -81,8 +96,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         target: &str,
         out: &mut String,
     ) -> Option<()> {
-        let lhs = self.preframe_operand(lhs)?;
-        let rhs = self.preframe_operand(rhs)?;
+        let lhs = self.preframe_guard_operand(lhs, "w9", out)?;
+        let rhs = self.preframe_guard_operand(rhs, "w10", out)?;
         if let (PreframeOperand::Imm(lhs), PreframeOperand::Imm(rhs)) = (&lhs, &rhs) {
             if eval_icmp(op, *lhs, *rhs) == branch_when {
                 out.push_str(&format!("  b {}\n", target));
@@ -105,6 +120,7 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
     fn emit_fast_result(&self, result: EarlyReturnResult, out: &mut String) -> Option<()> {
         match result {
+            EarlyReturnResult::Void => Some(()),
             EarlyReturnResult::Direct(value) => {
                 match self.preframe_operand(value)? {
                     PreframeOperand::Reg(reg) if reg != "w0" => {
@@ -144,6 +160,37 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             ValueKind::Const(Const::Bool(value)) => Some(PreframeOperand::Imm(i32::from(value))),
             ValueKind::Const(_) | ValueKind::Global(_) | ValueKind::Inst(_, _) => None,
         }
+    }
+
+    fn preframe_guard_operand(
+        &self,
+        value: ValueId,
+        scratch: &'static str,
+        out: &mut String,
+    ) -> Option<PreframeOperand> {
+        if let Some(operand) = self.preframe_operand(value) {
+            return Some(operand);
+        }
+        let ValueKind::Inst(block, inst_index) = self.func.value(value).kind else {
+            return None;
+        };
+        let InstKind::Binary { op, lhs, rhs } =
+            self.func.blocks.get(block.0)?.insts.get(inst_index)?.kind
+        else {
+            return None;
+        };
+        let PreframeOperand::Imm(rhs) = self.preframe_operand(rhs)? else {
+            return None;
+        };
+        let (instruction, immediate) = match op {
+            BinaryOp::Iadd if (0..=4095).contains(&rhs) => ("add", rhs),
+            BinaryOp::Isub if (0..=4095).contains(&rhs) => ("sub", rhs),
+            _ => return None,
+        };
+        let lhs = self.preframe_operand(lhs)?;
+        let lhs = self.materialize_operand(lhs, scratch, out);
+        out.push_str(&format!("  {instruction} {scratch}, {lhs}, #{immediate}\n"));
+        Some(PreframeOperand::Reg(scratch.to_string()))
     }
 
     fn preframe_param_reg(&self, value: ValueId) -> Option<String> {
