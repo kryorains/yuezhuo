@@ -116,12 +116,19 @@ fn main() {
     let costs = target.cost_model();
     let pass_options = ir::pass::PassOptions {
         enable_simple_loop_unroll: costs.enable_simple_loop_unroll(),
+        small_expr_inline_rounds: costs.small_expr_inline_rounds(),
         cfg_inline_rounds: costs.cfg_inline_rounds(),
         cfg_inline_global_loads: costs.cfg_inline_global_loads(),
+        enable_constant_address_count_reduction: costs.enable_constant_address_count_reduction(),
+        enable_recursive_const_specialization: costs.enable_recursive_const_specialization(),
         enable_loop_call_memoize: costs.enable_loop_call_memoize(),
+        enable_loop_invariant_call_memoize: costs.enable_loop_invariant_call_memoize(),
         enable_repeated_overwrite_elision: costs.enable_repeated_overwrite_elision(),
         enable_guarded_mulmod_idiom: costs.enable_guarded_mulmod_idiom(),
         enable_guarded_pow2_digit_idiom: costs.enable_guarded_pow2_digit_idiom(),
+        enable_regional_global_scalar_promotion: costs.enable_regional_global_scalar_promotion(),
+        enable_producer_consumer_fusion: costs.enable_producer_consumer_fusion(),
+        enable_periodic_reduction_memoize: costs.enable_periodic_reduction_memoize(),
         enable_write_only_alloca_cleanup_before_inline: costs
             .cleanup_write_only_allocas_before_inline(),
     };

@@ -13,18 +13,43 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
     pub(super) fn guarded_pow2_digit_prelude(&self) -> Option<String> {
         let shift = self.func.guarded_pow2_digit_shift()?;
-        let zero_position = 31u32.div_ceil(shift);
+        let zero_position = 32u32.div_ceil(shift);
         let mask = (1u32.checked_shl(shift)? - 1) as i32;
+        let scale_position = if shift.is_power_of_two() {
+            format!("  slliw t1, a1, {}\n", shift.trailing_zeros())
+        } else {
+            format!("  li t0, {shift}\n  mulw t1, a1, t0\n")
+        };
+        let apply_mask = if mask <= 2047 {
+            format!("  andi a0, a0, {mask}\n")
+        } else {
+            format!("  li t0, {mask}\n  and a0, a0, t0\n")
+        };
         let fallback = format!(".L_pow2_digit_fallback_{}", self.func.name);
         let zero = format!(".L_pow2_digit_zero_{}", self.func.name);
         Some(format!(
-            "  bltz a0, {fallback}\n  bltz a1, {fallback}\n  li t0, {zero_position}\n  bge a1, t0, {zero}\n  li t0, {shift}\n  mulw t1, a1, t0\n  sraw a0, a0, t1\n  li t0, {mask}\n  and a0, a0, t0\n  ret\n{zero}:\n  li a0, 0\n  ret\n{fallback}:\n"
+            "  bltz a1, {fallback}\n  li t0, {zero_position}\n  bge a1, t0, {zero}\n  bltz a0, {fallback}\n{scale_position}  sraw a0, a0, t1\n{apply_mask}  ret\n{zero}:\n  li a0, 0\n  ret\n{fallback}:\n"
         ))
     }
 
     pub(super) fn pre_prologue_early_return(&self, plan: &EntryEarlyReturn) -> Option<String> {
         let frame_label = format!(".L_frame_{}", self.func.name);
         let mut out = String::new();
+        if let Some(chain) = plan.chained {
+            let return_label = format!(".L_preframe_return_{}", self.func.name);
+            self.emit_guard_branch(plan.condition, plan.fast_when_true, &return_label, &mut out)?;
+            self.emit_guard_branch(
+                chain.condition,
+                chain.fast_when_true,
+                &return_label,
+                &mut out,
+            )?;
+            out.push_str(&format!("  j {frame_label}\n{return_label}:\n"));
+            self.emit_fast_result(plan.result, &mut out)?;
+            out.push_str("  ret\n");
+            out.push_str(&format!("{frame_label}:\n"));
+            return Some(out);
+        }
         self.emit_guard_branch(plan.condition, !plan.fast_when_true, &frame_label, &mut out)?;
         self.emit_fast_result(plan.result, &mut out)?;
         out.push_str("  ret\n");
@@ -97,8 +122,8 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         target: &str,
         out: &mut String,
     ) -> Option<()> {
-        let lhs = self.preframe_operand(lhs)?;
-        let rhs = self.preframe_operand(rhs)?;
+        let lhs = self.preframe_guard_operand(lhs, "t0", out)?;
+        let rhs = self.preframe_guard_operand(rhs, "t1", out)?;
         if let (PreframeOperand::Imm(lhs), PreframeOperand::Imm(rhs)) = (&lhs, &rhs) {
             if eval_icmp(op, *lhs, *rhs) == branch_when {
                 out.push_str(&format!("  j {}\n", target));
@@ -124,6 +149,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
     fn emit_fast_result(&self, result: EarlyReturnResult, out: &mut String) -> Option<()> {
         match result {
+            EarlyReturnResult::Void => Some(()),
             EarlyReturnResult::Direct(value) => {
                 match self.preframe_operand(value)? {
                     PreframeOperand::Reg(reg) if reg != "a0" => {
@@ -165,6 +191,40 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             ValueKind::Const(Const::Bool(value)) => Some(PreframeOperand::Imm(i32::from(value))),
             ValueKind::Const(_) | ValueKind::Global(_) | ValueKind::Inst(_, _) => None,
         }
+    }
+
+    fn preframe_guard_operand(
+        &self,
+        value: ValueId,
+        scratch: &'static str,
+        out: &mut String,
+    ) -> Option<PreframeOperand> {
+        if let Some(operand) = self.preframe_operand(value) {
+            return Some(operand);
+        }
+        let ValueKind::Inst(block, inst_index) = self.func.value(value).kind else {
+            return None;
+        };
+        let InstKind::Binary { op, lhs, rhs } =
+            self.func.blocks.get(block.0)?.insts.get(inst_index)?.kind
+        else {
+            return None;
+        };
+        let PreframeOperand::Imm(rhs) = self.preframe_operand(rhs)? else {
+            return None;
+        };
+        let immediate = match op {
+            BinaryOp::Iadd => rhs,
+            BinaryOp::Isub => rhs.checked_neg()?,
+            _ => return None,
+        };
+        if !(-2048..=2047).contains(&immediate) {
+            return None;
+        }
+        let lhs = self.preframe_operand(lhs)?;
+        let lhs = self.materialize_operand(lhs, scratch, out);
+        out.push_str(&format!("  addiw {scratch}, {lhs}, {immediate}\n"));
+        Some(PreframeOperand::Reg(scratch.to_string()))
     }
 
     fn preframe_param_reg(&self, value: ValueId) -> Option<String> {

@@ -6,8 +6,9 @@ use std::collections::HashSet;
 // the original entry-to-slow phi copies before bypassing the duplicated guard.
 const MAX_GUARD_VALUES: usize = 12;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EarlyReturnResult {
+    Void,
     Direct(ValueId),
     Binary {
         op: BinaryOp,
@@ -17,17 +18,26 @@ pub(crate) enum EarlyReturnResult {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct ChainedEntryEarlyReturn {
+    pub(crate) condition: ValueId,
+    pub(crate) fast_when_true: bool,
+    pub(crate) guard_block: BlockId,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct EntryEarlyReturn {
     pub(crate) condition: ValueId,
     pub(crate) fast_when_true: bool,
     pub(crate) fast_block: BlockId,
+    pub(crate) fast_block_exclusive: bool,
     pub(crate) slow_block: BlockId,
+    pub(crate) chained: Option<ChainedEntryEarlyReturn>,
     pub(crate) result: EarlyReturnResult,
 }
 
 /// Finds one guarded, register-only return that can execute before the prologue.
 pub(crate) fn entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
-    if func.ret != Type::I32 || has_predecessor(func, func.entry) {
+    if !matches!(func.ret, Type::Void | Type::I32) || has_predecessor(func, func.entry) {
         return None;
     }
     let entry = &func.blocks[func.entry.0];
@@ -44,7 +54,7 @@ pub(crate) fn entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
     if !collect_guard_values(func, func.entry, *cond, &mut guard_values)
         || guard_values.len() > MAX_GUARD_VALUES
         || entry.insts.iter().any(|inst| {
-            !matches!(inst.kind, InstKind::Nop)
+            !matches!(inst.kind, InstKind::Nop | InstKind::Alloca { .. })
                 && inst
                     .result
                     .is_none_or(|result| !guard_values.contains(&result))
@@ -57,20 +67,42 @@ pub(crate) fn entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
         (true, *then_target, *else_target),
         (false, *else_target, *then_target),
     ] {
-        if fast_block == slow_block || !has_only_predecessor(func, fast_block, func.entry) {
+        if fast_block == slow_block {
             continue;
         }
         let Some(result) = early_result(func, fast_block) else {
             continue;
         };
-        if entry_results_escape(func, func.entry, fast_block) {
-            continue;
+        let chained = chained_early_return(func, slow_block, fast_block, result);
+        let final_slow_block = chained.map_or(slow_block, |chain| {
+            let Terminator::Branch {
+                then_target,
+                else_target,
+                ..
+            } = func.blocks[chain.guard_block.0]
+                .terminator
+                .as_ref()
+                .expect("chained guard must remain a branch")
+            else {
+                unreachable!();
+            };
+            if *then_target == fast_block {
+                *else_target
+            } else {
+                *then_target
+            }
+        });
+        let mut skipped_predecessors = HashSet::from([func.entry]);
+        if let Some(chain) = chained {
+            skipped_predecessors.insert(chain.guard_block);
         }
         return Some(EntryEarlyReturn {
             condition: *cond,
             fast_when_true,
             fast_block,
-            slow_block,
+            fast_block_exclusive: has_only_predecessors(func, fast_block, &skipped_predecessors),
+            slow_block: final_slow_block,
+            chained,
             result,
         });
     }
@@ -101,7 +133,8 @@ fn collect_guard_values(
             }
             match inst.kind {
                 InstKind::Icmp { lhs, rhs, .. } => {
-                    is_direct_integer(func, lhs) && is_direct_integer(func, rhs)
+                    collect_guard_integer(func, entry, lhs, values)
+                        && collect_guard_integer(func, entry, rhs, values)
                 }
                 InstKind::Unary {
                     op: crate::ir::UnaryOp::Not,
@@ -122,9 +155,102 @@ fn collect_guard_values(
     }
 }
 
+fn collect_guard_integer(
+    func: &Function,
+    owner: BlockId,
+    value: ValueId,
+    values: &mut HashSet<ValueId>,
+) -> bool {
+    if !matches!(func.value(value).ty, Type::I1 | Type::I32) {
+        return false;
+    }
+    match func.value(value).kind {
+        ValueKind::Param | ValueKind::Const(_) => true,
+        ValueKind::Inst(block, inst_index) if block == owner => {
+            if values.len() >= MAX_GUARD_VALUES {
+                return false;
+            }
+            values.insert(value);
+            let Some(inst) = func.blocks[block.0].insts.get(inst_index) else {
+                return false;
+            };
+            matches!(
+                inst.kind,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd | BinaryOp::Isub,
+                    ..
+                }
+            ) && match inst.kind {
+                InstKind::Binary { lhs, rhs, .. } => {
+                    collect_guard_integer(func, owner, lhs, values)
+                        && collect_guard_integer(func, owner, rhs, values)
+                }
+                _ => false,
+            }
+        }
+        ValueKind::Inst(_, _) | ValueKind::Global(_) => false,
+    }
+}
+
+fn chained_early_return(
+    func: &Function,
+    guard_block: BlockId,
+    fast_block: BlockId,
+    result: EarlyReturnResult,
+) -> Option<ChainedEntryEarlyReturn> {
+    if !has_only_predecessor(func, guard_block, func.entry) {
+        return None;
+    }
+    let block = &func.blocks[guard_block.0];
+    let Terminator::Branch {
+        cond,
+        then_target,
+        else_target,
+    } = block.terminator.as_ref()?
+    else {
+        return None;
+    };
+    let fast_when_true = if *then_target == fast_block && *else_target != fast_block {
+        true
+    } else if *else_target == fast_block && *then_target != fast_block {
+        false
+    } else {
+        return None;
+    };
+    if early_result(func, fast_block)? != result {
+        return None;
+    }
+    let mut guard_values = HashSet::new();
+    if !collect_guard_values(func, guard_block, *cond, &mut guard_values)
+        || guard_values.len() > MAX_GUARD_VALUES
+        || block.insts.iter().any(|inst| {
+            !matches!(inst.kind, InstKind::Nop)
+                && inst
+                    .result
+                    .is_none_or(|inst_result| !guard_values.contains(&inst_result))
+        })
+    {
+        return None;
+    }
+    Some(ChainedEntryEarlyReturn {
+        condition: *cond,
+        fast_when_true,
+        guard_block,
+    })
+}
+
 fn early_result(func: &Function, block: BlockId) -> Option<EarlyReturnResult> {
     let owner = &func.blocks[block.0];
     let result = match owner.terminator.as_ref()? {
+        Terminator::Return(None)
+            if func.ret == Type::Void
+                && owner
+                    .insts
+                    .iter()
+                    .all(|inst| matches!(inst.kind, InstKind::Nop)) =>
+        {
+            return Some(EarlyReturnResult::Void);
+        }
         Terminator::Return(Some(result)) => *result,
         Terminator::Jump(merge) => {
             let merge_block = &func.blocks[merge.0];
@@ -203,57 +329,6 @@ fn is_direct_integer(func: &Function, value: ValueId) -> bool {
         )
 }
 
-fn entry_results_escape(func: &Function, entry: BlockId, fast_block: BlockId) -> bool {
-    let entry_results = func.blocks[entry.0]
-        .insts
-        .iter()
-        .filter_map(|inst| inst.result)
-        .collect::<HashSet<_>>();
-    for (block_idx, block) in func.blocks.iter().enumerate() {
-        if block_idx == entry.0 || block_idx == fast_block.0 {
-            continue;
-        }
-        if block
-            .insts
-            .iter()
-            .flat_map(|inst| inst_operands(&inst.kind))
-            .chain(terminator_operands(block.terminator.as_ref()))
-            .any(|operand| entry_results.contains(&operand))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
-    match kind {
-        InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
-        InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
-        InstKind::Store { ptr, value } => vec![*ptr, *value],
-        InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
-        InstKind::Binary { lhs, rhs, .. }
-        | InstKind::Icmp { lhs, rhs, .. }
-        | InstKind::Fcmp { lhs, rhs, .. } => vec![*lhs, *rhs],
-        InstKind::Gep { base, indices } => {
-            let mut operands = Vec::with_capacity(indices.len() + 1);
-            operands.push(*base);
-            operands.extend(indices.iter().copied());
-            operands
-        }
-        InstKind::Call { args, .. } => args.clone(),
-    }
-}
-
-fn terminator_operands(terminator: Option<&Terminator>) -> Vec<ValueId> {
-    match terminator {
-        Some(Terminator::Return(Some(value))) => vec![*value],
-        Some(Terminator::Branch { cond, .. }) => vec![*cond],
-        Some(Terminator::Return(None) | Terminator::Jump(_)) | None => Vec::new(),
-    }
-}
-
 fn has_predecessor(func: &Function, target: BlockId) -> bool {
     func.blocks
         .iter()
@@ -269,6 +344,10 @@ fn has_predecessor(func: &Function, target: BlockId) -> bool {
 }
 
 fn has_only_predecessor(func: &Function, target: BlockId, expected: BlockId) -> bool {
+    has_only_predecessors(func, target, &HashSet::from([expected]))
+}
+
+fn has_only_predecessors(func: &Function, target: BlockId, expected: &HashSet<BlockId>) -> bool {
     let mut predecessors = HashSet::new();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let reaches_target = match block.terminator.as_ref() {
@@ -284,5 +363,5 @@ fn has_only_predecessor(func: &Function, target: BlockId, expected: BlockId) -> 
             predecessors.insert(BlockId(block_idx));
         }
     }
-    predecessors == HashSet::from([expected])
+    &predecessors == expected
 }

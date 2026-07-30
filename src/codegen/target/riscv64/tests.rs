@@ -85,6 +85,118 @@ fn does_not_add_float_frame_to_integer_only_function() {
 }
 
 #[test]
+fn clears_aligned_local_arrays_with_wide_stores() {
+    let mut function = Function::new("clear_local", Type::Void);
+    let array = function
+        .append_inst(
+            function.entry,
+            InstKind::Alloca {
+                ty: Type::Array {
+                    elem: Box::new(Type::I32),
+                    len: 16,
+                },
+            },
+            Some(Type::Ptr(Box::new(Type::Array {
+                elem: Box::new(Type::I32),
+                len: 16,
+            }))),
+        )
+        .unwrap();
+    function.append_inst(
+        function.entry,
+        InstKind::MemZero {
+            ptr: array,
+            bytes: 64,
+        },
+        None,
+    );
+    function.set_terminator(function.entry, Terminator::Return(None));
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let function_asm = function_asm(&asm, "clear_local");
+
+    assert!(function_asm.contains("  sd zero, 0(a0)\n"));
+    assert!(!function_asm.contains("  sb zero,"));
+}
+
+#[test]
+fn returns_from_chained_void_guards_before_building_the_frame() {
+    let mut function = Function::new("guarded_void", Type::Void);
+    let depth = function.add_param("depth", Type::I32);
+    let left = function.add_param("left", Type::I32);
+    let right = function.add_param("right", Type::I32);
+    let minus_one = function.add_const(Const::Int(-1));
+    let one = function.add_const(Const::Int(1));
+    let fast = function.add_block("fast");
+    let second_guard = function.add_block("second_guard");
+    let work = function.add_block("work");
+    let depth_done = function
+        .append_inst(
+            function.entry,
+            InstKind::Icmp {
+                op: crate::ir::CmpOp::Eq,
+                lhs: depth,
+                rhs: minus_one,
+            },
+            Some(Type::I1),
+        )
+        .unwrap();
+    function.set_terminator(
+        function.entry,
+        Terminator::Branch {
+            cond: depth_done,
+            then_target: fast,
+            else_target: second_guard,
+        },
+    );
+    let next_left = function
+        .append_inst(
+            second_guard,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: left,
+                rhs: one,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let range_done = function
+        .append_inst(
+            second_guard,
+            InstKind::Icmp {
+                op: crate::ir::CmpOp::Ge,
+                lhs: next_left,
+                rhs: right,
+            },
+            Some(Type::I1),
+        )
+        .unwrap();
+    function.set_terminator(
+        second_guard,
+        Terminator::Branch {
+            cond: range_done,
+            then_target: fast,
+            else_target: work,
+        },
+    );
+    function.set_terminator(fast, Terminator::Return(None));
+    function.set_terminator(work, Terminator::Return(None));
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let function_asm = function_asm(&asm, "guarded_void");
+    let frame = function_asm.find("  addi sp, sp, -16\n").unwrap();
+    let preframe = &function_asm[..frame];
+
+    assert!(preframe.contains("  beq a0, t1, .L_preframe_return_guarded_void\n"));
+    assert!(preframe.contains("  addiw t0, a1, 1\n"));
+    assert!(preframe.contains("  bge t0, a2, .L_preframe_return_guarded_void\n"));
+}
+
+#[test]
 fn keeps_straight_line_float_intermediates_in_registers() {
     let mut function = Function::new("float_expr", Type::I32);
     let lhs = function.add_param("lhs", Type::F32);
@@ -130,8 +242,7 @@ fn keeps_straight_line_float_intermediates_in_registers() {
     let function_asm = function_asm(&asm, "float_expr");
     let body = entry_block_asm(function_asm, "float_expr");
 
-    assert!(body.contains("fmul.s"));
-    assert!(body.contains("fadd.s"));
+    assert!(!body.contains("fmadd.s"));
     assert!(body.lines().any(|line| line.starts_with("  fmul.s ft")));
     assert!(body.lines().any(|line| line.starts_with("  fadd.s ft")));
     assert!(!body.lines().any(|line| line.starts_with("  fmv.s ft")));
@@ -396,8 +507,8 @@ fn preserves_call_crossing_float_parameter() {
     let caller_asm = function_asm(&asm, "float_caller");
 
     assert!(caller_asm.contains("fmv.s fs0, fa0"));
-    assert!(caller_asm.contains("fmv.s fa1, fs0"));
-    assert!(caller_asm.contains("fadd.s ft1, fa1, fa0"));
+    assert!(!caller_asm.contains("fmv.s fa1, fs0"));
+    assert!(caller_asm.contains("fadd.s ft1, fs0, fa0"));
     assert!(caller_asm.contains("fmv.s fa0, ft1"));
     assert!(!caller_asm.contains("lw a0, -24(s0)"));
     assert!(caller_asm.contains("fsd fs0, -8(s0)"));

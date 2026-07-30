@@ -1,4 +1,5 @@
 use super::dominators::{ControlFlowGraph, Dominators};
+use super::function_effects::FunctionEffects;
 use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
 use crate::ir::{Function, InstKind, Module, Type, ValueId, ValueKind};
@@ -28,13 +29,14 @@ impl LocalForwardPass {
 
 impl ModulePass for LocalForwardPass {
     fn run(&mut self, module: &mut Module) {
+        let effects = FunctionEffects::analyze(module);
         for func in &mut module.funcs {
-            forward_function(func);
+            forward_function(func, &effects);
         }
     }
 }
 
-fn forward_function(func: &mut Function) {
+fn forward_function(func: &mut Function, effects: &FunctionEffects) {
     // DSE can expose forwarding and forwarding can canonicalize a DSE match.
     // Keep the pre-existing forwarding enabled for over-budget functions; only
     // the new pointer-chain analysis is size-gated.
@@ -48,8 +50,10 @@ fn forward_function(func: &mut Function) {
     let mut changed = false;
     let mut converged = false;
     for _ in 0..iteration_limit {
-        let dse_changed = dse_enabled && eliminate_redundant_writebacks(func);
+        let dse_changed = dse_enabled
+            && (eliminate_redundant_writebacks(func) | eliminate_overwritten_stores(func));
         let mut replacements = ValueReplacements::new();
+        let mut forwarded_loads = Vec::new();
         let pointer_roots = dse_enabled.then(|| {
             func.values
                 .iter()
@@ -62,7 +66,7 @@ fn forward_function(func: &mut Function) {
             .and_then(|pointer_roots| {
                 let cfg = ControlFlowGraph::new(func);
                 let dom = Dominators::new(func, &cfg);
-                available_load_entries(func, &cfg, &dom, pointer_roots)
+                available_load_entries(func, &cfg, &dom, pointer_roots, effects)
             })
             .unwrap_or_else(|| vec![HashMap::new(); func.blocks.len()]);
 
@@ -72,7 +76,7 @@ fn forward_function(func: &mut Function) {
             // intersection proves the same dominating load on all paths.
             let mut known_memory = HashMap::<ValueId, ValueId>::new();
             let mut known_loads = load_entries.get(block_idx).cloned().unwrap_or_default();
-            for inst in &block.insts {
+            for (inst_idx, inst) in block.insts.iter().enumerate() {
                 match &inst.kind {
                     InstKind::Nop | InstKind::Alloca { .. } => {}
                     InstKind::Store { ptr, value } => {
@@ -90,7 +94,22 @@ fn forward_function(func: &mut Function) {
                             known_loads.clear();
                         }
                         let value = resolve(*value, &replacements);
-                        if tracked_pointer(func, ptr) {
+                        if pointer_roots
+                            .as_ref()
+                            .and_then(|roots| roots.get(ptr.0))
+                            .copied()
+                            .flatten()
+                            .is_some()
+                        {
+                            known_memory.retain(|known_ptr, _| {
+                                *known_ptr == ptr
+                                    || pointers_proven_disjoint(
+                                        func,
+                                        pointer_roots.as_deref().unwrap_or(&[]),
+                                        *known_ptr,
+                                        ptr,
+                                    )
+                            });
                             known_memory.insert(ptr, value);
                         } else {
                             known_memory.clear();
@@ -109,11 +128,18 @@ fn forward_function(func: &mut Function) {
                         {
                             if func.value(value).ty == func.value(result).ty {
                                 replacements.insert(result, value);
+                                forwarded_loads.push((block_idx, inst_idx));
                             }
                         } else {
                             known_loads.insert(ptr, result);
                         }
                     }
+                    InstKind::Call { name, args }
+                        if inst.result.is_some_and(|result| {
+                            effects
+                                .resolve_no_memory_call(func, name, result, args)
+                                .is_some()
+                        }) => {}
                     InstKind::Call { .. } | InstKind::MemZero { .. } => {
                         // 调用和批量清零都可能改写内存，保守地丢弃本块内已知信息。
                         known_memory.clear();
@@ -126,6 +152,12 @@ fn forward_function(func: &mut Function) {
         }
 
         let forward_changed = rewrite_function_uses(func, &replacements);
+        if forward_changed {
+            for (block_idx, inst_idx) in forwarded_loads {
+                func.blocks[block_idx].insts[inst_idx].result = None;
+                func.blocks[block_idx].insts[inst_idx].kind = InstKind::Nop;
+            }
+        }
         changed |= dse_changed || forward_changed;
         if !dse_changed && !forward_changed {
             converged = true;
@@ -153,6 +185,7 @@ fn available_load_entries(
     cfg: &ControlFlowGraph,
     dom: &Dominators,
     pointer_roots: &[Option<TypedScalarRoot>],
+    effects: &FunctionEffects,
 ) -> Option<Vec<HashMap<ValueId, ValueId>>> {
     let mut entries = vec![HashMap::new(); func.blocks.len()];
     let mut exits = vec![HashMap::new(); func.blocks.len()];
@@ -172,7 +205,14 @@ fn available_load_entries(
                 entry.clear();
             }
             let mut exit = entry.clone();
-            transfer_load_state(func, block_idx, &mut exit, pointer_roots, &mut work)?;
+            transfer_load_state(
+                func,
+                block_idx,
+                &mut exit,
+                pointer_roots,
+                effects,
+                &mut work,
+            )?;
             if exit.len() > MAX_EDGE_LOADS {
                 exit.clear();
             }
@@ -211,6 +251,7 @@ fn transfer_load_state(
     block_idx: usize,
     state: &mut HashMap<ValueId, ValueId>,
     pointer_roots: &[Option<TypedScalarRoot>],
+    effects: &FunctionEffects,
     work: &mut usize,
 ) -> Option<()> {
     for inst in &func.blocks.get(block_idx)?.insts {
@@ -238,6 +279,12 @@ fn transfer_load_state(
                     });
                 }
             }
+            InstKind::Call { name, args }
+                if inst.result.is_some_and(|result| {
+                    effects
+                        .resolve_no_memory_call(func, name, result, args)
+                        .is_some()
+                }) => {}
             InstKind::Call { .. } | InstKind::MemZero { .. } => state.clear(),
             _ => {}
         }
@@ -314,6 +361,60 @@ fn eliminate_redundant_writebacks(func: &mut Function) -> bool {
         }
     }
     changed
+}
+
+/// Removes an exact-address store overwritten later in the same block when no
+/// intervening access can observe it. Typed scalar roots let us retain
+/// candidates across accesses that are proven disjoint while conservatively
+/// dropping them for unknown or potentially aliasing pointers.
+fn eliminate_overwritten_stores(func: &mut Function) -> bool {
+    let pointer_roots = func
+        .values
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| typed_scalar_pointer_root(func, ValueId(idx)))
+        .collect::<Vec<_>>();
+    let mut dead = Vec::new();
+
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let mut candidates = HashMap::<ValueId, usize>::new();
+        for (inst_idx, inst) in block.insts.iter().enumerate() {
+            match &inst.kind {
+                InstKind::Load { ptr } => {
+                    candidates.retain(|stored_ptr, _| {
+                        pointers_proven_disjoint(func, &pointer_roots, *stored_ptr, *ptr)
+                    });
+                }
+                InstKind::Store { ptr, .. }
+                    if pointer_roots.get(ptr.0).copied().flatten().is_some() =>
+                {
+                    let mut overwritten = None;
+                    candidates.retain(|stored_ptr, stored_idx| {
+                        if *stored_ptr == *ptr {
+                            overwritten = Some(*stored_idx);
+                            false
+                        } else {
+                            pointers_proven_disjoint(func, &pointer_roots, *stored_ptr, *ptr)
+                        }
+                    });
+                    if let Some(stored_idx) = overwritten {
+                        dead.push((block_idx, stored_idx));
+                    }
+                    candidates.insert(*ptr, inst_idx);
+                }
+                InstKind::Store { .. } | InstKind::Call { .. } | InstKind::MemZero { .. } => {
+                    candidates.clear();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for (block_idx, inst_idx) in &dead {
+        func.blocks[*block_idx].insts[*inst_idx].kind = InstKind::Nop;
+        func.blocks[*block_idx].insts[*inst_idx].result = None;
+    }
+    !dead.is_empty()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -565,23 +666,88 @@ fn type_node_count(mut ty: &Type, remaining: usize) -> Option<usize> {
     }
 }
 
-fn tracked_pointer(func: &Function, value: ValueId) -> bool {
-    // 目前只跟踪非数组 alloca，避免数组/复杂别名导致错误转发。
-    let Type::Ptr(inner) = &func.value(value).ty else {
-        return false;
-    };
-    if matches!(**inner, Type::Array { .. }) {
-        return false;
-    }
-    let ValueKind::Inst(block, inst_idx) = func.value(value).kind else {
-        return false;
-    };
-    matches!(
-        func.block(block).insts[inst_idx].kind,
-        InstKind::Alloca { .. }
-    )
-}
-
 fn resolve(value: ValueId, replacements: &ValueReplacements) -> ValueId {
     super::util::resolve_replacement(value, replacements)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{BinaryOp, Const, InstKind, Module, Terminator};
+
+    #[test]
+    fn forwards_exact_gep_loads_and_removes_overwritten_stores() {
+        let mut func = Function::new("exact_gep", Type::I32);
+        let slot = func
+            .append_inst(
+                func.entry,
+                InstKind::Alloca { ty: Type::I32 },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        let zero = func.add_const(Const::Int(0));
+        let one = func.add_const(Const::Int(1));
+        let ptr = func
+            .append_inst(
+                func.entry,
+                InstKind::Gep {
+                    base: slot,
+                    indices: vec![zero],
+                },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        func.append_inst(func.entry, InstKind::Store { ptr, value: one }, None);
+        let loaded = func
+            .append_inst(func.entry, InstKind::Load { ptr }, Some(Type::I32))
+            .unwrap();
+        let incremented = func
+            .append_inst(
+                func.entry,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: loaded,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.append_inst(
+            func.entry,
+            InstKind::Store {
+                ptr,
+                value: incremented,
+            },
+            None,
+        );
+        let returned = func
+            .append_inst(func.entry, InstKind::Load { ptr }, Some(Type::I32))
+            .unwrap();
+        func.set_terminator(func.entry, Terminator::Return(Some(returned)));
+
+        let mut module = Module::new();
+        module.add_func(func);
+        LocalForwardPass::new().run(&mut module);
+        let func = &module.funcs[0];
+        let active = func.blocks[0]
+            .insts
+            .iter()
+            .filter(|inst| !matches!(inst.kind, InstKind::Nop))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            active
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store { .. }))
+                .count(),
+            1
+        );
+        assert!(active
+            .iter()
+            .all(|inst| !matches!(inst.kind, InstKind::Load { .. })));
+        assert_eq!(
+            func.blocks[0].terminator,
+            Some(Terminator::Return(Some(incremented)))
+        );
+        assert!(func.verify().is_ok());
+    }
 }

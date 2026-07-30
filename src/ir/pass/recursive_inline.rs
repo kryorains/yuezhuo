@@ -984,12 +984,19 @@ mod tests {
         o1.add_func(func);
         let options = PassOptions {
             enable_simple_loop_unroll: false,
+            small_expr_inline_rounds: 1,
             cfg_inline_rounds: 1,
             cfg_inline_global_loads: false,
+            enable_constant_address_count_reduction: false,
+            enable_recursive_const_specialization: false,
             enable_loop_call_memoize: false,
+            enable_loop_invariant_call_memoize: false,
             enable_repeated_overwrite_elision: false,
             enable_guarded_mulmod_idiom: false,
             enable_guarded_pow2_digit_idiom: false,
+            enable_regional_global_scalar_promotion: false,
+            enable_producer_consumer_fusion: false,
+            enable_periodic_reduction_memoize: false,
             enable_write_only_alloca_cleanup_before_inline: true,
         };
 

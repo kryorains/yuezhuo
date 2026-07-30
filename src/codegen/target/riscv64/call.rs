@@ -29,7 +29,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 };
                 self.load_value_into(args[idx], &format!("a{}", reg_idx));
             }
-            if !self.emit_guarded_pow2_digit_call(name) {
+            if !self.emit_guarded_pow2_digit_call(name, args)
+                && !self.emit_guarded_mulmod_call(name)
+            {
                 self.body.push_str(&format!("  call {}\n", name));
             }
             if sig.ret == Type::F32 {
@@ -93,7 +95,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         sig.ret
     }
 
-    fn emit_guarded_pow2_digit_call(&mut self, name: &str) -> bool {
+    fn emit_guarded_pow2_digit_call(&mut self, name: &str, args: &[ValueId]) -> bool {
         let Some(shift) = self
             .parent
             .ctx
@@ -105,13 +107,83 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         else {
             return false;
         };
-        let zero_position = 31u32.div_ceil(shift);
+        let zero_position = 32u32.div_ceil(shift);
         let mask = (1u32 << shift) - 1;
+        if let [_, position] = args {
+            if let Some(position) = self.const_i32(*position) {
+                if position < 0 {
+                    self.body.push_str(&format!("  call {name}\n"));
+                    return true;
+                }
+                if (position as u32) >= zero_position {
+                    self.body.push_str("  li a0, 0\n");
+                    return true;
+                }
+                let amount = (position as u32) * shift;
+                let fallback = self
+                    .parent
+                    .ctx
+                    .fresh_label("pow2_digit_const_call_fallback");
+                let done = self.parent.ctx.fresh_label("pow2_digit_const_call_done");
+                self.body.push_str(&format!("  bltz a0, {fallback}\n"));
+                if amount != 0 {
+                    self.body.push_str(&format!("  sraiw a0, a0, {amount}\n"));
+                }
+                if mask <= 2047 {
+                    self.body.push_str(&format!("  andi a0, a0, {mask}\n"));
+                } else {
+                    self.body
+                        .push_str(&format!("  li t0, {mask}\n  and a0, a0, t0\n"));
+                }
+                self.body.push_str(&format!(
+                    "  j {done}\n{fallback}:\n  call {name}\n{done}:\n"
+                ));
+                return true;
+            }
+        }
+        let scale_position = if shift.is_power_of_two() {
+            format!("  slliw t1, a1, {}\n", shift.trailing_zeros())
+        } else {
+            format!("  li t0, {shift}\n  mulw t1, a1, t0\n")
+        };
+        let apply_mask = if mask <= 2047 {
+            format!("  andi a0, a0, {mask}\n")
+        } else {
+            format!("  li t0, {mask}\n  and a0, a0, t0\n")
+        };
         let fallback = self.parent.ctx.fresh_label("pow2_digit_call_fallback");
         let zero = self.parent.ctx.fresh_label("pow2_digit_call_zero");
         let done = self.parent.ctx.fresh_label("pow2_digit_call_done");
         self.body.push_str(&format!(
-            "  bltz a0, {fallback}\n  bltz a1, {fallback}\n  li t0, {zero_position}\n  bge a1, t0, {zero}\n  li t0, {shift}\n  mulw t1, a1, t0\n  sraw a0, a0, t1\n  li t0, {mask}\n  and a0, a0, t0\n  j {done}\n{zero}:\n  li a0, 0\n  j {done}\n{fallback}:\n  call {name}\n{done}:\n"
+            "  bltz a1, {fallback}\n  li t0, {zero_position}\n  bge a1, t0, {zero}\n  bltz a0, {fallback}\n{scale_position}  sraw a0, a0, t1\n{apply_mask}  j {done}\n{zero}:\n  li a0, 0\n  j {done}\n{fallback}:\n  call {name}\n{done}:\n"
+        ));
+        true
+    }
+
+    fn const_i32(&self, value: ValueId) -> Option<i32> {
+        match self.func.value(value).kind {
+            crate::ir::ValueKind::Const(crate::ir::Const::Int(value)) => Some(value),
+            crate::ir::ValueKind::Const(crate::ir::Const::Zero(Type::I32)) => Some(0),
+            _ => None,
+        }
+    }
+
+    fn emit_guarded_mulmod_call(&mut self, name: &str) -> bool {
+        let Some(modulus) = self
+            .parent
+            .ctx
+            .module
+            .funcs
+            .iter()
+            .find(|func| func.name == name)
+            .and_then(|func| func.guarded_mulmod_modulus())
+        else {
+            return false;
+        };
+        let fallback = self.parent.ctx.fresh_label("mulmod_call_fallback");
+        let done = self.parent.ctx.fresh_label("mulmod_call_done");
+        self.body.push_str(&format!(
+            "  bltz a0, {fallback}\n  bltz a1, {fallback}\n  li t0, {modulus}\n  bge a0, t0, {fallback}\n  bge a1, t0, {fallback}\n  mul t1, a0, a1\n  rem a0, t1, t0\n  j {done}\n{fallback}:\n  call {name}\n{done}:\n"
         ));
         true
     }
