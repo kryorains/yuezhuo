@@ -68,7 +68,7 @@ impl TargetCostModel {
                 regional_global_scalar_promotion: false,
                 producer_consumer_fusion: false,
                 periodic_reduction_memoize: false,
-                contract_float_madd: true,
+                contract_float_madd: false,
                 cleanup_write_only_allocas_before_inline: false,
                 max_reduction_jam_factor: 2,
                 min_global_register_score: 2,
@@ -203,6 +203,7 @@ mod tests {
         assert!(aarch64.cfg_inline_global_loads());
         assert!(aarch64.enable_loop_call_memoize());
         assert!(aarch64.enable_repeated_overwrite_elision());
+        assert!(!aarch64.contract_float_madd());
         assert!(!aarch64.cleanup_write_only_allocas_before_inline());
         assert!(riscv64.enable_simple_loop_unroll());
         assert_eq!(riscv64.small_expr_inline_rounds(), 2);
