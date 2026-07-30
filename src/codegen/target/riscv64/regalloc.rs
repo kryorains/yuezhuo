@@ -1,4 +1,4 @@
-use crate::codegen::common::{ir_value_use_counts, natural_loop_depths};
+use crate::codegen::common::{ir_value_use_counts, weighted_use_scores};
 use crate::ir::{Function, InstKind, Terminator, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
@@ -556,35 +556,6 @@ fn call_crossing_candidates(
         (std::cmp::Reverse(*uses), std::cmp::Reverse(*span), value.0)
     });
     candidates.into_iter().map(|(value, _, _)| value).collect()
-}
-
-pub(in crate::codegen::target) fn weighted_use_scores(func: &Function) -> Vec<usize> {
-    let loop_depths = natural_loop_depths(func);
-    let weight_for = |block_idx: usize| 1usize << loop_depths[block_idx].saturating_mul(4).min(20);
-    let mut scores = vec![0usize; func.values.len()];
-    for (block_idx, block) in func.blocks.iter().enumerate() {
-        let weight = weight_for(block_idx);
-        for inst in &block.insts {
-            match &inst.kind {
-                InstKind::Phi { incomings } => {
-                    for (pred, value) in incomings {
-                        scores[value.0] = scores[value.0].saturating_add(weight_for(pred.0));
-                    }
-                }
-                kind => {
-                    for value in inst_uses(kind) {
-                        scores[value.0] = scores[value.0].saturating_add(weight);
-                    }
-                }
-            }
-        }
-        if let Some(terminator) = &block.terminator {
-            for value in terminator_uses(terminator) {
-                scores[value.0] = scores[value.0].saturating_add(weight);
-            }
-        }
-    }
-    scores
 }
 
 fn cross_block_memory_candidates(

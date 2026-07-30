@@ -7,16 +7,20 @@ mod function_effects;
 mod gep_induction;
 mod global_const_prop;
 mod global_scalar_localize;
+mod guarded_mulmod;
+mod guarded_pow2_digit;
 mod inline;
 mod inst_combine;
 mod invariant_load;
 mod licm;
 mod local_forward;
 mod loop_analysis;
+mod loop_call_memoize;
 mod pointer_recurrence_coalesce;
 mod recursive_inline;
 mod reduction_jam;
 mod repeat_reduction;
+mod repeated_overwrite;
 mod scalar_promote;
 mod simple_loop_unroll;
 mod simplify_cfg;
@@ -31,15 +35,19 @@ use dce::DcePass;
 use gep_induction::GepInductionPass;
 use global_const_prop::GlobalConstPropPass;
 use global_scalar_localize::GlobalScalarLocalizePass;
+use guarded_mulmod::GuardedMulModPass;
+use guarded_pow2_digit::GuardedPow2DigitPass;
 use inline::InlineSmallExprPass;
 use inst_combine::InstCombinePass;
 use invariant_load::InvariantLoadForwardPass;
 use licm::LicmPass;
 use local_forward::LocalForwardPass;
+use loop_call_memoize::LoopCallMemoizePass;
 use pointer_recurrence_coalesce::PointerRecurrenceCoalescePass;
 use recursive_inline::{CfgInlinePass, RecursiveInlinePass};
 use reduction_jam::ReductionJamPass;
 use repeat_reduction::RepeatReductionPass;
+use repeated_overwrite::RepeatedOverwritePass;
 use scalar_promote::ScalarPromotePass;
 use simple_loop_unroll::SimpleLoopUnrollPass;
 use simplify_cfg::SimplifyCfgPass;
@@ -54,6 +62,12 @@ pub enum OptLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PassOptions {
     pub enable_simple_loop_unroll: bool,
+    pub cfg_inline_rounds: usize,
+    pub cfg_inline_global_loads: bool,
+    pub enable_loop_call_memoize: bool,
+    pub enable_repeated_overwrite_elision: bool,
+    pub enable_guarded_mulmod_idiom: bool,
+    pub enable_guarded_pow2_digit_idiom: bool,
     pub enable_write_only_alloca_cleanup_before_inline: bool,
 }
 
@@ -93,6 +107,12 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(GlobalScalarLocalizePass::new_across_no_memory_calls());
             pipeline.add(ScalarPromotePass::new());
+            if options.enable_guarded_mulmod_idiom {
+                pipeline.add(GuardedMulModPass::new());
+            }
+            if options.enable_guarded_pow2_digit_idiom {
+                pipeline.add(GuardedPow2DigitPass::new());
+            }
             pipeline.add(ConstSpecializePass::new());
             pipeline.add(ConstFoldPass::new());
             pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
@@ -103,7 +123,9 @@ pub fn run_pipeline_with_reduction_jam_factor(
             }
             pipeline.add(RecursiveInlinePass::new());
             pipeline.add(InlineSmallExprPass::new());
-            pipeline.add(CfgInlinePass::new());
+            for _ in 0..options.cfg_inline_rounds {
+                pipeline.add(CfgInlinePass::new(options.cfg_inline_global_loads));
+            }
             pipeline.add(LocalForwardPass::new());
             pipeline.add(CsePass::new());
             pipeline.add(LicmPass::new());
@@ -118,6 +140,12 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(InvariantLoadForwardPass::new());
             pipeline.add(DcePass::new());
             pipeline.add(RepeatReductionPass::new());
+            if options.enable_loop_call_memoize {
+                pipeline.add(LoopCallMemoizePass::new());
+            }
+            if options.enable_repeated_overwrite_elision {
+                pipeline.add(RepeatedOverwritePass::new());
+            }
             if options.enable_simple_loop_unroll {
                 pipeline.add(SimpleLoopUnrollPass::new(max_reduction_jam_factor));
             }

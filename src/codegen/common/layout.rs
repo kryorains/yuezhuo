@@ -13,25 +13,39 @@ pub(crate) struct IrFuncLayout {
 
 impl IrFuncLayout {
     pub(crate) fn new(func: &Function) -> Self {
+        Self::new_with_stack_slots(func, |_| true)
+    }
+
+    /// Builds a compact frame for values that really need spill storage.
+    ///
+    /// `alloca` objects are always retained because the predicate describes the
+    /// result pointer, not the separately allocated object that it addresses.
+    pub(crate) fn new_with_stack_slots(
+        func: &Function,
+        mut needs_stack_slot: impl FnMut(ValueId) -> bool,
+    ) -> Self {
         let mut layout = Self {
             offsets: HashMap::new(),
             stack_size: 0,
         };
         for (idx, value) in func.values.iter().enumerate() {
+            let value_id = ValueId(idx);
             let size = match &value.kind {
-                ValueKind::Param => ir_slot_size(&value.ty),
+                ValueKind::Param if needs_stack_slot(value_id) => ir_slot_size(&value.ty),
+                ValueKind::Param => 0,
                 ValueKind::Inst(block, inst_idx) => {
                     let inst = &func.block(*block).insts[*inst_idx];
                     match &inst.kind {
                         InstKind::Nop => 0,
                         InstKind::Alloca { ty } => 8 + ir_align_to(ir_size(ty), 8),
-                        _ => ir_slot_size(&value.ty),
+                        _ if needs_stack_slot(value_id) => ir_slot_size(&value.ty),
+                        _ => 0,
                     }
                 }
                 ValueKind::Const(_) | ValueKind::Global(_) => 0,
             };
             if size != 0 {
-                layout.alloc(ValueId(idx), size);
+                layout.alloc(value_id, size);
             }
         }
         layout

@@ -29,7 +29,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 };
                 self.load_value_into(args[idx], &format!("a{}", reg_idx));
             }
-            self.body.push_str(&format!("  call {}\n", name));
+            if !self.emit_guarded_pow2_digit_call(name) {
+                self.body.push_str(&format!("  call {}\n", name));
+            }
             if sig.ret == Type::F32 {
                 if let Some(result) = result {
                     self.store_float_result(result, "fa0");
@@ -89,5 +91,28 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             self.adjust_sp(cleanup);
         }
         sig.ret
+    }
+
+    fn emit_guarded_pow2_digit_call(&mut self, name: &str) -> bool {
+        let Some(shift) = self
+            .parent
+            .ctx
+            .module
+            .funcs
+            .iter()
+            .find(|func| func.name == name)
+            .and_then(|func| func.guarded_pow2_digit_shift())
+        else {
+            return false;
+        };
+        let zero_position = 31u32.div_ceil(shift);
+        let mask = (1u32 << shift) - 1;
+        let fallback = self.parent.ctx.fresh_label("pow2_digit_call_fallback");
+        let zero = self.parent.ctx.fresh_label("pow2_digit_call_zero");
+        let done = self.parent.ctx.fresh_label("pow2_digit_call_done");
+        self.body.push_str(&format!(
+            "  bltz a0, {fallback}\n  bltz a1, {fallback}\n  li t0, {zero_position}\n  bge a1, t0, {zero}\n  li t0, {shift}\n  mulw t1, a1, t0\n  sraw a0, a0, t1\n  li t0, {mask}\n  and a0, a0, t0\n  j {done}\n{zero}:\n  li a0, 0\n  j {done}\n{fallback}:\n  call {name}\n{done}:\n"
+        ));
+        true
     }
 }

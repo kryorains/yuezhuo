@@ -1,4 +1,5 @@
-use crate::codegen::common::{ir_value_use_counts, natural_loop_depths};
+use crate::codegen::common::{ir_value_use_counts, weighted_use_scores};
+use crate::codegen::Target;
 use crate::ir::{Function, InstKind, Terminator, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
@@ -32,9 +33,28 @@ impl AArch64PhiRegs {
         }
 
         let is_leaf = is_leaf(func);
+        let costs = Target::AArch64.cost_model();
         let scores = weighted_use_scores(func);
         let block_local_values = collect_block_local_values(func);
+        let call_crossing_values = collect_call_crossing_values(func);
         let direct_branch_conditions = collect_direct_branch_conditions(func);
+        let phi_copy_values = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| match &inst.kind {
+                InstKind::Phi { incomings } => Some(incomings),
+                _ => None,
+            })
+            .flatten()
+            .map(|(_, incoming)| *incoming)
+            .filter(|incoming| {
+                !matches!(
+                    func.value(*incoming).kind,
+                    ValueKind::Const(_) | ValueKind::Global(_)
+                )
+            })
+            .collect::<HashSet<_>>();
         let mut candidates = func
             .values
             .iter()
@@ -54,8 +74,15 @@ impl AArch64PhiRegs {
                 if !is_register_type(&value.ty)
                     || matches!(value.kind, ValueKind::Const(_) | ValueKind::Global(_))
                     || scores[idx] == 0
-                    || (scores[idx] < 2 && !is_phi)
-                    || (block_local_values.contains(&value_id) && !is_phi)
+                    || !costs.should_allocate_global_register(
+                        scores[idx],
+                        is_phi,
+                        phi_copy_values.contains(&value_id),
+                        call_crossing_values.contains(&value_id),
+                    )
+                    || (block_local_values.contains(&value_id)
+                        && !is_phi
+                        && !call_crossing_values.contains(&value_id))
                     || direct_branch_conditions.contains(&value_id)
                 {
                     return None;
@@ -465,34 +492,51 @@ fn collect_block_local_values(func: &Function) -> HashSet<ValueId> {
         .collect()
 }
 
-fn weighted_use_scores(func: &Function) -> Vec<usize> {
-    let loop_depths = natural_loop_depths(func);
-    let weight_for = |block_idx: usize| 1usize << loop_depths[block_idx].saturating_mul(4).min(20);
-    let mut scores = vec![0usize; func.values.len()];
-    for (block_idx, block) in func.blocks.iter().enumerate() {
-        let weight = weight_for(block_idx);
-        for inst in &block.insts {
-            match &inst.kind {
-                InstKind::Phi { incomings } => {
-                    for (pred, value) in incomings {
-                        let edge_weight = weight_for(pred.0);
-                        scores[value.0] = scores[value.0].saturating_add(edge_weight);
-                    }
-                }
-                kind => {
-                    for value in inst_operands(kind) {
-                        scores[value.0] = scores[value.0].saturating_add(weight);
-                    }
-                }
+fn collect_call_crossing_values(func: &Function) -> HashSet<ValueId> {
+    let mut crossing = HashSet::new();
+    for block in &func.blocks {
+        let calls = block
+            .insts
+            .iter()
+            .enumerate()
+            .filter_map(|(inst_idx, inst)| {
+                matches!(inst.kind, InstKind::Call { .. }).then_some(inst_idx)
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            continue;
+        }
+
+        let mut definitions = HashMap::<ValueId, usize>::new();
+        let mut last_uses = HashMap::<ValueId, usize>::new();
+        for (inst_idx, inst) in block.insts.iter().enumerate() {
+            if let Some(result) = inst.result {
+                definitions.insert(result, inst_idx);
+            }
+            for operand in inst_operands(&inst.kind) {
+                last_uses.insert(operand, inst_idx);
             }
         }
         if let Some(terminator) = &block.terminator {
-            for value in terminator_operands(terminator) {
-                scores[value.0] = scores[value.0].saturating_add(weight);
+            for operand in terminator_operands(terminator) {
+                last_uses.insert(operand, block.insts.len());
+            }
+        }
+
+        for (value, definition) in definitions {
+            let Some(last_use) = last_uses.get(&value).copied() else {
+                continue;
+            };
+            if !matches!(func.value(value).ty, Type::I1 | Type::I32 | Type::Ptr(_)) {
+                continue;
+            }
+            let next_call = calls.partition_point(|call| *call <= definition);
+            if calls.get(next_call).is_some_and(|call| *call < last_use) {
+                crossing.insert(value);
             }
         }
     }
-    scores
+    crossing
 }
 
 fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
@@ -552,5 +596,66 @@ mod tests {
         assert!(regs.reg(lhs).is_some());
         assert!(regs.reg(rhs).is_some());
         assert_ne!(regs.reg(lhs), regs.reg(rhs));
+    }
+
+    #[test]
+    fn coalesces_a_cold_entry_parameter_with_its_phi() {
+        let mut func = Function::new("entry_phi", Type::I32);
+        let param = func.add_param("value", Type::I32);
+        let header = func.add_block("header");
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        let phi = func
+            .append_inst(
+                header,
+                InstKind::Phi {
+                    incomings: vec![(func.entry, param)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(header, Terminator::Return(Some(phi)));
+
+        let regs = AArch64PhiRegs::new(&func);
+
+        assert_eq!(regs.reg(param), regs.reg(phi));
+        assert!(regs.reg(phi).is_some());
+    }
+
+    #[test]
+    fn allocates_a_block_local_pointer_that_crosses_a_call() {
+        let mut func = Function::new("call_crossing_pointer", Type::Void);
+        let base = func.add_param("base", Type::Ptr(Box::new(Type::I32)));
+        let zero = func.add_const(crate::ir::Const::Int(0));
+        let pointer = func
+            .append_inst(
+                func.entry,
+                InstKind::Gep {
+                    base,
+                    indices: vec![zero],
+                },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        func.append_inst(
+            func.entry,
+            InstKind::Call {
+                name: "side_effect".into(),
+                args: Vec::new(),
+            },
+            None,
+        );
+        func.append_inst(
+            func.entry,
+            InstKind::Store {
+                ptr: pointer,
+                value: zero,
+            },
+            None,
+        );
+        func.set_terminator(func.entry, Terminator::Return(None));
+
+        let regs = AArch64PhiRegs::new(&func);
+
+        assert!(regs.reg(pointer).is_some());
     }
 }

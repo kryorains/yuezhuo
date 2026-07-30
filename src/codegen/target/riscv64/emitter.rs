@@ -126,6 +126,8 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit(mut self) {
+        let guarded_mulmod = self.guarded_mulmod_prelude();
+        let guarded_pow2_digit = self.guarded_pow2_digit_prelude();
         let early_return = entry_early_return(self.func).and_then(|plan| {
             self.pre_prologue_early_return(&plan)
                 .map(|prelude| (plan, prelude))
@@ -191,6 +193,12 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             ".p2align {1}\n.globl {0}\n.type {0}, @function\n{0}:\n",
             self.func.name, function_alignment
         ));
+        if let Some(prelude) = &guarded_mulmod {
+            self.parent.out.push_str(prelude);
+        }
+        if let Some(prelude) = &guarded_pow2_digit {
+            self.parent.out.push_str(prelude);
+        }
         if let Some((_, prelude)) = &early_return {
             self.parent.out.push_str(prelude);
         }

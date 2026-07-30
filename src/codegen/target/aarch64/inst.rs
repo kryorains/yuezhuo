@@ -1,4 +1,6 @@
+use super::imm::mov_w_imm;
 use super::AArch64IrFuncEmitter;
+use crate::codegen::common::signed_magic_positive;
 use crate::ir::{
     BinaryOp, BlockId, CastOp, CmpOp, Const, Inst, InstKind, Terminator, Type, UnaryOp, ValueId,
     ValueKind,
@@ -23,18 +25,20 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             InstKind::Load { ptr } => {
                 let result = inst.result.unwrap();
                 if !self.emit_assigned_load(result, *ptr) {
-                    self.load_value(*ptr);
+                    let (base, offset) = self.memory_address(*ptr);
+                    self.load_value(base);
                     let ty = self.func.value(result).ty.clone();
-                    self.load_indirect(&ty);
+                    self.load_indirect_offset(&ty, offset);
                     self.store_result(result);
                 }
             }
             InstKind::Store { ptr, value } => {
                 if !self.emit_assigned_store(*ptr, *value) {
-                    self.load_value_into(*ptr, "x1");
+                    let (base, offset) = self.memory_address(*ptr);
+                    self.load_value_into(base, "x1");
                     self.load_value(*value);
                     let ty = self.func.value(*value).ty.clone();
-                    self.store_indirect(&ty);
+                    self.store_indirect_offset(&ty, offset);
                 }
             }
             InstKind::MemZero { ptr, bytes } => self.emit_memzero(*ptr, *bytes),
@@ -53,6 +57,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     return;
                 }
                 if (*op == BinaryOp::Imul && self.fused_madd_user(result).is_some())
+                    || (*op == BinaryOp::Fmul
+                        && (self.fused_float_madd_user(result).is_some()
+                            || self.fused_float_msub_user(result).is_some()))
                     || (*op == BinaryOp::Iand && self.fused_bit_test_branch_user(result))
                 {
                     return;
@@ -77,6 +84,42 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                             self.load_value_into(addend, "x2");
                             self.body.push_str("  madd w0, w1, w0, w2\n");
                             self.store_result(result);
+                        }
+                        return;
+                    }
+                }
+                if *op == BinaryOp::Fadd {
+                    if let Some((mul_lhs, mul_rhs, addend)) =
+                        self.fused_float_madd_operands(result, *lhs, *rhs)
+                    {
+                        let mul_lhs = self.load_or_assigned_float(mul_lhs, "s2");
+                        let mul_rhs = self.load_or_assigned_float(mul_rhs, "s1");
+                        let addend = self.load_or_assigned_float(addend, "s0");
+                        let destination = self.assigned_float_reg(result).unwrap_or("s0");
+                        self.body.push_str(&format!(
+                            "  fmadd {}, {}, {}, {}\n",
+                            destination, mul_lhs, mul_rhs, addend
+                        ));
+                        if self.assigned_float_reg(result).is_none() {
+                            self.store_float_result(result, destination);
+                        }
+                        return;
+                    }
+                }
+                if *op == BinaryOp::Fsub {
+                    if let Some((instruction, mul_lhs, mul_rhs, addend)) =
+                        self.fused_float_msub_operands(result, *lhs, *rhs)
+                    {
+                        let mul_lhs = self.load_or_assigned_float(mul_lhs, "s2");
+                        let mul_rhs = self.load_or_assigned_float(mul_rhs, "s1");
+                        let addend = self.load_or_assigned_float(addend, "s0");
+                        let destination = self.assigned_float_reg(result).unwrap_or("s0");
+                        self.body.push_str(&format!(
+                            "  {} {}, {}, {}, {}\n",
+                            instruction, destination, mul_lhs, mul_rhs, addend
+                        ));
+                        if self.assigned_float_reg(result).is_none() {
+                            self.store_float_result(result, destination);
                         }
                         return;
                     }
@@ -112,6 +155,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Gep { base, indices } => {
                 let result = inst.result.unwrap();
+                if self.skips_folded_memory_gep(result) {
+                    return;
+                }
                 if !self.emit_assigned_gep(result, *base, indices) {
                     self.emit_gep(result, *base, indices);
                     self.store_result(result);
@@ -600,6 +646,100 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         }
     }
 
+    fn fused_float_madd_user(&self, multiply: ValueId) -> Option<ValueId> {
+        if self.value_use_counts[multiply.0] != 1 {
+            return None;
+        }
+        let ValueKind::Inst(block, inst_idx) = self.func.value(multiply).kind else {
+            return None;
+        };
+        let next = self.func.block(block).insts.get(inst_idx + 1)?;
+        let result = next.result?;
+        matches!(
+            next.kind,
+            InstKind::Binary {
+                op: BinaryOp::Fadd,
+                lhs,
+                rhs,
+            } if lhs == multiply || rhs == multiply
+        )
+        .then_some(result)
+    }
+
+    fn fused_float_madd_operands(
+        &self,
+        add: ValueId,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Option<(ValueId, ValueId, ValueId)> {
+        let (multiply, addend) = if self.fused_float_madd_user(lhs) == Some(add) {
+            (lhs, rhs)
+        } else if self.fused_float_madd_user(rhs) == Some(add) {
+            (rhs, lhs)
+        } else {
+            return None;
+        };
+        let ValueKind::Inst(block, inst_idx) = self.func.value(multiply).kind else {
+            return None;
+        };
+        match self.func.block(block).insts.get(inst_idx)?.kind {
+            InstKind::Binary {
+                op: BinaryOp::Fmul,
+                lhs,
+                rhs,
+            } => Some((lhs, rhs, addend)),
+            _ => None,
+        }
+    }
+
+    fn fused_float_msub_user(&self, multiply: ValueId) -> Option<ValueId> {
+        if self.value_use_counts[multiply.0] != 1 {
+            return None;
+        }
+        let ValueKind::Inst(block, inst_idx) = self.func.value(multiply).kind else {
+            return None;
+        };
+        let next = self.func.block(block).insts.get(inst_idx + 1)?;
+        let result = next.result?;
+        matches!(
+            next.kind,
+            InstKind::Binary {
+                op: BinaryOp::Fsub,
+                lhs,
+                rhs,
+            } if lhs == multiply || rhs == multiply
+        )
+        .then_some(result)
+    }
+
+    fn fused_float_msub_operands(
+        &self,
+        subtract: ValueId,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Option<(&'static str, ValueId, ValueId, ValueId)> {
+        let (instruction, multiply, addend) = if self.fused_float_msub_user(rhs) == Some(subtract) {
+            // AArch64 FMSUB computes the accumulator minus the product.
+            ("fmsub", rhs, lhs)
+        } else if self.fused_float_msub_user(lhs) == Some(subtract) {
+            // FNMSUB computes the product minus the accumulator.
+            ("fnmsub", lhs, rhs)
+        } else {
+            return None;
+        };
+        let ValueKind::Inst(block, inst_idx) = self.func.value(multiply).kind else {
+            return None;
+        };
+        match self.func.block(block).insts.get(inst_idx)?.kind {
+            InstKind::Binary {
+                op: BinaryOp::Fmul,
+                lhs,
+                rhs,
+            } => Some((instruction, lhs, rhs, addend)),
+            _ => None,
+        }
+    }
+
     fn emit_unary(&mut self, op: UnaryOp, value: ValueId) {
         self.load_value(value);
         match op {
@@ -690,14 +830,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 }
             }
             BinaryOp::Idiv | BinaryOp::Imod => {
-                if let (Some(source), Some(shift)) =
-                    (self.assigned_w_reg(lhs), pow2_shift(self.func, rhs))
-                {
-                    self.emit_assigned_signed_divmod_pow2(
-                        &destination,
-                        &source,
-                        shift,
+                if let Some(divisor) = const_i32(self.func, rhs) {
+                    self.emit_signed_divmod_const_into(
+                        lhs,
+                        divisor,
                         op == BinaryOp::Imod,
+                        &destination,
                     );
                     return true;
                 }
@@ -873,8 +1011,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 }
             }
             BinaryOp::Idiv | BinaryOp::Imod => {
-                if let Some(shift) = pow2_shift(self.func, rhs) {
-                    self.emit_signed_divmod_pow2(lhs, shift, op == BinaryOp::Imod);
+                if let Some(divisor) = const_i32(self.func, rhs) {
+                    self.emit_signed_divmod_const_into(lhs, divisor, op == BinaryOp::Imod, "w0");
                     return true;
                 }
             }
@@ -905,11 +1043,6 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         }
 
         false
-    }
-
-    fn emit_signed_divmod_pow2(&mut self, value: ValueId, shift: u32, remainder: bool) {
-        self.load_value(value);
-        self.emit_assigned_signed_divmod_pow2("w0", "w0", shift, remainder);
     }
 
     fn emit_assigned_signed_divmod_pow2(
@@ -962,6 +1095,95 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 destination,
                 shift
             ));
+        }
+    }
+
+    fn emit_signed_divmod_const_into(
+        &mut self,
+        value: ValueId,
+        divisor: i32,
+        remainder: bool,
+        destination: &str,
+    ) {
+        let source = if let Some(source) = self.assigned_w_reg(value) {
+            source
+        } else {
+            self.load_value(value);
+            "w0".to_string()
+        };
+
+        if divisor == 0 {
+            if remainder {
+                if destination != source {
+                    self.body
+                        .push_str(&format!("  mov {}, {}\n", destination, source));
+                }
+            } else {
+                self.body.push_str(&format!("  mov {}, wzr\n", destination));
+            }
+            return;
+        }
+        if divisor == 1 || divisor == -1 {
+            if remainder {
+                self.body.push_str(&format!("  mov {}, wzr\n", destination));
+            } else if divisor < 0 {
+                self.body
+                    .push_str(&format!("  neg {}, {}\n", destination, source));
+            } else if destination != source {
+                self.body
+                    .push_str(&format!("  mov {}, {}\n", destination, source));
+            }
+            return;
+        }
+
+        let abs_divisor = divisor.unsigned_abs();
+        if abs_divisor.is_power_of_two() {
+            self.emit_assigned_signed_divmod_pow2(
+                destination,
+                &source,
+                abs_divisor.trailing_zeros(),
+                remainder,
+            );
+            if divisor < 0 && !remainder {
+                self.body
+                    .push_str(&format!("  neg {}, {}\n", destination, destination));
+            }
+            return;
+        }
+
+        if remainder {
+            self.body.push_str(&format!("  mov w3, {}\n", source));
+        }
+        let magic = signed_magic_positive(abs_divisor);
+        self.body.push_str(&mov_w_imm("w1", magic.multiplier));
+        self.body
+            .push_str(&format!("  smull x2, {}, w1\n  asr x2, x2, #32\n", source));
+        if magic.add_dividend {
+            self.body.push_str(&format!("  add w2, w2, {}\n", source));
+        }
+        if magic.shift != 0 {
+            self.body
+                .push_str(&format!("  asr w2, w2, #{}\n", magic.shift));
+        }
+        self.body.push_str("  add w2, w2, w2, lsr #31\n");
+
+        if divisor < 0 && !remainder {
+            self.body.push_str("  neg w2, w2\n");
+        }
+        if remainder {
+            if abs_divisor.checked_add(1).is_some_and(u32::is_power_of_two) {
+                self.body.push_str(&format!(
+                    "  lsl w1, w2, #{}\n  sub w2, w1, w2\n",
+                    (abs_divisor + 1).trailing_zeros()
+                ));
+            } else {
+                self.body.push_str(&mov_w_imm("w1", abs_divisor as i32));
+                self.body.push_str("  mul w2, w2, w1\n");
+            }
+            self.body
+                .push_str(&format!("  sub {}, w3, w2\n", destination));
+        } else if destination != "w2" {
+            self.body.push_str(&format!("  mov {}, w2\n", destination));
         }
     }
 

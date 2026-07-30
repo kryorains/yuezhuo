@@ -1,7 +1,22 @@
 use super::imm::{mov_w_imm, mov_x_imm};
 use super::AArch64IrFuncEmitter;
 use crate::codegen::common::{gep_elem_type, ir_size, pointee};
-use crate::ir::{Const, Type, ValueId, ValueKind};
+use crate::ir::{Const, Function, InstKind, Type, ValueId, ValueKind};
+use std::collections::HashMap;
+
+const MAX_FOLDED_MEMORY_BLOCKS: usize = 1024;
+const MAX_FOLDED_MEMORY_VALUES: usize = 8192;
+const MAX_FOLDED_MEMORY_INSTRUCTIONS: usize = 32_768;
+const MAX_FOLDED_MEMORY_USES: usize = 65_536;
+const MAX_FOLDED_MEMORY_GEPS: usize = 1024;
+const MAX_FOLDED_MEMORY_TYPE_NODES: usize = 128;
+const MAX_FOLDED_MEMORY_CLONE_TYPE_NODES: usize = 65_536;
+
+#[derive(Clone, Copy)]
+pub(super) struct FoldedMemoryGep {
+    pub(super) base: ValueId,
+    offset: i32,
+}
 
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     pub(super) fn emit_memzero(&mut self, ptr: ValueId, bytes: usize) {
@@ -33,64 +48,99 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn emit_assigned_load(&mut self, result: ValueId, ptr: ValueId) -> bool {
+        let (base, offset) = self.memory_address(ptr);
         if self.func.value(result).ty == Type::F32 {
             let Some(destination) = self.assigned_float_reg(result) else {
                 return false;
             };
-            let pointer = if let Some(pointer) = self.assigned_x_reg(ptr) {
+            let pointer = if let Some(pointer) = self.assigned_x_reg(base) {
                 pointer
             } else {
-                self.load_value_into(ptr, "x1");
+                self.load_value_into(base, "x1");
                 "x1"
             };
-            self.body
-                .push_str(&format!("  ldr {}, [{}]\n", destination, pointer));
+            if offset == 0 {
+                self.body
+                    .push_str(&format!("  ldr {}, [{}]\n", destination, pointer));
+            } else {
+                self.load_base_s(destination, pointer, offset);
+            }
             return true;
         }
-        let (Some(destination), Some(pointer)) =
-            (self.assigned_x_reg(result), self.assigned_x_reg(ptr))
-        else {
+        let Some(destination) = self.assigned_x_reg(result) else {
             return false;
         };
+        let pointer = if let Some(pointer) = self.assigned_x_reg(base) {
+            pointer
+        } else {
+            self.load_value_into(base, "x1");
+            "x1"
+        };
         match self.func.value(result).ty {
-            Type::Ptr(_) => self
+            Type::Ptr(_) if offset == 0 => self
                 .body
                 .push_str(&format!("  ldr {}, [{}]\n", destination, pointer)),
-            _ => self
-                .body
-                .push_str(&format!("  ldr {}, [{}]\n", w_reg(destination), pointer)),
+            Type::Ptr(_) => self.load_base_x(destination, pointer, offset),
+            _ if offset == 0 => {
+                self.body
+                    .push_str(&format!("  ldr {}, [{}]\n", w_reg(destination), pointer))
+            }
+            _ => self.load_base_w(&w_reg(destination), pointer, offset),
         }
         true
     }
 
     pub(super) fn emit_assigned_store(&mut self, ptr: ValueId, value: ValueId) -> bool {
+        let (base, offset) = self.memory_address(ptr);
         if self.func.value(value).ty == Type::F32 {
             let Some(source) = self.assigned_float_reg(value) else {
                 return false;
             };
-            let pointer = if let Some(pointer) = self.assigned_x_reg(ptr) {
+            let pointer = if let Some(pointer) = self.assigned_x_reg(base) {
                 pointer
             } else {
-                self.load_value_into(ptr, "x1");
+                self.load_value_into(base, "x1");
                 "x1"
             };
-            self.body
-                .push_str(&format!("  str {}, [{}]\n", source, pointer));
+            if offset == 0 {
+                self.body
+                    .push_str(&format!("  str {}, [{}]\n", source, pointer));
+            } else {
+                self.store_base_s(source, pointer, offset);
+            }
             return true;
         }
-        let (Some(pointer), Some(source)) = (self.assigned_x_reg(ptr), self.assigned_x_reg(value))
-        else {
+        let Some(source) = self.assigned_x_reg(value) else {
             return false;
         };
+        let pointer = if let Some(pointer) = self.assigned_x_reg(base) {
+            pointer
+        } else {
+            self.load_value_into(base, "x1");
+            "x1"
+        };
         match self.func.value(value).ty {
-            Type::Ptr(_) => self
+            Type::Ptr(_) if offset == 0 => self
                 .body
                 .push_str(&format!("  str {}, [{}]\n", source, pointer)),
-            _ => self
-                .body
-                .push_str(&format!("  str {}, [{}]\n", w_reg(source), pointer)),
+            Type::Ptr(_) => self.store_base_x(source, pointer, offset),
+            _ if offset == 0 => {
+                self.body
+                    .push_str(&format!("  str {}, [{}]\n", w_reg(source), pointer))
+            }
+            _ => self.store_base_w(&w_reg(source), pointer, offset),
         }
         true
+    }
+
+    pub(super) fn memory_address(&self, ptr: ValueId) -> (ValueId, i32) {
+        self.folded_memory_geps
+            .get(&ptr)
+            .map_or((ptr, 0), |address| (address.base, address.offset))
+    }
+
+    pub(super) fn skips_folded_memory_gep(&self, result: ValueId) -> bool {
+        self.folded_memory_geps.contains_key(&result)
     }
 
     pub(super) fn emit_assigned_gep(
@@ -337,17 +387,21 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         }
     }
 
-    pub(super) fn load_indirect(&mut self, ty: &Type) {
+    pub(super) fn load_indirect_offset(&mut self, ty: &Type, offset: i32) {
         match ty {
-            Type::Ptr(_) => self.body.push_str("  ldr x0, [x0]\n"),
-            _ => self.body.push_str("  ldr w0, [x0]\n"),
+            Type::Ptr(_) if offset == 0 => self.body.push_str("  ldr x0, [x0]\n"),
+            Type::Ptr(_) => self.load_base_x("x0", "x0", offset),
+            _ if offset == 0 => self.body.push_str("  ldr w0, [x0]\n"),
+            _ => self.load_base_w("w0", "x0", offset),
         }
     }
 
-    pub(super) fn store_indirect(&mut self, ty: &Type) {
+    pub(super) fn store_indirect_offset(&mut self, ty: &Type, offset: i32) {
         match ty {
-            Type::Ptr(_) => self.body.push_str("  str x0, [x1]\n"),
-            _ => self.body.push_str("  str w0, [x1]\n"),
+            Type::Ptr(_) if offset == 0 => self.body.push_str("  str x0, [x1]\n"),
+            Type::Ptr(_) => self.store_base_x("x0", "x1", offset),
+            _ if offset == 0 => self.body.push_str("  str w0, [x1]\n"),
+            _ => self.store_base_w("w0", "x1", offset),
         }
     }
 
@@ -407,6 +461,7 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn frame_addr(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.base_addr(dst, "x29", offset);
     }
 
@@ -431,26 +486,32 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_frame_x(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.load_base_x(dst, "x29", offset);
     }
 
     pub(super) fn load_frame_w(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.load_base_w(dst, "x29", offset);
     }
 
     pub(super) fn load_frame_s(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.load_base_s(dst, "x29", offset);
     }
 
     pub(super) fn store_frame_x(&mut self, src: &str, offset: i32) {
+        self.frame_accessed = true;
         self.store_base_x(src, "x29", offset);
     }
 
     pub(super) fn store_frame_w(&mut self, src: &str, offset: i32) {
+        self.frame_accessed = true;
         self.store_base_w(src, "x29", offset);
     }
 
     pub(super) fn store_frame_s(&mut self, src: &str, offset: i32) {
+        self.frame_accessed = true;
         self.store_base_s(src, "x29", offset);
     }
 
@@ -557,6 +618,231 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     pub(super) fn object_offset(&self, value: ValueId, _ty: &Type) -> i32 {
         self.layout.offset(value) + 8
     }
+}
+
+/// Selects constant single-index GEPs whose complete use set consists of
+/// correctly typed loads/stores and whose byte offset fits an AArch64 memory
+/// operand. Selected GEPs can be omitted from both allocation and emission.
+pub(super) fn collect_folded_memory_geps(
+    func: &Function,
+    value_use_counts: &[usize],
+) -> HashMap<ValueId, FoldedMemoryGep> {
+    let instruction_count = func
+        .blocks
+        .iter()
+        .try_fold(0usize, |total, block| total.checked_add(block.insts.len()));
+    let use_count = value_use_counts
+        .iter()
+        .try_fold(0usize, |total, count| total.checked_add(*count));
+    if value_use_counts.len() != func.values.len()
+        || !function_types_fit_clone_budget(func)
+        || func.blocks.len() > MAX_FOLDED_MEMORY_BLOCKS
+        || func.values.len() > MAX_FOLDED_MEMORY_VALUES
+        || instruction_count.is_none_or(|count| count > MAX_FOLDED_MEMORY_INSTRUCTIONS)
+        || use_count.is_none_or(|count| count > MAX_FOLDED_MEMORY_USES)
+    {
+        return HashMap::new();
+    }
+
+    let mut memory_pointer_uses = vec![0usize; func.values.len()];
+    let mut exact_pointer_types = vec![true; func.values.len()];
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let (ptr, access_ty) = match &inst.kind {
+                InstKind::Load { ptr } => {
+                    let Some(result) = inst.result else {
+                        if let Some(exact) = exact_pointer_types.get_mut(ptr.0) {
+                            *exact = false;
+                        }
+                        continue;
+                    };
+                    (*ptr, func.values.get(result.0).map(|value| &value.ty))
+                }
+                InstKind::Store { ptr, value } => {
+                    (*ptr, func.values.get(value.0).map(|value| &value.ty))
+                }
+                _ => continue,
+            };
+            let Some(count) = memory_pointer_uses.get_mut(ptr.0) else {
+                continue;
+            };
+            *count = count.saturating_add(1);
+            let exact = match (func.values.get(ptr.0), access_ty) {
+                (Some(pointer), Some(access_ty)) => match &pointer.ty {
+                    Type::Ptr(pointee) => types_equal_bounded(pointee, access_ty),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !exact {
+                exact_pointer_types[ptr.0] = false;
+            }
+        }
+    }
+
+    let mut folded = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let (Some(result), InstKind::Gep { base, indices }) = (inst.result, &inst.kind) else {
+                continue;
+            };
+            let [index] = indices.as_slice() else {
+                continue;
+            };
+            let Some(total_uses) = value_use_counts.get(result.0).copied() else {
+                continue;
+            };
+            if total_uses == 0
+                || memory_pointer_uses.get(result.0).copied() != Some(total_uses)
+                || exact_pointer_types.get(result.0) != Some(&true)
+            {
+                continue;
+            }
+            let Some(stride) = strict_single_index_stride(func, *base, result) else {
+                continue;
+            };
+            let Some(offset) = const_gep_offset(func, *index, stride)
+                .and_then(|offset| i32::try_from(offset).ok())
+                .filter(|offset| *offset != 0 && direct_mem_op(*offset, stride).is_some())
+            else {
+                continue;
+            };
+            if folded.len() == MAX_FOLDED_MEMORY_GEPS {
+                return HashMap::new();
+            }
+            folded.insert(
+                result,
+                FoldedMemoryGep {
+                    base: *base,
+                    offset,
+                },
+            );
+        }
+    }
+    folded
+}
+
+pub(super) fn rewrite_folded_memory_uses_for_allocation(
+    func: &mut Function,
+    folded: &HashMap<ValueId, FoldedMemoryGep>,
+) {
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            match &mut inst.kind {
+                InstKind::Load { ptr } | InstKind::Store { ptr, .. } => {
+                    if let Some(address) = folded.get(ptr) {
+                        *ptr = address.base;
+                    }
+                }
+                _ => {}
+            }
+            if inst
+                .result
+                .is_some_and(|result| folded.contains_key(&result))
+            {
+                inst.result = None;
+                inst.kind = InstKind::Nop;
+            }
+        }
+    }
+}
+
+fn function_types_fit_clone_budget(func: &Function) -> bool {
+    let mut roots = func
+        .values
+        .iter()
+        .map(|value| &value.ty)
+        .collect::<Vec<_>>();
+    roots.extend(func.blocks.iter().flat_map(|block| {
+        block.insts.iter().filter_map(|inst| match &inst.kind {
+            InstKind::Alloca { ty } => Some(ty),
+            _ => None,
+        })
+    }));
+    let mut total = 0usize;
+    for root in roots {
+        let mut worklist = vec![(root, 1usize)];
+        while let Some((ty, depth)) = worklist.pop() {
+            total = match total.checked_add(1) {
+                Some(total) if total <= MAX_FOLDED_MEMORY_CLONE_TYPE_NODES => total,
+                _ => return false,
+            };
+            if depth > MAX_FOLDED_MEMORY_TYPE_NODES {
+                return false;
+            }
+            match ty {
+                Type::Ptr(inner) => worklist.push((inner, depth + 1)),
+                Type::Array { elem, .. } => worklist.push((elem, depth + 1)),
+                Type::Void | Type::I1 | Type::I32 | Type::F32 => {}
+            }
+        }
+    }
+    true
+}
+
+fn strict_single_index_stride(func: &Function, base: ValueId, result: ValueId) -> Option<i32> {
+    let Type::Ptr(base_pointee) = &func.values.get(base.0)?.ty else {
+        return None;
+    };
+    let Type::Ptr(result_pointee) = &func.values.get(result.0)?.ty else {
+        return None;
+    };
+    let compatible = types_equal_bounded(base_pointee, result_pointee)
+        || matches!(
+            base_pointee.as_ref(),
+            Type::Array { elem, .. } if types_equal_bounded(elem, result_pointee)
+        );
+    compatible
+        .then(|| checked_type_size(result_pointee))
+        .flatten()
+        .filter(|size| *size > 0)
+}
+
+fn checked_type_size(ty: &Type) -> Option<i32> {
+    let mut current = ty;
+    let mut elements = 1i32;
+    for _ in 0..MAX_FOLDED_MEMORY_TYPE_NODES {
+        match current {
+            Type::Void => return Some(0),
+            Type::I1 | Type::I32 | Type::F32 => return elements.checked_mul(4),
+            Type::Ptr(_) => return elements.checked_mul(8),
+            Type::Array { elem, len } => {
+                elements = elements.checked_mul(i32::try_from(*len).ok()?)?;
+                current = elem;
+            }
+        }
+    }
+    None
+}
+
+fn types_equal_bounded(mut lhs: &Type, mut rhs: &Type) -> bool {
+    for _ in 0..MAX_FOLDED_MEMORY_TYPE_NODES {
+        match (lhs, rhs) {
+            (Type::Void, Type::Void)
+            | (Type::I1, Type::I1)
+            | (Type::I32, Type::I32)
+            | (Type::F32, Type::F32) => return true,
+            (Type::Ptr(lhs_inner), Type::Ptr(rhs_inner)) => {
+                lhs = lhs_inner;
+                rhs = rhs_inner;
+            }
+            (
+                Type::Array {
+                    elem: lhs_elem,
+                    len: lhs_len,
+                },
+                Type::Array {
+                    elem: rhs_elem,
+                    len: rhs_len,
+                },
+            ) if lhs_len == rhs_len => {
+                lhs = lhs_elem;
+                rhs = rhs_elem;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn w_reg(x_reg: &str) -> String {

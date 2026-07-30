@@ -1,13 +1,21 @@
 mod common;
+mod cost;
 pub mod target;
 
 use crate::ir::Module;
+pub use cost::TargetCostModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     X86_64,
     AArch64,
     Riscv64,
+}
+
+impl Target {
+    pub const fn cost_model(self) -> TargetCostModel {
+        TargetCostModel::for_target(self)
+    }
 }
 
 pub fn emit_asm(target: Target, module: &Module) -> String {
