@@ -54,6 +54,7 @@ pub enum OptLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PassOptions {
     pub enable_simple_loop_unroll: bool,
+    pub enable_write_only_alloca_cleanup_before_inline: bool,
 }
 
 pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptions) {
@@ -81,7 +82,11 @@ pub fn run_pipeline_with_reduction_jam_factor(
             // 先传播只读全局常量、折叠常量和清理死代码，再做标量提升/局部转发。
             pipeline.add(GlobalConstPropPass::new());
             pipeline.add(ConstFoldPass::new());
-            pipeline.add(DcePass::new());
+            if options.enable_write_only_alloca_cleanup_before_inline {
+                pipeline.add(DcePass::new());
+            } else {
+                pipeline.add(DcePass::preserving_write_only_allocas());
+            }
             pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
             pipeline.add(TailRecursionPass::new());
             pipeline.add(GlobalScalarLocalizePass::new());
@@ -91,7 +96,11 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(ConstSpecializePass::new());
             pipeline.add(ConstFoldPass::new());
             pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
-            pipeline.add(DcePass::new());
+            if options.enable_write_only_alloca_cleanup_before_inline {
+                pipeline.add(DcePass::new());
+            } else {
+                pipeline.add(DcePass::preserving_write_only_allocas());
+            }
             pipeline.add(RecursiveInlinePass::new());
             pipeline.add(InlineSmallExprPass::new());
             pipeline.add(CfgInlinePass::new());

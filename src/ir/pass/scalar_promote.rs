@@ -324,6 +324,8 @@ fn insert_phi(func: &mut Function, block: BlockId, ty: Type) -> ValueId {
     .unwrap()
 }
 
+// The explicit state parameters keep the recursive SSA renaming flow local and auditable.
+#[allow(clippy::too_many_arguments)]
 fn rename_block(
     func: &mut Function,
     block: BlockId,

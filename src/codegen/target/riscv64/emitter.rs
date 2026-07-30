@@ -1,4 +1,3 @@
-use super::regalloc::Riscv64RegAlloc;
 use super::{Riscv64IrEmitter, Riscv64IrFuncEmitter};
 use crate::codegen::common::{
     emit_ir_data_section, entry_early_return, ir_align_to, loop_rotated_block_order,
@@ -102,11 +101,18 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             );
         }
         let allocation_func = allocation_view.as_ref().unwrap_or(func);
+        let regalloc = super::regalloc::Riscv64RegAlloc::new(allocation_func);
+        let float_regalloc = super::regalloc::Riscv64FloatRegAlloc::new(allocation_func);
+        let saved_slot_count =
+            regalloc.used_regs().len() + float_regalloc.used_callee_saved().len();
+        let saved_area_size = ir_align_to((saved_slot_count as i32) * 8, 16);
         Self {
             parent,
             func,
             layout: IrFuncLayout::new(func),
-            regalloc: Riscv64RegAlloc::new(allocation_func),
+            regalloc,
+            float_regalloc,
+            saved_area_size,
             local_regs: crate::codegen::common::IrLocalRegs::new(
                 allocation_func,
                 &["t3", "t4", "t5", "t6"],
@@ -160,8 +166,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         }
         let setup = self.body[..setup_end].to_string();
         let blocks = self.body[setup_end..].to_string();
-        let saved_regs = self.regalloc.used_regs().to_vec();
-        let stack_size = ir_align_to(self.layout.stack_size + self.regalloc.saved_area_size(), 16);
+        let saved_int_regs = self.regalloc.used_regs().to_vec();
+        let saved_float_regs = self.float_regalloc.used_callee_saved().to_vec();
+        let stack_size = ir_align_to(self.layout.stack_size + self.saved_area_size, 16);
         let leaf = !self.func.blocks.iter().any(|block| {
             block
                 .insts
@@ -203,20 +210,32 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     .push_str(&format!("  li t6, {}\n  sub sp, sp, t6\n", stack_size));
             }
         }
-        for (idx, reg) in saved_regs.iter().enumerate() {
+        for (idx, reg) in saved_int_regs.iter().enumerate() {
             self.parent
                 .out
                 .push_str(&format!("  sd {}, -{}(s0)\n", reg, (idx + 1) * 8));
+        }
+        for (idx, reg) in saved_float_regs.iter().enumerate() {
+            let slot = saved_int_regs.len() + idx + 1;
+            self.parent
+                .out
+                .push_str(&format!("  fsd {}, -{}(s0)\n", reg, slot * 8));
         }
         self.parent.out.push_str(&setup);
         self.parent.out.push_str(&blocks);
         self.parent
             .out
             .push_str(&format!("{}:\n", self.return_label));
-        for (idx, reg) in saved_regs.iter().enumerate() {
+        for (idx, reg) in saved_int_regs.iter().enumerate() {
             self.parent
                 .out
                 .push_str(&format!("  ld {}, -{}(s0)\n", reg, (idx + 1) * 8));
+        }
+        for (idx, reg) in saved_float_regs.iter().enumerate() {
+            let slot = saved_int_regs.len() + idx + 1;
+            self.parent
+                .out
+                .push_str(&format!("  fld {}, -{}(s0)\n", reg, slot * 8));
         }
         self.parent.out.push_str("  mv sp, s0\n");
         if !leaf {

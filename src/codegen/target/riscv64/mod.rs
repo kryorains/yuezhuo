@@ -4,11 +4,11 @@ mod early_return;
 mod emitter;
 mod inst;
 mod memory;
-mod regalloc;
+pub(in crate::codegen::target) mod regalloc;
 
 use crate::codegen::common::{IrFuncLayout, IrLocalRegs};
 use crate::ir::{Function, Module, ValueId};
-use regalloc::Riscv64RegAlloc;
+use regalloc::{Riscv64FloatRegAlloc, Riscv64RegAlloc};
 use std::collections::HashMap;
 
 struct Riscv64IrEmitter<'a> {
@@ -21,6 +21,8 @@ struct Riscv64IrFuncEmitter<'a, 'b> {
     func: &'b Function,
     layout: IrFuncLayout,
     regalloc: Riscv64RegAlloc,
+    float_regalloc: Riscv64FloatRegAlloc,
+    saved_area_size: i32,
     local_regs: IrLocalRegs,
     value_use_counts: Vec<usize>,
     folded_memory_geps: HashMap<ValueId, memory::FoldedMemoryGep>,
@@ -31,3 +33,6 @@ struct Riscv64IrFuncEmitter<'a, 'b> {
 pub fn emit_ir_asm(module: &Module) -> String {
     emitter::emit_asm(module)
 }
+
+#[cfg(test)]
+mod tests;

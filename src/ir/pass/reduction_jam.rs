@@ -865,9 +865,7 @@ fn estimate_jam_cost(func: &Function, candidate: &JamCandidate, factor: usize) -
         for inst in &func.blocks.get(block.0)?.insts {
             if block == candidate.inner_body {
                 for operand in instruction_operands(&inst.kind) {
-                    let Some(value) = func.values.get(operand.0) else {
-                        return None;
-                    };
+                    let value = func.values.get(operand.0)?;
                     let external = matches!(value.kind, ValueKind::Param)
                         || matches!(value.kind, ValueKind::Inst(owner, _) if !candidate_blocks.contains(&owner));
                     if external && matches!(value.ty, Type::I1 | Type::I32 | Type::F32) {

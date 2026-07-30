@@ -117,6 +117,10 @@ fn main() {
         // The current AArch64 stack-oriented lowering makes cloned scalar
         // bodies slower; keep the transform behind a target profitability gate.
         enable_simple_loop_unroll: target != codegen::Target::AArch64,
+        // Cleaning write-only local slots can expose multi-block inline
+        // candidates. RISC-V benefits from that code growth; AArch64 currently
+        // does not. A later DCE still removes the dead slots on every target.
+        enable_write_only_alloca_cleanup_before_inline: target != codegen::Target::AArch64,
     };
     let max_reduction_jam_factor = if target == codegen::Target::Riscv64 {
         4

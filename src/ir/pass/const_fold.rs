@@ -171,16 +171,16 @@ fn simplify_binary(
         },
         BinaryOp::Fadd => None,
         BinaryOp::Fsub => match const_float(func, rhs) {
-            Some(value) if value == 0.0 => Some(lhs),
+            Some(0.0) => Some(lhs),
             _ => None,
         },
         BinaryOp::Fmul => match (const_float(func, lhs), const_float(func, rhs)) {
-            (Some(value), _) if value == 1.0 => Some(rhs),
-            (_, Some(value)) if value == 1.0 => Some(lhs),
+            (Some(1.0), _) => Some(rhs),
+            (_, Some(1.0)) => Some(lhs),
             _ => None,
         },
         BinaryOp::Fdiv => match const_float(func, rhs) {
-            Some(value) if value == 1.0 => Some(lhs),
+            Some(1.0) => Some(lhs),
             _ => None,
         },
         BinaryOp::And => match (const_bool(func, lhs), const_bool(func, rhs)) {

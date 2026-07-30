@@ -30,7 +30,16 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     }
                 }
                 IrArgLocation::FloatReg(reg_idx) => {
-                    self.store_frame_s(&format!("s{}", reg_idx), offset);
+                    let source = format!("s{}", reg_idx);
+                    if let Some(target) = self.assigned_float_reg(*param) {
+                        if target != source {
+                            self.body
+                                .push_str(&format!("  fmov {}, {}\n", target, source));
+                        }
+                    }
+                    // Keep the canonical parameter slot initialized for fallback
+                    // paths and snapshot phi copies.
+                    self.store_frame_s(&source, offset);
                 }
                 IrArgLocation::Stack => {
                     let src = 16 + (stack_idx as i32) * 8;
@@ -42,8 +51,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                             self.store_frame_x("x0", offset);
                         }
                     } else if param_sig.ty == Type::F32 {
-                        self.load_frame_s("s0", src);
-                        self.store_frame_s("s0", offset);
+                        let target = self.assigned_float_reg(*param).unwrap_or("s0");
+                        self.load_frame_s(target, src);
+                        self.store_frame_s(target, offset);
                     } else {
                         self.load_frame_w("w0", src);
                         if self.phi_regs.reg(*param).is_some() {

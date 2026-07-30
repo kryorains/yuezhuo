@@ -2,6 +2,10 @@ use crate::codegen::common::{ir_value_use_counts, natural_loop_depths};
 use crate::ir::{Function, InstKind, Terminator, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
+mod float;
+#[allow(unused_imports)]
+pub(super) use float::Riscv64FloatRegAlloc;
+
 const INT_REGS: [&str; 11] = [
     "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
 ];
@@ -78,9 +82,9 @@ impl Riscv64RegAlloc {
             };
             let preferred = affinities[value.0]
                 .iter()
-                .find_map(|neighbor| regs.get(neighbor).copied().filter(|reg| allowed(*reg)));
+                .find_map(|neighbor| regs.get(neighbor).copied().filter(|reg| allowed(reg)));
             if let Some(reg) =
-                preferred.or_else(|| available.iter().copied().find(|reg| allowed(*reg)))
+                preferred.or_else(|| available.iter().copied().find(|reg| allowed(reg)))
             {
                 regs.insert(value, reg);
             }
@@ -157,10 +161,6 @@ impl Riscv64RegAlloc {
 
     pub(super) fn used_regs(&self) -> &[&'static str] {
         &self.used_regs
-    }
-
-    pub(super) fn saved_area_size(&self) -> i32 {
-        align_to((self.used_regs.len() as i32) * 8, 16)
     }
 }
 
@@ -277,13 +277,13 @@ fn value_owner_block(func: &Function, value: ValueId) -> Option<usize> {
     }
 }
 
-struct InterferenceAnalysis {
-    interference: Vec<HashSet<ValueId>>,
-    call_operands: HashSet<ValueId>,
-    live_across_calls: HashSet<ValueId>,
+pub(in crate::codegen::target) struct InterferenceAnalysis {
+    pub(in crate::codegen::target) interference: Vec<HashSet<ValueId>>,
+    pub(in crate::codegen::target) call_operands: HashSet<ValueId>,
+    pub(in crate::codegen::target) live_across_calls: HashSet<ValueId>,
 }
 
-fn interference_graph(
+pub(in crate::codegen::target) fn interference_graph(
     func: &Function,
     candidates: &HashSet<ValueId>,
 ) -> Option<InterferenceAnalysis> {
@@ -472,7 +472,7 @@ fn interference_graph(
     })
 }
 
-fn phi_affinities(
+pub(in crate::codegen::target) fn phi_affinities(
     func: &Function,
     candidates: &HashSet<ValueId>,
     interference: &[HashSet<ValueId>],
@@ -558,7 +558,7 @@ fn call_crossing_candidates(
     candidates.into_iter().map(|(value, _, _)| value).collect()
 }
 
-fn weighted_use_scores(func: &Function) -> Vec<usize> {
+pub(in crate::codegen::target) fn weighted_use_scores(func: &Function) -> Vec<usize> {
     let loop_depths = natural_loop_depths(func);
     let weight_for = |block_idx: usize| 1usize << loop_depths[block_idx].saturating_mul(4).min(20);
     let mut scores = vec![0usize; func.values.len()];
@@ -640,10 +640,6 @@ fn cross_block_memory_candidates(
     candidates
         .sort_by_key(|(value, score)| (std::cmp::Reverse(*score), std::cmp::Reverse(value.0)));
     candidates.into_iter().map(|(value, _)| value).collect()
-}
-
-fn align_to(value: i32, align: i32) -> i32 {
-    (value + align - 1) / align * align
 }
 
 #[cfg(test)]

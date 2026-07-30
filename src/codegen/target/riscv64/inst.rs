@@ -4,14 +4,16 @@ use crate::ir::{
     ValueKind,
 };
 
-const PHI_CYCLE_SCRATCH: &str = "t2";
-const PHI_MOVE_SCRATCHES: [&str; 4] = ["a0", "t0", "t1", PHI_CYCLE_SCRATCH];
+const INT_PHI_CYCLE_SCRATCH: &str = "t2";
+const FLOAT_PHI_CYCLE_SCRATCH: &str = "ft0";
+const INT_PHI_MOVE_SCRATCHES: [&str; 4] = ["a0", "t0", "t1", INT_PHI_CYCLE_SCRATCH];
 const MAX_PARALLEL_PHI_COPIES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhiLocation {
-    Reg(&'static str),
-    StackSlot(i32),
+    IntReg(&'static str),
+    FloatReg(&'static str),
+    StackSlot { offset: i32, ty: PhiCopyType },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -20,22 +22,30 @@ enum PhiSource {
     Rematerialize(ValueId),
 }
 
-#[derive(Clone, Copy, Debug)]
-enum PhiCopyWidth {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhiCopyType {
     Word,
     Doubleword,
+    Float,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PhiCopy {
     destination: PhiLocation,
     source: PhiSource,
-    width: PhiCopyWidth,
+    ty: PhiCopyType,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhiSnapshotCopy {
+    result: ValueId,
+    incoming: ValueId,
+    ty: PhiCopyType,
 }
 
 enum PhiCopyPlan {
     Parallel(Vec<PhiCopy>),
-    Snapshot(Vec<(ValueId, ValueId)>),
+    Snapshot(Vec<PhiSnapshotCopy>),
 }
 
 impl PhiCopyPlan {
@@ -76,15 +86,23 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     self.load_value(base);
                     let ty = self.func.value(result).ty.clone();
                     self.load_indirect(&ty, offset);
-                    self.store_result(result);
+                    if ty == Type::F32 {
+                        self.store_float_result(result, "fa0");
+                    } else {
+                        self.store_result(result);
+                    }
                 }
             }
             InstKind::Store { ptr, value } => {
                 if !self.emit_assigned_store(*ptr, *value) {
                     let (base, offset) = self.memory_address(*ptr);
                     self.load_value_into(base, "a1");
-                    self.load_value(*value);
                     let ty = self.func.value(*value).ty.clone();
+                    if ty == Type::F32 {
+                        self.load_float_value(*value, "fa0");
+                    } else {
+                        self.load_value(*value);
+                    }
                     self.store_indirect(&ty, offset);
                 }
             }
@@ -93,14 +111,25 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 let result = inst.result.unwrap();
                 if !self.emit_assigned_unary(result, *op, *value) {
                     self.emit_unary(*op, *value);
-                    self.store_result(result);
+                    if *op == UnaryOp::Fneg {
+                        self.store_float_result(result, "fa0");
+                    } else {
+                        self.store_result(result);
+                    }
                 }
             }
             InstKind::Binary { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
                 if !self.emit_assigned_binary(result, *op, *lhs, *rhs) {
                     self.emit_binary(*op, *lhs, *rhs);
-                    self.store_result(result);
+                    if matches!(
+                        op,
+                        BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv
+                    ) {
+                        self.store_float_result(result, "fa0");
+                    } else {
+                        self.store_result(result);
+                    }
                 }
             }
             InstKind::Icmp { op, lhs, rhs } => {
@@ -123,7 +152,11 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 let result = inst.result.unwrap();
                 if !self.emit_assigned_cast(result, *op, *value) {
                     self.emit_cast(*op, *value);
-                    self.store_result(result);
+                    if *op == CastOp::I32ToF32 {
+                        self.store_float_result(result, "fa0");
+                    } else {
+                        self.store_result(result);
+                    }
                 }
             }
             InstKind::Gep { base, indices } => {
@@ -137,11 +170,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 }
             }
             InstKind::Call { name, args } => {
-                let ret = self.emit_call(name, args);
+                let ret = self.emit_call(name, args, inst.result);
                 if let Some(result) = inst.result {
-                    if ret == Type::F32 {
-                        self.store_frame_s("fa0", self.layout.offset(result));
-                    } else {
+                    if ret != Type::F32 {
                         self.store_result(result);
                     }
                 }
@@ -158,9 +189,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         match terminator {
             Terminator::Return(value) => {
                 if let Some(value) = value {
-                    self.load_value(*value);
                     if self.func.value(*value).ty == Type::F32 {
-                        self.body.push_str("  fmv.w.x fa0, a0\n");
+                        self.load_float_value(*value, "fa0");
+                    } else {
+                        self.load_value(*value);
                     }
                 }
                 if next_block.is_some() {
@@ -258,11 +290,19 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             match self.normalize_phi_copy(result, *incoming) {
                 NormalizedPhiCopy::Noop => {}
                 NormalizedPhiCopy::Copy(copy) => {
-                    raw_copies.push((result, *incoming));
+                    raw_copies.push(PhiSnapshotCopy {
+                        result,
+                        incoming: *incoming,
+                        ty: copy.ty,
+                    });
                     copies.push(copy);
                 }
                 NormalizedPhiCopy::Unsupported => {
-                    raw_copies.push((result, *incoming));
+                    raw_copies.push(PhiSnapshotCopy {
+                        result,
+                        incoming: *incoming,
+                        ty: snapshot_phi_copy_type(&self.func.value(result).ty),
+                    });
                     unsupported = true;
                 }
             }
@@ -279,12 +319,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn normalize_phi_copy(&self, result: ValueId, incoming: ValueId) -> NormalizedPhiCopy {
-        if result == incoming
-            || matches!(
-                (self.regalloc.reg(result), self.regalloc.reg(incoming)),
-                (Some(destination), Some(source)) if destination == source
-            )
-        {
+        if result == incoming {
             return NormalizedPhiCopy::Noop;
         }
 
@@ -292,9 +327,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         if self.func.value(incoming).ty != *result_ty {
             return NormalizedPhiCopy::Unsupported;
         }
-        let width = match result_ty {
-            Type::I1 | Type::I32 | Type::F32 => PhiCopyWidth::Word,
-            Type::Ptr(_) => PhiCopyWidth::Doubleword,
+        let ty = match result_ty {
+            Type::I1 | Type::I32 => PhiCopyType::Word,
+            Type::Ptr(_) => PhiCopyType::Doubleword,
+            Type::F32 => PhiCopyType::Float,
             Type::Void | Type::Array { .. } => return NormalizedPhiCopy::Unsupported,
         };
 
@@ -307,30 +343,55 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             return NormalizedPhiCopy::Unsupported;
         }
 
-        let destination = self
-            .regalloc
-            .reg(result)
-            .map(PhiLocation::Reg)
-            .unwrap_or_else(|| PhiLocation::StackSlot(self.layout.offset(result)));
-        let source = if let Some(reg) = self.regalloc.reg(incoming) {
-            PhiSource::Location(PhiLocation::Reg(reg))
+        let destination = if ty == PhiCopyType::Float {
+            self.assigned_float_reg(result)
+                .map(PhiLocation::FloatReg)
+                .unwrap_or_else(|| PhiLocation::StackSlot {
+                    offset: self.layout.offset(result),
+                    ty,
+                })
+        } else {
+            self.regalloc
+                .reg(result)
+                .map(PhiLocation::IntReg)
+                .unwrap_or_else(|| PhiLocation::StackSlot {
+                    offset: self.layout.offset(result),
+                    ty,
+                })
+        };
+        let assigned_source = match ty {
+            PhiCopyType::Float => self.assigned_float_reg(incoming).map(PhiLocation::FloatReg),
+            PhiCopyType::Word | PhiCopyType::Doubleword => {
+                self.regalloc.reg(incoming).map(PhiLocation::IntReg)
+            }
+        };
+        let source = if let Some(location) = assigned_source {
+            PhiSource::Location(location)
         } else if matches!(
             self.func.value(incoming).kind,
             ValueKind::Const(_) | ValueKind::Global(_)
         ) {
             PhiSource::Rematerialize(incoming)
         } else {
-            PhiSource::Location(PhiLocation::StackSlot(self.layout.offset(incoming)))
+            PhiSource::Location(PhiLocation::StackSlot {
+                offset: self.layout.offset(incoming),
+                ty,
+            })
         };
 
         if matches!(source, PhiSource::Location(location) if location == destination) {
             NormalizedPhiCopy::Noop
         } else {
-            NormalizedPhiCopy::Copy(PhiCopy {
+            let copy = PhiCopy {
                 destination,
                 source,
-                width,
-            })
+                ty,
+            };
+            if phi_copy_locations_match(copy) {
+                NormalizedPhiCopy::Copy(copy)
+            } else {
+                NormalizedPhiCopy::Unsupported
+            }
         }
     }
 
@@ -349,17 +410,23 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             // Every blocked destination is still a source. Preserve one such
             // old value in the reserved scratch, then schedule the opened cycle.
             let location = copies[0].destination;
-            let width = copies
+            let ty = copies
                 .iter()
                 .find_map(|copy| match copy.source {
-                    PhiSource::Location(source) if source == location => Some(copy.width),
+                    PhiSource::Location(source) if source == location => Some(copy.ty),
                     PhiSource::Location(_) | PhiSource::Rematerialize(_) => None,
                 })
                 .expect("blocked phi destination must be a remaining source");
-            self.save_phi_cycle_location(location, width);
+            self.save_phi_cycle_location(location, ty);
+            let scratch = match ty {
+                PhiCopyType::Word | PhiCopyType::Doubleword => {
+                    PhiLocation::IntReg(INT_PHI_CYCLE_SCRATCH)
+                }
+                PhiCopyType::Float => PhiLocation::FloatReg(FLOAT_PHI_CYCLE_SCRATCH),
+            };
             for copy in &mut copies {
                 if matches!(copy.source, PhiSource::Location(source) if source == location) {
-                    copy.source = PhiSource::Location(PhiLocation::Reg(PHI_CYCLE_SCRATCH));
+                    copy.source = PhiSource::Location(scratch);
                 }
             }
         }
@@ -367,70 +434,143 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
 
     fn emit_phi_copy(&mut self, copy: PhiCopy) {
         match copy.source {
-            PhiSource::Rematerialize(value) => match copy.destination {
-                PhiLocation::Reg(destination) => {
-                    if !self.rematerialize_into(value, destination) {
-                        self.load_value_into(value, "a0");
-                        self.store_phi_location(copy.destination, "a0", copy.width);
+            PhiSource::Rematerialize(value) => match copy.ty {
+                PhiCopyType::Float => match copy.destination {
+                    PhiLocation::FloatReg(destination) => {
+                        self.load_float_value(value, destination);
                     }
-                }
-                PhiLocation::StackSlot(_) => {
-                    self.load_value_into(value, "a0");
-                    self.store_phi_location(copy.destination, "a0", copy.width);
-                }
-            },
-            PhiSource::Location(PhiLocation::Reg(source)) => {
-                self.store_phi_location(copy.destination, source, copy.width);
-            }
-            PhiSource::Location(PhiLocation::StackSlot(offset)) => match copy.destination {
-                PhiLocation::Reg(destination) => match copy.width {
-                    PhiCopyWidth::Word => self.load_frame_w(destination, offset),
-                    PhiCopyWidth::Doubleword => self.load_frame_x(destination, offset),
+                    PhiLocation::StackSlot { .. } => {
+                        self.load_float_value(value, "fa0");
+                        self.store_phi_location(copy.destination, "fa0", copy.ty);
+                    }
+                    PhiLocation::IntReg(_) => unreachable!("float phi destination must be float"),
                 },
-                PhiLocation::StackSlot(_) => {
-                    match copy.width {
-                        PhiCopyWidth::Word => self.load_frame_w("a0", offset),
-                        PhiCopyWidth::Doubleword => self.load_frame_x("a0", offset),
+                PhiCopyType::Word | PhiCopyType::Doubleword => match copy.destination {
+                    PhiLocation::IntReg(destination) => {
+                        if !self.rematerialize_into(value, destination) {
+                            self.load_value_into(value, "a0");
+                            self.store_phi_location(copy.destination, "a0", copy.ty);
+                        }
                     }
-                    self.store_phi_location(copy.destination, "a0", copy.width);
+                    PhiLocation::StackSlot { .. } => {
+                        self.load_value_into(value, "a0");
+                        self.store_phi_location(copy.destination, "a0", copy.ty);
+                    }
+                    PhiLocation::FloatReg(_) => {
+                        unreachable!("integer phi destination must be integer")
+                    }
+                },
+            },
+            PhiSource::Location(PhiLocation::IntReg(source)) => {
+                self.store_phi_location(copy.destination, source, copy.ty);
+            }
+            PhiSource::Location(PhiLocation::FloatReg(source)) => {
+                self.store_phi_location(copy.destination, source, copy.ty);
+            }
+            PhiSource::Location(PhiLocation::StackSlot { offset, ty }) => match copy.destination {
+                PhiLocation::IntReg(destination) => match ty {
+                    PhiCopyType::Word => self.load_frame_w(destination, offset),
+                    PhiCopyType::Doubleword => self.load_frame_x(destination, offset),
+                    PhiCopyType::Float => {
+                        unreachable!("float stack phi destination must be float")
+                    }
+                },
+                PhiLocation::FloatReg(destination) => {
+                    debug_assert_eq!(ty, PhiCopyType::Float);
+                    self.load_raw_frame_s(destination, offset - self.saved_area_size);
+                }
+                PhiLocation::StackSlot { .. } => {
+                    let scratch = match ty {
+                        PhiCopyType::Word => {
+                            self.load_frame_w("a0", offset);
+                            "a0"
+                        }
+                        PhiCopyType::Doubleword => {
+                            self.load_frame_x("a0", offset);
+                            "a0"
+                        }
+                        PhiCopyType::Float => {
+                            self.load_raw_frame_s("fa0", offset - self.saved_area_size);
+                            "fa0"
+                        }
+                    };
+                    self.store_phi_location(copy.destination, scratch, copy.ty);
                 }
             },
         }
     }
 
-    fn store_phi_location(&mut self, destination: PhiLocation, source: &str, width: PhiCopyWidth) {
+    fn store_phi_location(&mut self, destination: PhiLocation, source: &str, ty: PhiCopyType) {
         match destination {
-            PhiLocation::Reg(destination) => self
+            PhiLocation::IntReg(destination) => self
                 .body
                 .push_str(&format!("  mv {}, {}\n", destination, source)),
-            PhiLocation::StackSlot(offset) => match width {
-                PhiCopyWidth::Word => self.store_frame_w(source, offset),
-                PhiCopyWidth::Doubleword => self.store_frame_x(source, offset),
-            },
-        }
-    }
-
-    fn save_phi_cycle_location(&mut self, location: PhiLocation, width: PhiCopyWidth) {
-        match location {
-            PhiLocation::Reg(source) => self
+            PhiLocation::FloatReg(destination) => self
                 .body
-                .push_str(&format!("  mv {}, {}\n", PHI_CYCLE_SCRATCH, source)),
-            PhiLocation::StackSlot(offset) => match width {
-                PhiCopyWidth::Word => self.load_frame_w(PHI_CYCLE_SCRATCH, offset),
-                PhiCopyWidth::Doubleword => self.load_frame_x(PHI_CYCLE_SCRATCH, offset),
-            },
+                .push_str(&format!("  fmv.s {}, {}\n", destination, source)),
+            PhiLocation::StackSlot {
+                offset,
+                ty: slot_ty,
+            } => {
+                debug_assert_eq!(slot_ty, ty);
+                match ty {
+                    PhiCopyType::Word => self.store_frame_w(source, offset),
+                    PhiCopyType::Doubleword => self.store_frame_x(source, offset),
+                    PhiCopyType::Float => self.store_frame_s(source, offset),
+                }
+            }
         }
     }
 
-    fn emit_snapshot_phi_copies(&mut self, copies: &[(ValueId, ValueId)]) {
-        for (_, value) in copies {
-            self.load_value(*value);
-            self.push_x0();
+    fn save_phi_cycle_location(&mut self, location: PhiLocation, ty: PhiCopyType) {
+        match location {
+            PhiLocation::IntReg(source) => self
+                .body
+                .push_str(&format!("  mv {}, {}\n", INT_PHI_CYCLE_SCRATCH, source)),
+            PhiLocation::FloatReg(source) => self.body.push_str(&format!(
+                "  fmv.s {}, {}\n",
+                FLOAT_PHI_CYCLE_SCRATCH, source
+            )),
+            PhiLocation::StackSlot {
+                offset,
+                ty: slot_ty,
+            } => {
+                debug_assert_eq!(slot_ty, ty);
+                match ty {
+                    PhiCopyType::Word => self.load_frame_w(INT_PHI_CYCLE_SCRATCH, offset),
+                    PhiCopyType::Doubleword => self.load_frame_x(INT_PHI_CYCLE_SCRATCH, offset),
+                    PhiCopyType::Float => self
+                        .load_raw_frame_s(FLOAT_PHI_CYCLE_SCRATCH, offset - self.saved_area_size),
+                }
+            }
         }
-        for (result, _) in copies.iter().rev() {
-            self.pop_x1();
-            self.body.push_str("  mv a0, a1\n");
-            self.store_result(*result);
+    }
+
+    fn emit_snapshot_phi_copies(&mut self, copies: &[PhiSnapshotCopy]) {
+        for copy in copies {
+            match copy.ty {
+                PhiCopyType::Float => {
+                    self.load_float_value(copy.incoming, "fa0");
+                    self.push_s0();
+                }
+                PhiCopyType::Word | PhiCopyType::Doubleword => {
+                    self.load_value(copy.incoming);
+                    self.push_x0();
+                }
+            }
+        }
+        for copy in copies.iter().rev() {
+            match copy.ty {
+                PhiCopyType::Float => {
+                    self.body.push_str("  flw fa0, 0(sp)\n  addi sp, sp, 16\n");
+                    self.store_float_result(copy.result, "fa0");
+                }
+                PhiCopyType::Word | PhiCopyType::Doubleword => {
+                    self.pop_x1();
+                    self.body.push_str("  mv a0, a1\n");
+                    self.store_result(copy.result);
+                }
+            }
         }
     }
 
@@ -563,17 +703,33 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_unary(&mut self, op: UnaryOp, value: ValueId) {
-        self.load_value(value);
         match op {
-            UnaryOp::Ineg => self.body.push_str("  negw a0, a0\n"),
-            UnaryOp::Fneg => self
-                .body
-                .push_str("  fmv.w.x fa0, a0\n  fneg.s fa0, fa0\n  fmv.x.w a0, fa0\n"),
-            UnaryOp::Not => self.body.push_str("  seqz a0, a0\n"),
+            UnaryOp::Ineg => {
+                self.load_value(value);
+                self.body.push_str("  negw a0, a0\n");
+            }
+            UnaryOp::Fneg => {
+                self.load_float_value(value, "fa0");
+                self.body.push_str("  fneg.s fa0, fa0\n");
+            }
+            UnaryOp::Not => {
+                self.load_value(value);
+                self.body.push_str("  seqz a0, a0\n");
+            }
         }
     }
 
     fn emit_assigned_unary(&mut self, result: ValueId, op: UnaryOp, value: ValueId) -> bool {
+        if op == UnaryOp::Fneg {
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            self.load_float_value(value, "fa0");
+            self.body
+                .push_str(&format!("  fneg.s {}, fa0\n", destination));
+            return true;
+        }
+
         let Some(destination) = self.assigned_reg(result) else {
             return false;
         };
@@ -597,6 +753,27 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         lhs: ValueId,
         rhs: ValueId,
     ) -> bool {
+        if matches!(
+            op,
+            BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv
+        ) {
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            self.load_float_value(lhs, "fa1");
+            self.load_float_value(rhs, "fa0");
+            let instruction = match op {
+                BinaryOp::Fadd => "fadd.s",
+                BinaryOp::Fsub => "fsub.s",
+                BinaryOp::Fmul => "fmul.s",
+                BinaryOp::Fdiv => "fdiv.s",
+                _ => unreachable!(),
+            };
+            self.body
+                .push_str(&format!("  {} {}, fa1, fa0\n", instruction, destination));
+            return true;
+        }
+
         let Some(destination) = self.assigned_reg(result) else {
             return false;
         };
@@ -790,7 +967,6 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                     BinaryOp::Fdiv => self.body.push_str("  fdiv.s fa0, fa1, fa0\n"),
                     _ => unreachable!(),
                 }
-                self.body.push_str("  fmv.x.w a0, fa0\n");
             }
             BinaryOp::And | BinaryOp::Or => {
                 self.load_value_into(lhs, "a1");
@@ -1231,6 +1407,16 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_assigned_cast(&mut self, result: ValueId, op: CastOp, value: ValueId) -> bool {
+        if op == CastOp::I32ToF32 {
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            let source = self.load_or_assigned(value, "a0");
+            self.body
+                .push_str(&format!("  fcvt.s.w {}, {}\n", destination, source));
+            return true;
+        }
+
         let Some(destination) = self.assigned_reg(result) else {
             return false;
         };
@@ -1269,9 +1455,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             CastOp::I32ToF32 | CastOp::BoolToI32 | CastOp::I32ToBool => {
                 self.load_value(value);
                 match op {
-                    CastOp::I32ToF32 => self
-                        .body
-                        .push_str("  fcvt.s.w fa0, a0\n  fmv.x.w a0, fa0\n"),
+                    CastOp::I32ToF32 => self.body.push_str("  fcvt.s.w fa0, a0\n"),
                     CastOp::BoolToI32 => {}
                     CastOp::I32ToBool => self.body.push_str("  snez a0, a0\n"),
                     _ => unreachable!(),
@@ -1295,6 +1479,7 @@ fn parallel_phi_invariants_hold(copies: &[PhiCopy]) -> bool {
         if copies[..idx]
             .iter()
             .any(|previous| previous.destination == copy.destination)
+            || !phi_copy_locations_match(*copy)
             || location_uses_move_scratch(copy.destination)
             || matches!(copy.source, PhiSource::Location(location) if location_uses_move_scratch(location))
         {
@@ -1304,8 +1489,36 @@ fn parallel_phi_invariants_hold(copies: &[PhiCopy]) -> bool {
     true
 }
 
+fn phi_copy_locations_match(copy: PhiCopy) -> bool {
+    phi_location_matches_type(copy.destination, copy.ty)
+        && match copy.source {
+            PhiSource::Location(source) => phi_location_matches_type(source, copy.ty),
+            PhiSource::Rematerialize(_) => true,
+        }
+}
+
+fn phi_location_matches_type(location: PhiLocation, ty: PhiCopyType) -> bool {
+    match location {
+        PhiLocation::IntReg(_) => matches!(ty, PhiCopyType::Word | PhiCopyType::Doubleword),
+        PhiLocation::FloatReg(_) => ty == PhiCopyType::Float,
+        PhiLocation::StackSlot { ty: slot_ty, .. } => slot_ty == ty,
+    }
+}
+
 fn location_uses_move_scratch(location: PhiLocation) -> bool {
-    matches!(location, PhiLocation::Reg(reg) if PHI_MOVE_SCRATCHES.contains(&reg))
+    match location {
+        PhiLocation::IntReg(reg) => INT_PHI_MOVE_SCRATCHES.contains(&reg),
+        PhiLocation::FloatReg(reg) => reg == FLOAT_PHI_CYCLE_SCRATCH,
+        PhiLocation::StackSlot { .. } => false,
+    }
+}
+
+fn snapshot_phi_copy_type(ty: &Type) -> PhiCopyType {
+    match ty {
+        Type::Ptr(_) => PhiCopyType::Doubleword,
+        Type::F32 => PhiCopyType::Float,
+        Type::I1 | Type::I32 | Type::Void | Type::Array { .. } => PhiCopyType::Word,
+    }
 }
 
 fn const_i32(func: &crate::ir::Function, value: ValueId) -> Option<i32> {

@@ -40,8 +40,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             InstKind::MemZero { ptr, bytes } => self.emit_memzero(*ptr, *bytes),
             InstKind::Unary { op, value } => {
                 let result = inst.result.unwrap();
-                self.emit_unary(*op, *value);
-                self.store_result(result);
+                if !self.emit_assigned_unary(result, *op, *value) {
+                    self.emit_unary(*op, *value);
+                    self.store_result(result);
+                }
             }
             InstKind::Binary { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
@@ -116,11 +118,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 }
             }
             InstKind::Call { name, args } => {
-                let ret = self.emit_call(name, args);
+                let ret = self.emit_call(name, args, inst.result);
                 if let Some(result) = inst.result {
-                    if ret == Type::F32 {
-                        self.store_frame_s("s0", self.layout.offset(result));
-                    } else {
+                    if ret != Type::F32 {
                         self.store_result(result);
                     }
                 }
@@ -137,9 +137,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         match terminator {
             Terminator::Return(value) => {
                 if let Some(value) = value {
-                    self.load_value(*value);
                     if self.func.value(*value).ty == Type::F32 {
-                        self.body.push_str("  fmov s0, w0\n");
+                        self.load_float_value(*value, "s0");
+                    } else {
+                        self.load_value(*value);
                     }
                 }
                 self.body.push_str(&format!("  b {}\n", self.return_label));
@@ -213,13 +214,31 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     .find(|(pred, _)| pred.0 == pred_idx)
                     .map(|(_, value)| (result, *value))
                     .filter(|(result, value)| {
-                        self.phi_regs.reg(*result) != self.phi_regs.reg(*value)
-                            || self.phi_regs.reg(*result).is_none()
+                        if self.func.value(*result).ty == Type::F32 {
+                            self.assigned_float_reg(*result) != self.assigned_float_reg(*value)
+                                || self.assigned_float_reg(*result).is_none()
+                        } else {
+                            self.phi_regs.reg(*result) != self.phi_regs.reg(*value)
+                                || self.phi_regs.reg(*result).is_none()
+                        }
                     })
             })
             .collect::<Vec<_>>();
 
         if let [(result, value)] = copies.as_slice() {
+            if self.func.value(*result).ty == Type::F32 {
+                if let (Some(destination), Some(source)) = (
+                    self.assigned_float_reg(*result),
+                    self.assigned_float_reg(*value),
+                ) {
+                    self.body
+                        .push_str(&format!("  fmov {}, {}\n", destination, source));
+                } else {
+                    self.load_float_value(*value, "s0");
+                    self.store_float_result(*result, "s0");
+                }
+                return;
+            }
             if let (Some(destination), Some(source)) =
                 (self.assigned_x_reg(*result), self.assigned_x_reg(*value))
             {
@@ -592,6 +611,19 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         }
     }
 
+    fn emit_assigned_unary(&mut self, result: ValueId, op: UnaryOp, value: ValueId) -> bool {
+        if op != UnaryOp::Fneg {
+            return false;
+        }
+        let Some(destination) = self.assigned_float_reg(result) else {
+            return false;
+        };
+        let source = self.load_or_assigned_float(value, "s0");
+        self.body
+            .push_str(&format!("  fneg {}, {}\n", destination, source));
+        true
+    }
+
     fn emit_assigned_binary_imm(
         &mut self,
         result: ValueId,
@@ -682,6 +714,28 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         lhs: ValueId,
         rhs: ValueId,
     ) -> bool {
+        if matches!(
+            op,
+            BinaryOp::Fadd | BinaryOp::Fsub | BinaryOp::Fmul | BinaryOp::Fdiv
+        ) {
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            let lhs = self.load_or_assigned_float(lhs, "s1");
+            let rhs = self.load_or_assigned_float(rhs, "s0");
+            let instruction = match op {
+                BinaryOp::Fadd => "fadd",
+                BinaryOp::Fsub => "fsub",
+                BinaryOp::Fmul => "fmul",
+                BinaryOp::Fdiv => "fdiv",
+                _ => unreachable!(),
+            };
+            self.body.push_str(&format!(
+                "  {} {}, {}, {}\n",
+                instruction, destination, lhs, rhs
+            ));
+            return true;
+        }
         let (Some(destination), Some(lhs), Some(rhs)) = (
             self.assigned_w_reg(result),
             self.assigned_w_reg(lhs),
@@ -713,6 +767,15 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             instruction, destination, lhs, rhs
         ));
         true
+    }
+
+    fn load_or_assigned_float(&mut self, value: ValueId, scratch: &'static str) -> &'static str {
+        if let Some(reg) = self.assigned_float_reg(value) {
+            reg
+        } else {
+            self.load_float_value(value, scratch);
+            scratch
+        }
     }
 
     fn emit_binary(&mut self, op: BinaryOp, lhs: ValueId, rhs: ValueId) {
@@ -1009,6 +1072,37 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     }
 
     fn emit_assigned_cast(&mut self, result: ValueId, op: CastOp, value: ValueId) -> bool {
+        if op == CastOp::I32ToF32 {
+            let Some(destination) = self.assigned_float_reg(result) else {
+                return false;
+            };
+            let source = if let Some(source) = self.assigned_w_reg(value) {
+                source
+            } else {
+                self.load_value(value);
+                "w0".to_string()
+            };
+            self.body
+                .push_str(&format!("  scvtf {}, {}\n", destination, source));
+            return true;
+        }
+        if matches!(op, CastOp::F32ToI32 | CastOp::F32ToBool) {
+            let Some(destination) = self.assigned_w_reg(result) else {
+                return false;
+            };
+            let source = self.load_or_assigned_float(value, "s0");
+            match op {
+                CastOp::F32ToI32 => self
+                    .body
+                    .push_str(&format!("  fcvtzs {}, {}\n", destination, source)),
+                CastOp::F32ToBool => self.body.push_str(&format!(
+                    "  fcmp {}, #0.0\n  cset {}, ne\n",
+                    source, destination
+                )),
+                _ => unreachable!(),
+            }
+            return true;
+        }
         let (Some(destination), Some(source)) =
             (self.assigned_w_reg(result), self.assigned_w_reg(value))
         else {

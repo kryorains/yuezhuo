@@ -249,7 +249,6 @@ fn transfer_load_state(
 /// intervening store also writes `v`. Exact pointer identity is required only
 /// for the store being removed; an intervening `store q, v` is harmless even
 /// when `q` aliases `p`.
-
 fn eliminate_redundant_writebacks(func: &mut Function) -> bool {
     let pointer_roots = func
         .values
@@ -478,10 +477,10 @@ fn within_budget(func: &Function) -> bool {
                 InstKind::Call { args, .. } => {
                     operand_edges = operand_edges.saturating_add(args.len());
                 }
-                InstKind::Alloca { ty } => {
-                    if !spend_type_budget(ty, &mut type_nodes, &mut proof_work, MAX_TYPE_NODES) {
-                        return false;
-                    }
+                InstKind::Alloca { ty }
+                    if !spend_type_budget(ty, &mut type_nodes, &mut proof_work, MAX_TYPE_NODES) =>
+                {
+                    return false;
                 }
                 _ => {}
             }

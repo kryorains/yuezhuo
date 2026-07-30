@@ -974,6 +974,7 @@ mod tests {
         o1.add_func(func);
         let options = PassOptions {
             enable_simple_loop_unroll: false,
+            enable_write_only_alloca_cleanup_before_inline: true,
         };
 
         run_pipeline(&mut o0, OptLevel::O0, options);

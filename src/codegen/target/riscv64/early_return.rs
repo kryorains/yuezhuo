@@ -1,7 +1,5 @@
 use super::Riscv64IrFuncEmitter;
-use crate::codegen::common::{
-    assign_arg_locations, EarlyReturnResult, EntryEarlyReturn, IrArgLocation,
-};
+use crate::codegen::common::{EarlyReturnResult, EntryEarlyReturn, IrArgLocation};
 use crate::ir::{BinaryOp, CmpOp, Const, InstKind, UnaryOp, ValueId, ValueKind};
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
@@ -153,7 +151,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     fn preframe_param_reg(&self, value: ValueId) -> Option<String> {
         let param_idx = self.func.params.iter().position(|param| *param == value)?;
         let sig = self.parent.ctx.funcs.get(&self.func.name)?;
-        let locations = assign_arg_locations(&sig.params, 8, 8);
+        let locations = super::abi::assign_riscv_arg_locations(&sig.params);
         match locations.get(param_idx)? {
             IrArgLocation::IntReg(reg) => Some(format!("a{}", reg)),
             IrArgLocation::FloatReg(_) | IrArgLocation::Stack => None,

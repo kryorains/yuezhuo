@@ -32,11 +32,17 @@ impl<'a> AArch64IrEmitter<'a> {
 
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     fn new(parent: &'a mut AArch64IrEmitter<'b>, func: &'b Function) -> Self {
+        let phi_regs = AArch64PhiRegs::new(func);
+        let float_regs = super::float_regs::AArch64FloatRegs::new(func);
+        let saved_slot_count = phi_regs.saved_regs().len() + float_regs.used_callee_saved().len();
+        let saved_area_size = ir_align_to((saved_slot_count as i32) * 8, 16);
         Self {
             parent,
             func,
             layout: IrFuncLayout::new(func),
-            phi_regs: AArch64PhiRegs::new(func),
+            phi_regs,
+            float_regs,
+            saved_area_size,
             local_regs: crate::codegen::common::IrLocalRegs::new(
                 func,
                 &["x3", "x4", "x5", "x6", "x7"],
@@ -86,8 +92,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         let setup = self.body[..setup_end].to_string();
         let blocks = self.body[setup_end..].to_string();
         let saved_regs = self.phi_regs.saved_regs().to_vec();
-        let saved_bytes = (saved_regs.len() as i32) * 8;
-        let stack_size = ir_align_to(self.layout.stack_size + saved_bytes, 16);
+        let saved_float_regs = self.float_regs.used_callee_saved().to_vec();
+        let stack_size = ir_align_to(self.layout.stack_size + self.saved_area_size, 16);
         self.parent.out.push_str(&format!(
             ".globl {0}\n.type {0}, %function\n{0}:\n",
             self.func.name
@@ -119,6 +125,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 .out
                 .push_str(&format!("  str {}, [sp, #{}]\n", reg, saved_idx * 8));
         }
+        for (idx, reg) in saved_float_regs.iter().enumerate() {
+            let offset = (saved_regs.len() + idx) * 8;
+            self.parent
+                .out
+                .push_str(&format!("  str {}, [sp, #{}]\n", d_reg_name(reg), offset));
+        }
         self.parent.out.push_str(&setup);
         self.parent.out.push_str(&blocks);
         self.parent
@@ -139,6 +151,12 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 .out
                 .push_str(&format!("  ldr {}, [sp, #{}]\n", reg, saved_idx * 8));
         }
+        for (idx, reg) in saved_float_regs.iter().enumerate() {
+            let offset = (saved_regs.len() + idx) * 8;
+            self.parent
+                .out
+                .push_str(&format!("  ldr {}, [sp, #{}]\n", d_reg_name(reg), offset));
+        }
         if stack_size != 0 {
             self.parent
                 .out
@@ -149,4 +167,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             .out
             .push_str("  ldp x29, x30, [sp], #16\n  ret\n\n");
     }
+}
+
+fn d_reg_name(s_reg: &str) -> String {
+    s_reg.replacen('s', "d", 1)
 }
