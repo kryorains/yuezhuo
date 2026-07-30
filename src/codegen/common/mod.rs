@@ -1,6 +1,8 @@
 mod abi;
 mod call;
+mod cost;
 mod data;
+mod division;
 mod early_return;
 mod layout;
 mod local_regs;
@@ -11,7 +13,9 @@ mod value_uses;
 
 pub(crate) use abi::{assign_arg_locations, IrArgLocation};
 pub(crate) use call::resolve_call_sig;
+pub(crate) use cost::weighted_use_scores;
 pub(crate) use data::emit_ir_data_section;
+pub(crate) use division::signed_magic_positive;
 pub(crate) use early_return::{entry_early_return, EarlyReturnResult, EntryEarlyReturn};
 pub(crate) use layout::{ir_align_to, ir_size, IrFuncLayout};
 pub(crate) use local_regs::IrLocalRegs;

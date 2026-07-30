@@ -9,7 +9,6 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         let mut stack_idx = 0usize;
         for (idx, param) in self.func.params.iter().enumerate() {
             let param_sig = &sig.params[idx];
-            let offset = self.layout.offset(*param);
             match locations[idx] {
                 IrArgLocation::IntReg(reg_idx) => {
                     if let Some(target) = self.phi_regs.reg(*param) {
@@ -24,9 +23,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                             ));
                         }
                     } else if param_sig.is_pointer {
-                        self.store_frame_x(&format!("x{}", reg_idx), offset);
+                        self.store_frame_x(&format!("x{}", reg_idx), self.layout.offset(*param));
                     } else {
-                        self.store_frame_w(&format!("w{}", reg_idx), offset);
+                        self.store_frame_w(&format!("w{}", reg_idx), self.layout.offset(*param));
                     }
                 }
                 IrArgLocation::FloatReg(reg_idx) => {
@@ -36,10 +35,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                             self.body
                                 .push_str(&format!("  fmov {}, {}\n", target, source));
                         }
+                    } else {
+                        self.store_frame_s(&source, self.layout.offset(*param));
                     }
-                    // Keep the canonical parameter slot initialized for fallback
-                    // paths and snapshot phi copies.
-                    self.store_frame_s(&source, offset);
                 }
                 IrArgLocation::Stack => {
                     let src = 16 + (stack_idx as i32) * 8;
@@ -48,18 +46,21 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                         if self.phi_regs.reg(*param).is_some() {
                             self.store_result(*param);
                         } else {
-                            self.store_frame_x("x0", offset);
+                            self.store_frame_x("x0", self.layout.offset(*param));
                         }
                     } else if param_sig.ty == Type::F32 {
-                        let target = self.assigned_float_reg(*param).unwrap_or("s0");
-                        self.load_frame_s(target, src);
-                        self.store_frame_s(target, offset);
+                        if let Some(target) = self.assigned_float_reg(*param) {
+                            self.load_frame_s(target, src);
+                        } else {
+                            self.load_frame_s("s0", src);
+                            self.store_frame_s("s0", self.layout.offset(*param));
+                        }
                     } else {
                         self.load_frame_w("w0", src);
                         if self.phi_regs.reg(*param).is_some() {
                             self.store_result(*param);
                         } else {
-                            self.store_frame_w("w0", offset);
+                            self.store_frame_w("w0", self.layout.offset(*param));
                         }
                     }
                     stack_idx += 1;

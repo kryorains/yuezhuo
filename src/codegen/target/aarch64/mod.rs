@@ -12,6 +12,7 @@ use crate::codegen::common::{IrFuncLayout, IrLocalRegs};
 use crate::ir::{Function, Module};
 use float_regs::AArch64FloatRegs;
 use phi_regs::AArch64PhiRegs;
+use std::collections::HashMap;
 
 struct AArch64IrEmitter<'a> {
     ctx: crate::codegen::common::IrModuleCtx<'a>,
@@ -27,6 +28,8 @@ struct AArch64IrFuncEmitter<'a, 'b> {
     saved_area_size: i32,
     local_regs: IrLocalRegs,
     value_use_counts: Vec<usize>,
+    folded_memory_geps: HashMap<crate::ir::ValueId, memory::FoldedMemoryGep>,
+    frame_accessed: bool,
     body: String,
     return_label: String,
 }

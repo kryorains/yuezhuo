@@ -60,6 +60,8 @@ pub struct Function {
     recursive_cfg_inline_decided: bool,
     reduction_jammed: bool,
     simple_loop_unroll_decided: bool,
+    guarded_mulmod_modulus: Option<i32>,
+    guarded_pow2_digit_shift: Option<u32>,
 }
 
 impl PartialEq for Function {
@@ -70,6 +72,8 @@ impl PartialEq for Function {
             && self.values == other.values
             && self.blocks == other.blocks
             && self.entry == other.entry
+            && self.guarded_mulmod_modulus == other.guarded_mulmod_modulus
+            && self.guarded_pow2_digit_shift == other.guarded_pow2_digit_shift
     }
 }
 
@@ -83,6 +87,8 @@ impl fmt::Debug for Function {
             .field("values", &self.values)
             .field("blocks", &self.blocks)
             .field("entry", &self.entry)
+            .field("guarded_mulmod_modulus", &self.guarded_mulmod_modulus)
+            .field("guarded_pow2_digit_shift", &self.guarded_pow2_digit_shift)
             .finish()
     }
 }
@@ -99,6 +105,8 @@ impl Function {
             recursive_cfg_inline_decided: false,
             reduction_jammed: false,
             simple_loop_unroll_decided: false,
+            guarded_mulmod_modulus: None,
+            guarded_pow2_digit_shift: None,
         };
         func.entry = func.add_block("entry");
         func
@@ -248,6 +256,22 @@ impl Function {
 
     pub(crate) fn mark_simple_loop_unroll_decided(&mut self) {
         self.simple_loop_unroll_decided = true;
+    }
+
+    pub(crate) fn guarded_mulmod_modulus(&self) -> Option<i32> {
+        self.guarded_mulmod_modulus
+    }
+
+    pub(crate) fn mark_guarded_mulmod(&mut self, modulus: i32) {
+        self.guarded_mulmod_modulus = Some(modulus);
+    }
+
+    pub(crate) fn guarded_pow2_digit_shift(&self) -> Option<u32> {
+        self.guarded_pow2_digit_shift
+    }
+
+    pub(crate) fn mark_guarded_pow2_digit(&mut self, shift: u32) {
+        self.guarded_pow2_digit_shift = Some(shift);
     }
 }
 

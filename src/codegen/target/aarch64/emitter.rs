@@ -3,9 +3,9 @@ use super::phi_regs::AArch64PhiRegs;
 use super::{AArch64IrEmitter, AArch64IrFuncEmitter};
 use crate::codegen::common::{
     emit_ir_data_section, entry_early_return, ir_align_to, loop_rotated_block_order, IrFuncLayout,
-    IrModuleCtx,
+    IrLocalRegs, IrModuleCtx,
 };
-use crate::ir::{Function, Module};
+use crate::ir::{Function, InstKind, Module};
 
 pub(super) fn emit_asm(module: &Module) -> String {
     AArch64IrEmitter::new(module).emit()
@@ -32,23 +32,38 @@ impl<'a> AArch64IrEmitter<'a> {
 
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     fn new(parent: &'a mut AArch64IrEmitter<'b>, func: &'b Function) -> Self {
-        let phi_regs = AArch64PhiRegs::new(func);
-        let float_regs = super::float_regs::AArch64FloatRegs::new(func);
+        let value_use_counts = crate::codegen::common::ir_value_use_counts(func);
+        let folded_memory_geps = super::memory::collect_folded_memory_geps(func, &value_use_counts);
+        let mut allocation_view = (!folded_memory_geps.is_empty()).then(|| func.clone());
+        if let Some(allocation_view) = &mut allocation_view {
+            super::memory::rewrite_folded_memory_uses_for_allocation(
+                allocation_view,
+                &folded_memory_geps,
+            );
+        }
+        let allocation_func = allocation_view.as_ref().unwrap_or(func);
+        let phi_regs = AArch64PhiRegs::new(allocation_func);
+        let float_regs = super::float_regs::AArch64FloatRegs::new(allocation_func);
+        let local_regs = IrLocalRegs::new(allocation_func, &["x3", "x4", "x5", "x6", "x7"], false);
+        let layout = IrFuncLayout::new_with_stack_slots(func, |value| {
+            phi_regs.reg(value).is_none()
+                && float_regs.reg(value).is_none()
+                && local_regs.reg(value).is_none()
+                && !folded_memory_geps.contains_key(&value)
+        });
         let saved_slot_count = phi_regs.saved_regs().len() + float_regs.used_callee_saved().len();
         let saved_area_size = ir_align_to((saved_slot_count as i32) * 8, 16);
         Self {
             parent,
             func,
-            layout: IrFuncLayout::new(func),
+            layout,
             phi_regs,
             float_regs,
             saved_area_size,
-            local_regs: crate::codegen::common::IrLocalRegs::new(
-                func,
-                &["x3", "x4", "x5", "x6", "x7"],
-                false,
-            ),
-            value_use_counts: crate::codegen::common::ir_value_use_counts(func),
+            local_regs,
+            value_use_counts,
+            folded_memory_geps,
+            frame_accessed: false,
             body: String::new(),
             return_label: format!(".L_return_{}", func.name),
         }
@@ -93,7 +108,19 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         let blocks = self.body[setup_end..].to_string();
         let saved_regs = self.phi_regs.saved_regs().to_vec();
         let saved_float_regs = self.float_regs.used_callee_saved().to_vec();
-        let stack_size = ir_align_to(self.layout.stack_size + self.saved_area_size, 16);
+        let spill_area_size = if self.frame_accessed {
+            self.layout.stack_size
+        } else {
+            0
+        };
+        let stack_size = ir_align_to(spill_area_size + self.saved_area_size, 16);
+        let has_calls = self.func.blocks.iter().any(|block| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Call { .. }))
+        });
+        let needs_frame_record = stack_size != 0 || has_calls || self.frame_accessed;
         self.parent.out.push_str(&format!(
             ".globl {0}\n.type {0}, %function\n{0}:\n",
             self.func.name
@@ -101,9 +128,11 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         if let Some((_, prelude)) = &early_return {
             self.parent.out.push_str(prelude);
         }
-        self.parent
-            .out
-            .push_str("  stp x29, x30, [sp, #-16]!\n  mov x29, sp\n");
+        if needs_frame_record {
+            self.parent
+                .out
+                .push_str("  stp x29, x30, [sp, #-16]!\n  mov x29, sp\n");
+        }
         if stack_size != 0 {
             self.parent
                 .out
@@ -163,9 +192,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 .push_str(&mov_x_imm("x16", stack_size as i64));
             self.parent.out.push_str("  add sp, sp, x16\n");
         }
-        self.parent
-            .out
-            .push_str("  ldp x29, x30, [sp], #16\n  ret\n\n");
+        if needs_frame_record {
+            self.parent.out.push_str("  ldp x29, x30, [sp], #16\n");
+        }
+        self.parent.out.push_str("  ret\n\n");
     }
 }
 

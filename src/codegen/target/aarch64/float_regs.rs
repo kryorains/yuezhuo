@@ -1,7 +1,6 @@
-use crate::codegen::common::ir_value_use_counts;
-use crate::codegen::target::riscv64::regalloc::{
-    interference_graph, phi_affinities, weighted_use_scores,
-};
+use crate::codegen::common::{ir_value_use_counts, weighted_use_scores};
+use crate::codegen::target::riscv64::regalloc::{interference_graph, phi_affinities};
+use crate::codegen::Target;
 use crate::ir::{Function, InstKind, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
@@ -16,7 +15,6 @@ const MAX_BLOCKS: usize = 1024;
 const MAX_VALUES: usize = 8192;
 const MAX_CANDIDATES: usize = 512;
 const MAX_LIVENESS_CELLS: usize = 262_144;
-const CALLEE_SAVED_SAVE_RESTORE_COST: usize = 16;
 
 pub(super) struct AArch64FloatRegs {
     regs: HashMap<ValueId, &'static str>,
@@ -58,6 +56,7 @@ impl AArch64FloatRegs {
         }
 
         let scores = weighted_use_scores(func);
+        let costs = Target::AArch64.cost_model();
         let Some(analysis) = interference_graph(func, &candidate_set) else {
             return Self::empty();
         };
@@ -79,8 +78,10 @@ impl AArch64FloatRegs {
                     && (CALLER_SAVED_REGS.contains(&reg)
                         && !analysis.live_across_calls.contains(&value)
                         || CALLEE_SAVED_REGS.contains(&reg)
-                            && (analysis.live_across_calls.contains(&value)
-                                || score >= CALLEE_SAVED_SAVE_RESTORE_COST))
+                            && costs.should_use_callee_saved_register(
+                                score,
+                                analysis.live_across_calls.contains(&value),
+                            ))
             };
             let preferred = affinities[value.0]
                 .iter()

@@ -24,7 +24,9 @@ const MAX_MODULE_GROWTH_INSTS: usize = 1024;
 const MAX_MODULE_GROWTH_BLOCKS: usize = 256;
 
 pub(super) struct RecursiveInlinePass;
-pub(super) struct CfgInlinePass;
+pub(super) struct CfgInlinePass {
+    allow_global_loads: bool,
+}
 
 impl RecursiveInlinePass {
     pub(super) fn new() -> Self {
@@ -33,8 +35,8 @@ impl RecursiveInlinePass {
 }
 
 impl CfgInlinePass {
-    pub(super) fn new() -> Self {
-        Self
+    pub(super) fn new(allow_global_loads: bool) -> Self {
+        Self { allow_global_loads }
     }
 }
 
@@ -104,7 +106,7 @@ impl ModulePass for CfgInlinePass {
         let targets = CallGraphTargets::new(&snapshots);
         let candidates = snapshots
             .iter()
-            .map(GeneralCallee::analyze)
+            .map(|func| GeneralCallee::analyze(func, self.allow_global_loads))
             .collect::<Vec<_>>();
         let mut plans = vec![Vec::new(); snapshots.len()];
         let mut module_growth = Growth::default();
@@ -203,8 +205,9 @@ struct GeneralCallee {
 }
 
 impl GeneralCallee {
-    fn analyze(func: &Function) -> Option<Self> {
+    fn analyze(func: &Function, allow_global_loads: bool) -> Option<Self> {
         if !matches!(func.ret, Type::I1 | Type::I32)
+            || func.guarded_pow2_digit_shift().is_some()
             || func.blocks.is_empty()
             || func.blocks.len() > MAX_GENERAL_SOURCE_BLOCKS
             || func.verify().is_err()
@@ -236,7 +239,10 @@ impl GeneralCallee {
             || reachable_insts.len() > MAX_GENERAL_SOURCE_INST_SLOTS
             || !func.blocks.iter().enumerate().all(|(block_idx, block)| {
                 !reachable[block_idx]
-                    || (block.insts.iter().all(is_pure_scalar_inline_inst)
+                    || (block
+                        .insts
+                        .iter()
+                        .all(|inst| is_pure_scalar_inline_inst(func, inst, allow_global_loads))
                         && !matches!(block.terminator, Some(Terminator::Return(None))))
             })
         {
@@ -258,7 +264,7 @@ impl GeneralCallee {
     }
 }
 
-fn is_pure_scalar_inline_inst(inst: &Inst) -> bool {
+fn is_pure_scalar_inline_inst(func: &Function, inst: &Inst, allow_global_loads: bool) -> bool {
     matches!(
         inst.kind,
         InstKind::Nop
@@ -287,6 +293,10 @@ fn is_pure_scalar_inline_inst(inst: &Inst) -> bool {
                 op: CastOp::BoolToI32 | CastOp::I32ToBool,
                 ..
             }
+    ) || matches!(
+        inst.kind,
+        InstKind::Load { ptr }
+            if allow_global_loads && matches!(func.value(ptr).kind, ValueKind::Global(_))
     )
 }
 
@@ -974,6 +984,12 @@ mod tests {
         o1.add_func(func);
         let options = PassOptions {
             enable_simple_loop_unroll: false,
+            cfg_inline_rounds: 1,
+            cfg_inline_global_loads: false,
+            enable_loop_call_memoize: false,
+            enable_repeated_overwrite_elision: false,
+            enable_guarded_mulmod_idiom: false,
+            enable_guarded_pow2_digit_idiom: false,
             enable_write_only_alloca_cleanup_before_inline: true,
         };
 

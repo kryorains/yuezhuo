@@ -3,6 +3,25 @@ use crate::codegen::common::{EarlyReturnResult, EntryEarlyReturn, IrArgLocation}
 use crate::ir::{BinaryOp, CmpOp, Const, InstKind, UnaryOp, ValueId, ValueKind};
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
+    pub(super) fn guarded_mulmod_prelude(&self) -> Option<String> {
+        let modulus = self.func.guarded_mulmod_modulus()?;
+        let fallback = format!(".L_mulmod_fallback_{}", self.func.name);
+        Some(format!(
+            "  bltz a0, {fallback}\n  bltz a1, {fallback}\n  li t0, {modulus}\n  bge a0, t0, {fallback}\n  bge a1, t0, {fallback}\n  mul t1, a0, a1\n  rem a0, t1, t0\n  ret\n{fallback}:\n"
+        ))
+    }
+
+    pub(super) fn guarded_pow2_digit_prelude(&self) -> Option<String> {
+        let shift = self.func.guarded_pow2_digit_shift()?;
+        let zero_position = 31u32.div_ceil(shift);
+        let mask = (1u32.checked_shl(shift)? - 1) as i32;
+        let fallback = format!(".L_pow2_digit_fallback_{}", self.func.name);
+        let zero = format!(".L_pow2_digit_zero_{}", self.func.name);
+        Some(format!(
+            "  bltz a0, {fallback}\n  bltz a1, {fallback}\n  li t0, {zero_position}\n  bge a1, t0, {zero}\n  li t0, {shift}\n  mulw t1, a1, t0\n  sraw a0, a0, t1\n  li t0, {mask}\n  and a0, a0, t0\n  ret\n{zero}:\n  li a0, 0\n  ret\n{fallback}:\n"
+        ))
+    }
+
     pub(super) fn pre_prologue_early_return(&self, plan: &EntryEarlyReturn) -> Option<String> {
         let frame_label = format!(".L_frame_{}", self.func.name);
         let mut out = String::new();

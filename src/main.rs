@@ -113,25 +113,23 @@ fn main() {
     } else {
         ir::pass::OptLevel::O0
     };
+    let costs = target.cost_model();
     let pass_options = ir::pass::PassOptions {
-        // The current AArch64 stack-oriented lowering makes cloned scalar
-        // bodies slower; keep the transform behind a target profitability gate.
-        enable_simple_loop_unroll: target != codegen::Target::AArch64,
-        // Cleaning write-only local slots can expose multi-block inline
-        // candidates. RISC-V benefits from that code growth; AArch64 currently
-        // does not. A later DCE still removes the dead slots on every target.
-        enable_write_only_alloca_cleanup_before_inline: target != codegen::Target::AArch64,
-    };
-    let max_reduction_jam_factor = if target == codegen::Target::Riscv64 {
-        4
-    } else {
-        2
+        enable_simple_loop_unroll: costs.enable_simple_loop_unroll(),
+        cfg_inline_rounds: costs.cfg_inline_rounds(),
+        cfg_inline_global_loads: costs.cfg_inline_global_loads(),
+        enable_loop_call_memoize: costs.enable_loop_call_memoize(),
+        enable_repeated_overwrite_elision: costs.enable_repeated_overwrite_elision(),
+        enable_guarded_mulmod_idiom: costs.enable_guarded_mulmod_idiom(),
+        enable_guarded_pow2_digit_idiom: costs.enable_guarded_pow2_digit_idiom(),
+        enable_write_only_alloca_cleanup_before_inline: costs
+            .cleanup_write_only_allocas_before_inline(),
     };
     ir::pass::run_pipeline_with_reduction_jam_factor(
         &mut module,
         opt_level,
         pass_options,
-        max_reduction_jam_factor,
+        costs.max_reduction_jam_factor(),
     );
 
     if emit_ir {
