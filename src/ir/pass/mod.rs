@@ -1,4 +1,5 @@
 mod adjacent_loop_fusion;
+mod bitwise_digit_loop;
 mod const_fold;
 mod const_specialize;
 mod constant_address_reduction;
@@ -9,6 +10,7 @@ mod function_effects;
 mod gep_induction;
 mod global_const_prop;
 mod global_scalar_localize;
+mod guarded_modular_multiply;
 mod inline;
 mod inst_combine;
 mod invariant_load;
@@ -17,9 +19,11 @@ mod local_forward;
 mod local_memzero_sink;
 mod loop_analysis;
 mod loop_call_memoize;
+mod modular_recurrence;
 mod pointer_recurrence_coalesce;
 mod range_integer;
 mod recursive_inline;
+mod recursive_memoize;
 mod reduction_jam;
 mod regional_global_scalar;
 mod repeat_reduction;
@@ -32,6 +36,7 @@ mod util;
 
 use super::Module;
 use adjacent_loop_fusion::AdjacentLoopFusionPass;
+use bitwise_digit_loop::BitwiseDigitLoopPass;
 use const_fold::ConstFoldPass;
 use const_specialize::ConstSpecializePass;
 use constant_address_reduction::ConstantAddressReductionPass;
@@ -40,6 +45,7 @@ use dce::DcePass;
 use gep_induction::GepInductionPass;
 use global_const_prop::GlobalConstPropPass;
 use global_scalar_localize::GlobalScalarLocalizePass;
+use guarded_modular_multiply::GuardedModularMultiplyPass;
 use inline::InlineSmallExprPass;
 use inst_combine::InstCombinePass;
 use invariant_load::InvariantLoadForwardPass;
@@ -47,9 +53,11 @@ use licm::LicmPass;
 use local_forward::LocalForwardPass;
 use local_memzero_sink::LocalMemzeroSinkPass;
 use loop_call_memoize::LoopCallMemoizePass;
+use modular_recurrence::ModularRecurrencePass;
 use pointer_recurrence_coalesce::PointerRecurrenceCoalescePass;
 use range_integer::RangeIntegerSimplifyPass;
 use recursive_inline::{CfgInlinePass, RecursiveInlinePass};
+use recursive_memoize::RecursiveMemoizePass;
 use reduction_jam::ReductionJamPass;
 use regional_global_scalar::RegionalGlobalScalarPass;
 use repeat_reduction::RepeatReductionPass;
@@ -120,6 +128,10 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(GlobalScalarLocalizePass::new_across_no_memory_calls());
             pipeline.add(ScalarPromotePass::new());
+            pipeline.add(DcePass::new());
+            pipeline.add(BitwiseDigitLoopPass::new());
+            pipeline.add(ModularRecurrencePass::new());
+            pipeline.add(GuardedModularMultiplyPass::new());
             pipeline.add(ConstSpecializePass::new(
                 options.enable_recursive_const_specialization,
                 options.enable_uniform_constant_arguments,
@@ -194,6 +206,7 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(LocalMemzeroSinkPass::new());
             pipeline.add(SimplifyCfgPass::new());
             pipeline.add(DcePass::new());
+            pipeline.add(RecursiveMemoizePass::new());
         }
     }
     pipeline.run(module);

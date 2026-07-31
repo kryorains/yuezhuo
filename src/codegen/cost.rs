@@ -54,17 +54,17 @@ impl TargetCostModel {
                 small_expr_inline_rounds: 1,
                 cfg_inline_rounds: 2,
                 cfg_inline_global_loads: true,
-                recursive_inline_rounds: 1,
+                recursive_inline_rounds: 2,
                 constant_address_count_reduction: false,
                 recursive_const_specialization: false,
-                initialized_global_propagation: false,
-                uniform_constant_arguments: false,
+                initialized_global_propagation: true,
+                uniform_constant_arguments: true,
                 loop_call_memoize: true,
                 loop_invariant_call_memoize: false,
                 regional_global_scalar_promotion: false,
                 contract_float_madd: false,
                 cleanup_write_only_allocas_before_inline: false,
-                max_reduction_jam_factor: 2,
+                max_reduction_jam_factor: 4,
                 min_global_register_score: 2,
                 callee_saved_register_score: 16,
             },
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(aarch64.small_expr_inline_rounds(), 1);
         assert_eq!(aarch64.cfg_inline_rounds(), 2);
         assert!(aarch64.cfg_inline_global_loads());
-        assert_eq!(aarch64.recursive_inline_rounds(), 1);
+        assert_eq!(aarch64.recursive_inline_rounds(), 2);
         assert!(aarch64.enable_loop_call_memoize());
         assert!(!aarch64.contract_float_madd());
         assert!(!aarch64.cleanup_write_only_allocas_before_inline());
@@ -198,8 +198,9 @@ mod tests {
         assert!(riscv64.enable_recursive_const_specialization());
         assert!(riscv64.enable_initialized_global_propagation());
         assert!(riscv64.enable_uniform_constant_arguments());
-        assert!(!aarch64.enable_initialized_global_propagation());
-        assert!(!aarch64.enable_uniform_constant_arguments());
+        assert!(aarch64.enable_initialized_global_propagation());
+        assert!(aarch64.enable_uniform_constant_arguments());
+        assert_eq!(aarch64.max_reduction_jam_factor(), 4);
         assert!(!riscv64.enable_loop_call_memoize());
         assert!(riscv64.enable_loop_invariant_call_memoize());
         assert!(riscv64.enable_regional_global_scalar_promotion());

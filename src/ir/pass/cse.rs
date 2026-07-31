@@ -4,6 +4,7 @@ use super::util::{resolve_replacement, rewrite_function_uses, ValueReplacements}
 use super::ModulePass;
 use crate::ir::{
     BinaryOp, CastOp, CmpOp, Function, FunctionId, InstKind, Module, Type, UnaryOp, ValueId,
+    ValueKind,
 };
 
 const MAX_CSE_KEY_OPERANDS: usize = 262_144;
@@ -38,6 +39,7 @@ fn cse_function(func: &mut Function, effects: &FunctionEffects) {
         return;
     }
 
+    canonicalize_global_values(func);
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
     let mut replacements = ValueReplacements::new();
@@ -58,6 +60,28 @@ fn cse_function(func: &mut Function, effects: &FunctionEffects) {
     if let Err(errors) = func.verify() {
         panic!("cse produced invalid IR in {}: {:?}", func.name, errors);
     }
+}
+
+/// Lowering and CFG inlining may materialize the same global symbol more than
+/// once in a function. They are the same address when both the symbol and its
+/// complete pointer type agree, so using one canonical SSA root exposes GEP
+/// and pointer-recurrence CSE without making any new alias assumption.
+fn canonicalize_global_values(func: &mut Function) {
+    let mut canonical = Vec::<(String, Type, ValueId)>::new();
+    let mut replacements = ValueReplacements::new();
+    for (index, value) in func.values.iter().enumerate() {
+        let ValueKind::Global(name) = &value.kind else {
+            continue;
+        };
+        if let Some((_, _, existing)) = canonical.iter().find(|(existing_name, existing_ty, _)| {
+            existing_name == name && existing_ty == &value.ty
+        }) {
+            replacements.insert(ValueId(index), *existing);
+        } else {
+            canonical.push((name.clone(), value.ty.clone(), ValueId(index)));
+        }
+    }
+    rewrite_function_uses(func, &replacements);
 }
 
 fn visit_dom_tree(
@@ -260,5 +284,62 @@ fn normalize_cmp_args(op: CmpOp, lhs: ValueId, rhs: ValueId) -> (CmpOp, ValueId,
         (op, rhs, lhs)
     } else {
         (op, lhs, rhs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Const, Terminator};
+
+    #[test]
+    fn canonicalizes_duplicate_references_to_the_same_global_object() {
+        let mut function = Function::new("use_global_twice", Type::Void);
+        let pointer_ty = Type::Ptr(Box::new(Type::I32));
+        let first_base = function.add_global_ref("items", pointer_ty.clone());
+        let second_base = function.add_global_ref("items", pointer_ty.clone());
+        let zero = function.add_const(Const::Int(0));
+        let first_gep = function
+            .append_inst(
+                function.entry,
+                InstKind::Gep {
+                    base: first_base,
+                    indices: vec![zero],
+                },
+                Some(pointer_ty.clone()),
+            )
+            .unwrap();
+        let second_gep = function
+            .append_inst(
+                function.entry,
+                InstKind::Gep {
+                    base: second_base,
+                    indices: vec![zero],
+                },
+                Some(pointer_ty),
+            )
+            .unwrap();
+        let loaded = function
+            .append_inst(
+                function.entry,
+                InstKind::Load { ptr: second_gep },
+                Some(Type::I32),
+            )
+            .unwrap();
+        function.set_terminator(function.entry, Terminator::Return(None));
+
+        let mut module = Module::new();
+        module.add_func(function);
+        CsePass::new().run(&mut module);
+
+        assert!(matches!(
+            module.funcs[0].blocks[0].insts[1].kind,
+            InstKind::Nop
+        ));
+        assert!(matches!(
+            module.funcs[0].blocks[0].insts[2].kind,
+            InstKind::Load { ptr } if ptr == first_gep
+        ));
+        assert_eq!(module.funcs[0].value(loaded).ty, Type::I32);
     }
 }

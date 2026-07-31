@@ -21,6 +21,28 @@ pub(super) fn rewrite_function_uses(func: &mut Function, replacements: &ValueRep
     changed
 }
 
+pub(super) fn rewrite_block_uses_from(
+    func: &mut Function,
+    block: BlockId,
+    inst_start: usize,
+    replacements: &ValueReplacements,
+) -> bool {
+    if replacements.is_empty() {
+        return false;
+    }
+    let Some(block) = func.blocks.get_mut(block.0) else {
+        return false;
+    };
+    let mut changed = false;
+    for inst in block.insts.iter_mut().skip(inst_start) {
+        changed |= rewrite_inst_uses(inst, replacements);
+    }
+    if let Some(terminator) = &mut block.terminator {
+        changed |= rewrite_terminator_uses(terminator, replacements);
+    }
+    changed
+}
+
 pub(super) fn resolve_replacement(mut value: ValueId, replacements: &ValueReplacements) -> ValueId {
     // 处理链式替换，例如 a -> b、b -> c，最终应该把 a 解析成 c。
     while let Some(next) = replacements.get(&value).copied() {
