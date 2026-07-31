@@ -1,8 +1,8 @@
 use super::dominators::{ControlFlowGraph, Dominators};
 use super::loop_analysis::LoopInfo;
 use super::ModulePass;
-use crate::ir::{BlockId, Function, InstKind, Module, Terminator, ValueId, ValueKind};
-use std::collections::HashSet;
+use crate::ir::{BlockId, Function, InstKind, Module, Terminator, Type, ValueId, ValueKind};
+use std::collections::{HashSet, VecDeque};
 
 /// Defers initialization of non-escaping local arrays until a chain of
 /// side-effect-free early-return guards has accepted the work.
@@ -24,6 +24,7 @@ impl ModulePass for LocalMemzeroSinkPass {
     fn run(&mut self, module: &mut Module) {
         for func in &mut module.funcs {
             sink_entry_memzeros(func);
+            remove_fully_overwritten_memzeros(func);
         }
     }
 }
@@ -318,6 +319,179 @@ fn replace_successor(terminator: &mut Terminator, old: BlockId, new: BlockId) {
     }
 }
 
+/// Removes a local-array zero fill when forward must-initialization proves that
+/// every subsequent read sees an explicit store first. Constant element stores
+/// build the initialized set; joins intersect it, and dynamic reads are
+/// accepted only after the complete object is known initialized.
+fn remove_fully_overwritten_memzeros(func: &mut Function) {
+    if func.blocks.len() > 4096 || func.values.len() > 32_768 {
+        return;
+    }
+    let mut candidates = Vec::new();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.insts.iter().enumerate() {
+            let InstKind::MemZero { ptr, bytes } = inst.kind else {
+                continue;
+            };
+            if local_array_len(func, ptr).is_some_and(|len| len.checked_mul(4) == Some(bytes)) {
+                candidates.push((BlockId(block_idx), inst_idx, ptr));
+            }
+        }
+    }
+
+    for (block, inst_idx, root) in candidates {
+        if memzero_is_fully_overwritten(func, block, inst_idx, root) {
+            func.blocks[block.0].insts[inst_idx].kind = InstKind::Nop;
+        }
+    }
+}
+
+fn local_array_len(func: &Function, root: ValueId) -> Option<usize> {
+    let ValueKind::Inst(block, inst_idx) = func.value(root).kind else {
+        return None;
+    };
+    let InstKind::Alloca {
+        ty: Type::Array { elem, len },
+    } = &func.blocks.get(block.0)?.insts.get(inst_idx)?.kind
+    else {
+        return None;
+    };
+    matches!(elem.as_ref(), Type::I32 | Type::F32).then_some(*len)
+}
+
+fn memzero_is_fully_overwritten(
+    func: &Function,
+    start_block: BlockId,
+    memzero_idx: usize,
+    root: ValueId,
+) -> bool {
+    let Some(len) = local_array_len(func, root) else {
+        return false;
+    };
+    if len == 0 || len > 256 {
+        return false;
+    }
+    let aliases = pointer_aliases(func, root);
+    if aliases
+        .iter()
+        .any(|alias| func.value(*alias).ty == Type::I32 || func.value(*alias).ty == Type::F32)
+    {
+        return false;
+    }
+
+    let cfg = ControlFlowGraph::new(func);
+    let dom = Dominators::new(func, &cfg);
+    if LoopInfo::new(&cfg, &dom)
+        .loops()
+        .iter()
+        .any(|natural_loop| natural_loop.blocks.contains(&start_block))
+    {
+        return false;
+    }
+    let mut incoming = vec![None::<Vec<bool>>; func.blocks.len()];
+    incoming[start_block.0] = Some(vec![false; len]);
+    let mut worklist = VecDeque::from([start_block]);
+    while let Some(block) = worklist.pop_front() {
+        let Some(mut initialized) = incoming[block.0].clone() else {
+            continue;
+        };
+        let first_inst = if block == start_block {
+            memzero_idx + 1
+        } else {
+            0
+        };
+        for inst in &func.blocks[block.0].insts[first_inst..] {
+            match &inst.kind {
+                InstKind::Nop | InstKind::Alloca { .. } => {}
+                InstKind::Gep { base, .. } if aliases.contains(base) => {}
+                InstKind::Phi { incomings }
+                    if !incomings.is_empty()
+                        && incomings.iter().all(|(_, value)| aliases.contains(value)) => {}
+                InstKind::Load { ptr } if aliases.contains(ptr) => {
+                    if !load_is_initialized(func, *ptr, root, &initialized) {
+                        return false;
+                    }
+                }
+                InstKind::Store { ptr, value } if aliases.contains(ptr) => {
+                    if aliases.contains(value) {
+                        return false;
+                    }
+                    if let Some(index) = constant_local_array_index(func, *ptr, root) {
+                        let Some(element) = initialized.get_mut(index) else {
+                            return false;
+                        };
+                        *element = true;
+                    }
+                }
+                InstKind::MemZero { ptr, .. } if *ptr == root => {
+                    initialized.fill(true);
+                }
+                kind if inst_operands(kind)
+                    .into_iter()
+                    .any(|operand| aliases.contains(&operand)) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        if terminator_operand(func.blocks[block.0].terminator.as_ref())
+            .is_some_and(|operand| aliases.contains(&operand))
+        {
+            return false;
+        }
+        for successor in &cfg.succs[block.0] {
+            let changed = match &mut incoming[successor.0] {
+                None => {
+                    incoming[successor.0] = Some(initialized.clone());
+                    true
+                }
+                Some(existing) => {
+                    let mut changed = false;
+                    for (current, next) in existing.iter_mut().zip(&initialized) {
+                        let intersection = *current && *next;
+                        changed |= intersection != *current;
+                        *current = intersection;
+                    }
+                    changed
+                }
+            };
+            if changed {
+                worklist.push_back(*successor);
+            }
+        }
+    }
+    true
+}
+
+fn load_is_initialized(func: &Function, ptr: ValueId, root: ValueId, initialized: &[bool]) -> bool {
+    initialized.iter().all(|element| *element)
+        || constant_local_array_index(func, ptr, root)
+            .and_then(|index| initialized.get(index))
+            .copied()
+            == Some(true)
+}
+
+fn constant_local_array_index(func: &Function, address: ValueId, root: ValueId) -> Option<usize> {
+    let ValueKind::Inst(block, inst_idx) = func.value(address).kind else {
+        return None;
+    };
+    let InstKind::Gep { base, indices } = &func.blocks.get(block.0)?.insts.get(inst_idx)?.kind
+    else {
+        return None;
+    };
+    let [index] = indices.as_slice() else {
+        return None;
+    };
+    if *base != root {
+        return None;
+    }
+    match func.value(*index).kind {
+        ValueKind::Const(crate::ir::Const::Int(index)) => usize::try_from(index).ok(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +561,61 @@ int work(int n) {
             .blocks
             .iter()
             .all(|block| block.name != "deferred.memzero"));
+    }
+
+    #[test]
+    fn removes_zeroing_after_every_element_is_definitely_initialized() {
+        let mut module = lower(
+            r#"
+int work(int index) {
+    int values[3] = {};
+    values[0] = 7;
+    values[1] = 8;
+    values[2] = 9;
+    return values[index];
+}
+"#,
+        );
+        LocalMemzeroSinkPass::new().run(&mut module);
+        let work = module
+            .funcs
+            .iter()
+            .find(|func| func.name == "work")
+            .unwrap();
+
+        assert!(work
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .all(|inst| !matches!(inst.kind, InstKind::MemZero { .. })));
+        assert!(work.verify().is_ok());
+    }
+
+    #[test]
+    fn keeps_zeroing_when_a_dynamic_read_can_observe_an_unwritten_element() {
+        let mut module = lower(
+            r#"
+int work(int index) {
+    int values[3] = {};
+    values[0] = 7;
+    values[2] = 9;
+    return values[index];
+}
+"#,
+        );
+        LocalMemzeroSinkPass::new().run(&mut module);
+        let work = module
+            .funcs
+            .iter()
+            .find(|func| func.name == "work")
+            .unwrap();
+
+        assert!(work
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, InstKind::MemZero { .. })));
+        assert!(work.verify().is_ok());
     }
 
     fn lower(source: &str) -> Module {

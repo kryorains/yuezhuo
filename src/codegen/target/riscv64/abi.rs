@@ -30,31 +30,30 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         for (idx, param) in self.func.params.iter().enumerate() {
             let param_sig = &sig.params[idx];
             let assigned_reg = self.regalloc.reg(*param);
-            let offset = self.layout.offset(*param);
             match locations[idx] {
                 IrArgLocation::IntReg(reg_idx) => {
                     let src = format!("a{}", reg_idx);
                     if param_sig.ty == Type::F32 && !param_sig.is_pointer {
                         if let Some(reg) = self.float_regalloc.reg(*param) {
                             self.body.push_str(&format!("  fmv.w.x {}, {}\n", reg, src));
-                            self.store_frame_s(reg, offset);
                         } else {
-                            self.store_frame_w(&src, offset);
+                            self.store_frame_w(&src, self.layout.offset(*param));
                         }
                     } else if let Some(reg) = assigned_reg {
                         self.body.push_str(&format!("  mv {}, {}\n", reg, src));
                     } else if param_sig.is_pointer {
-                        self.store_frame_x(&src, offset);
+                        self.store_frame_x(&src, self.layout.offset(*param));
                     } else {
-                        self.store_frame_w(&src, offset);
+                        self.store_frame_w(&src, self.layout.offset(*param));
                     }
                 }
                 IrArgLocation::FloatReg(reg_idx) => {
                     let src = format!("fa{}", reg_idx);
                     if let Some(reg) = self.float_regalloc.reg(*param) {
                         self.body.push_str(&format!("  fmv.s {}, {}\n", reg, src));
+                    } else {
+                        self.store_frame_s(&src, self.layout.offset(*param));
                     }
-                    self.store_frame_s(&src, offset);
                 }
                 IrArgLocation::Stack => {
                     let src = 16 + (stack_idx as i32) * 8;
@@ -63,22 +62,21 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                         if let Some(reg) = assigned_reg {
                             self.body.push_str(&format!("  mv {}, a0\n", reg));
                         } else {
-                            self.store_frame_x("a0", offset);
+                            self.store_frame_x("a0", self.layout.offset(*param));
                         }
                     } else if param_sig.ty == Type::F32 {
                         if let Some(reg) = self.float_regalloc.reg(*param) {
                             self.load_raw_frame_s(reg, src);
-                            self.store_frame_s(reg, offset);
                         } else {
                             self.load_raw_frame_s("fa0", src);
-                            self.store_frame_s("fa0", offset);
+                            self.store_frame_s("fa0", self.layout.offset(*param));
                         }
                     } else {
                         self.load_raw_frame_w("a0", src);
                         if let Some(reg) = assigned_reg {
                             self.body.push_str(&format!("  mv {}, a0\n", reg));
                         } else {
-                            self.store_frame_w("a0", offset);
+                            self.store_frame_w("a0", self.layout.offset(*param));
                         }
                     }
                     stack_idx += 1;

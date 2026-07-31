@@ -1,3 +1,4 @@
+mod adjacent_loop_fusion;
 mod const_fold;
 mod const_specialize;
 mod constant_address_reduction;
@@ -8,8 +9,6 @@ mod function_effects;
 mod gep_induction;
 mod global_const_prop;
 mod global_scalar_localize;
-mod guarded_mulmod;
-mod guarded_pow2_digit;
 mod inline;
 mod inst_combine;
 mod invariant_load;
@@ -18,21 +17,21 @@ mod local_forward;
 mod local_memzero_sink;
 mod loop_analysis;
 mod loop_call_memoize;
-mod periodic_reduction_memoize;
 mod pointer_recurrence_coalesce;
-mod producer_consumer_fusion;
+mod range_integer;
 mod recursive_inline;
 mod reduction_jam;
 mod regional_global_scalar;
 mod repeat_reduction;
-mod repeated_overwrite;
 mod scalar_promote;
 mod simple_loop_unroll;
 mod simplify_cfg;
+mod small_loop_full_unroll;
 mod tail_recursion;
 mod util;
 
 use super::Module;
+use adjacent_loop_fusion::AdjacentLoopFusionPass;
 use const_fold::ConstFoldPass;
 use const_specialize::ConstSpecializePass;
 use constant_address_reduction::ConstantAddressReductionPass;
@@ -41,8 +40,6 @@ use dce::DcePass;
 use gep_induction::GepInductionPass;
 use global_const_prop::GlobalConstPropPass;
 use global_scalar_localize::GlobalScalarLocalizePass;
-use guarded_mulmod::GuardedMulModPass;
-use guarded_pow2_digit::GuardedPow2DigitPass;
 use inline::InlineSmallExprPass;
 use inst_combine::InstCombinePass;
 use invariant_load::InvariantLoadForwardPass;
@@ -50,17 +47,16 @@ use licm::LicmPass;
 use local_forward::LocalForwardPass;
 use local_memzero_sink::LocalMemzeroSinkPass;
 use loop_call_memoize::LoopCallMemoizePass;
-use periodic_reduction_memoize::PeriodicReductionMemoizePass;
 use pointer_recurrence_coalesce::PointerRecurrenceCoalescePass;
-use producer_consumer_fusion::ProducerConsumerFusionPass;
+use range_integer::RangeIntegerSimplifyPass;
 use recursive_inline::{CfgInlinePass, RecursiveInlinePass};
 use reduction_jam::ReductionJamPass;
 use regional_global_scalar::RegionalGlobalScalarPass;
 use repeat_reduction::RepeatReductionPass;
-use repeated_overwrite::RepeatedOverwritePass;
 use scalar_promote::ScalarPromotePass;
 use simple_loop_unroll::SimpleLoopUnrollPass;
 use simplify_cfg::SimplifyCfgPass;
+use small_loop_full_unroll::SmallLoopFullUnrollPass;
 use tail_recursion::TailRecursionPass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,16 +71,14 @@ pub struct PassOptions {
     pub small_expr_inline_rounds: usize,
     pub cfg_inline_rounds: usize,
     pub cfg_inline_global_loads: bool,
+    pub recursive_inline_rounds: usize,
     pub enable_constant_address_count_reduction: bool,
     pub enable_recursive_const_specialization: bool,
+    pub enable_initialized_global_propagation: bool,
+    pub enable_uniform_constant_arguments: bool,
     pub enable_loop_call_memoize: bool,
     pub enable_loop_invariant_call_memoize: bool,
-    pub enable_repeated_overwrite_elision: bool,
-    pub enable_guarded_mulmod_idiom: bool,
-    pub enable_guarded_pow2_digit_idiom: bool,
     pub enable_regional_global_scalar_promotion: bool,
-    pub enable_producer_consumer_fusion: bool,
-    pub enable_periodic_reduction_memoize: bool,
     pub enable_write_only_alloca_cleanup_before_inline: bool,
 }
 
@@ -111,7 +105,9 @@ pub fn run_pipeline_with_reduction_jam_factor(
         }
         OptLevel::O1 => {
             // 先传播只读全局常量、折叠常量和清理死代码，再做标量提升/局部转发。
-            pipeline.add(GlobalConstPropPass::new());
+            pipeline.add(GlobalConstPropPass::new(
+                options.enable_initialized_global_propagation,
+            ));
             pipeline.add(ConstFoldPass::new());
             if options.enable_write_only_alloca_cleanup_before_inline {
                 pipeline.add(DcePass::new());
@@ -124,40 +120,34 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(GlobalScalarLocalizePass::new_across_no_memory_calls());
             pipeline.add(ScalarPromotePass::new());
-            if options.enable_guarded_mulmod_idiom {
-                pipeline.add(GuardedMulModPass::new());
-            }
-            if options.enable_guarded_pow2_digit_idiom {
-                pipeline.add(GuardedPow2DigitPass::new());
-            }
             pipeline.add(ConstSpecializePass::new(
                 options.enable_recursive_const_specialization,
+                options.enable_uniform_constant_arguments,
             ));
             pipeline.add(ConstFoldPass::new());
-            if options.enable_guarded_pow2_digit_idiom {
-                pipeline.add(GuardedPow2DigitPass::new());
-            }
+            pipeline.add(SmallLoopFullUnrollPass::new());
+            pipeline.add(ConstFoldPass::new());
             pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
             if options.enable_write_only_alloca_cleanup_before_inline {
                 pipeline.add(DcePass::new());
             } else {
                 pipeline.add(DcePass::preserving_write_only_allocas());
             }
-            pipeline.add(RecursiveInlinePass::new());
+            pipeline.add(RecursiveInlinePass::with_rounds(
+                options.recursive_inline_rounds,
+            ));
             for _ in 0..options.small_expr_inline_rounds {
                 pipeline.add(InlineSmallExprPass::new());
             }
             for _ in 0..options.cfg_inline_rounds {
                 pipeline.add(CfgInlinePass::new(options.cfg_inline_global_loads));
             }
+            pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
+            pipeline.add(RangeIntegerSimplifyPass::new());
+            pipeline.add(DcePass::new());
+            pipeline.add(AdjacentLoopFusionPass::new());
             pipeline.add(LocalForwardPass::new());
             pipeline.add(CsePass::new());
-            if options.enable_producer_consumer_fusion {
-                pipeline.add(ProducerConsumerFusionPass::new());
-            }
-            if options.enable_periodic_reduction_memoize {
-                pipeline.add(PeriodicReductionMemoizePass::new());
-            }
             pipeline.add(LicmPass::new());
             pipeline.add(InvariantLoadForwardPass::new());
             pipeline.add(InstCombinePass::divisibility_only());
@@ -175,9 +165,6 @@ pub fn run_pipeline_with_reduction_jam_factor(
             }
             if options.enable_loop_invariant_call_memoize {
                 pipeline.add(LoopCallMemoizePass::new_invariant_calls());
-            }
-            if options.enable_repeated_overwrite_elision {
-                pipeline.add(RepeatedOverwritePass::new());
             }
             if options.enable_regional_global_scalar_promotion {
                 pipeline.add(RegionalGlobalScalarPass::new());

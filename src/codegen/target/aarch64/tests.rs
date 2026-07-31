@@ -21,6 +21,72 @@ fn block_asm<'a>(function_asm: &'a str, name: &str, block: usize) -> &'a str {
 }
 
 #[test]
+fn reduces_a_twice_bounded_signed_remainder_with_conditional_selects() {
+    let mut reduce = Function::new("bounded_reduce", Type::I32);
+    let input = reduce.add_param("input", Type::I32);
+    let divisor = reduce.add_const(Const::Int(97));
+    let reduced = reduce
+        .append_inst(
+            reduce.entry,
+            InstKind::Binary {
+                op: BinaryOp::Imod,
+                lhs: input,
+                rhs: divisor,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    reduce.set_terminator(reduce.entry, Terminator::Return(Some(reduced)));
+
+    let mut caller = Function::new("double_bounded", Type::I32);
+    let input = caller.add_param("input", Type::I32);
+    let reduced = caller
+        .append_inst(
+            caller.entry,
+            InstKind::Call {
+                name: "bounded_reduce".into(),
+                args: vec![input],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let doubled = caller
+        .append_inst(
+            caller.entry,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: reduced,
+                rhs: reduced,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let divisor = caller.add_const(Const::Int(97));
+    let result = caller
+        .append_inst(
+            caller.entry,
+            InstKind::Binary {
+                op: BinaryOp::Imod,
+                lhs: doubled,
+                rhs: divisor,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    caller.set_terminator(caller.entry, Terminator::Return(Some(result)));
+
+    let mut module = Module::new();
+    module.add_func(reduce);
+    module.add_func(caller);
+    let asm = emit_ir_asm(&module);
+    let caller_asm = function_asm(&asm, "double_bounded");
+
+    assert_eq!(caller_asm.matches("  csel ").count(), 2);
+    assert!(caller_asm.contains("  neg w1, w1\n"));
+    assert!(!caller_asm.contains("  smull "));
+}
+
+#[test]
 fn keeps_straight_line_float_intermediates_in_registers() {
     let mut function = Function::new("float_expr", Type::F32);
     let lhs = function.add_param("lhs", Type::F32);

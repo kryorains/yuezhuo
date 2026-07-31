@@ -1138,6 +1138,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             return;
         }
 
+        if remainder && self.emit_narrow_signed_remainder(value, &source, divisor, destination) {
+            return;
+        }
+
         let abs_divisor = divisor.unsigned_abs();
         if abs_divisor.is_power_of_two() {
             self.emit_assigned_signed_divmod_pow2(
@@ -1187,6 +1191,53 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         } else if destination != "w2" {
             self.body.push_str(&format!("  mov {}, w2\n", destination));
         }
+    }
+
+    fn emit_narrow_signed_remainder(
+        &mut self,
+        value: ValueId,
+        source: &str,
+        divisor: i32,
+        destination: &str,
+    ) -> bool {
+        let Some(range) = self.int_ranges[value.0] else {
+            return false;
+        };
+        let bound = i64::from(divisor).abs();
+        if bound <= 1 || bound > i64::from(i32::MAX) {
+            return false;
+        }
+        if range.min > -bound && range.max < bound {
+            if source != destination {
+                self.body
+                    .push_str(&format!("  mov {}, {}\n", destination, source));
+            }
+            return true;
+        }
+        if (bound as u32).is_power_of_two() || range.min <= -2 * bound || range.max >= 2 * bound {
+            return false;
+        }
+
+        if range.min > -bound {
+            self.body.push_str(&mov_w_imm("w1", bound as i32));
+            self.body.push_str(&format!(
+                "  cmp {source}, w1\n  sub w2, {source}, w1\n  csel {destination}, w2, {source}, ge\n"
+            ));
+            return true;
+        }
+        if range.max < bound {
+            self.body.push_str(&mov_w_imm("w1", -(bound as i32)));
+            self.body.push_str(&format!(
+                "  cmp {source}, w1\n  sub w2, {source}, w1\n  csel {destination}, w2, {source}, le\n"
+            ));
+            return true;
+        }
+
+        self.body.push_str(&mov_w_imm("w1", bound as i32));
+        self.body.push_str(&format!(
+            "  cmp {source}, w1\n  sub w2, {source}, w1\n  csel {destination}, w2, {source}, ge\n  neg w1, w1\n  cmp {source}, w1\n  sub w2, {source}, w1\n  csel {destination}, w2, {destination}, le\n"
+        ));
+        true
     }
 
     fn direct_branch_icmp(&self, value: ValueId) -> Option<(CmpOp, ValueId, ValueId)> {

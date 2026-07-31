@@ -67,6 +67,12 @@ enum NormalizedPhiCopy {
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     pub(super) fn emit_inst(&mut self, inst: &Inst) {
+        if inst
+            .result
+            .is_some_and(|result| self.elided_values.contains(&result))
+        {
+            return;
+        }
         match &inst.kind {
             InstKind::Nop => {}
             InstKind::Phi { incomings } => {
@@ -310,6 +316,9 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             let (Some(result), InstKind::Phi { incomings }) = (inst.result, &inst.kind) else {
                 continue;
             };
+            if self.elided_values.contains(&result) {
+                continue;
+            }
             let Some((_, incoming)) = incomings.iter().find(|(pred, _)| pred.0 == pred_idx) else {
                 continue;
             };
@@ -1213,6 +1222,10 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             return;
         }
 
+        if remainder && self.emit_narrow_signed_remainder(value, divisor, destination) {
+            return;
+        }
+
         let source = self.load_or_assigned(value, "a0");
         let abs_divisor = divisor.unsigned_abs();
         if remainder && abs_divisor.is_power_of_two() {
@@ -1306,6 +1319,52 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         } else {
             self.body.push_str(&format!("  mv {}, t0\n", destination));
         }
+    }
+
+    fn emit_narrow_signed_remainder(
+        &mut self,
+        value: ValueId,
+        divisor: i32,
+        destination: &'static str,
+    ) -> bool {
+        let Some(range) = self.int_ranges[value.0] else {
+            return false;
+        };
+        let bound = i64::from(divisor).abs();
+        if bound <= 1 || bound > i64::from(i32::MAX) {
+            return false;
+        }
+
+        let source = self.load_or_assigned(value, "a0");
+        if range.min > -bound && range.max < bound {
+            if source != destination {
+                self.body
+                    .push_str(&format!("  mv {}, {}\n", destination, source));
+            }
+            return true;
+        }
+        if (bound as u32).is_power_of_two() {
+            return false;
+        }
+        if range.min > -2 * bound && range.max < 2 * bound {
+            if range.min > -bound {
+                self.body.push_str(&format!(
+                    "  li t0, {bound}\n  slt t1, {source}, t0\n  addi t1, t1, -1\n  and t1, t1, t0\n  subw {destination}, {source}, t1\n"
+                ));
+                return true;
+            }
+            if range.max < bound {
+                self.body.push_str(&format!(
+                    "  li t0, {bound}\n  negw t1, t0\n  addiw t1, t1, 1\n  slt t1, {source}, t1\n  negw t1, t1\n  and t1, t1, t0\n  addw {destination}, {source}, t1\n"
+                ));
+                return true;
+            }
+            self.body.push_str(&format!(
+                "  li t0, {bound}\n  slt t1, {source}, t0\n  xori t1, t1, 1\n  negw t2, t0\n  addiw t2, t2, 1\n  slt t2, {source}, t2\n  subw t1, t1, t2\n  mulw t1, t1, t0\n  subw {destination}, {source}, t1\n"
+            ));
+            return true;
+        }
+        false
     }
 
     fn direct_branch_icmp(&self, value: ValueId) -> Option<(CmpOp, ValueId, ValueId)> {

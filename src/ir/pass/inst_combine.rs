@@ -265,6 +265,12 @@ fn combine_binary(
         }
     }
 
+    if op == BinaryOp::Idiv {
+        if let Some(combined) = combine_positive_constant_divisions(func, lhs, rhs) {
+            return combined;
+        }
+    }
+
     if matches!(op, BinaryOp::Iadd | BinaryOp::Imul) {
         if let Some((base, constant)) = reassociate_constants(func, op, lhs, rhs) {
             lhs = base;
@@ -274,6 +280,52 @@ fn combine_binary(
     }
 
     InstKind::Binary { op, lhs, rhs }
+}
+
+/// Reassociates `(x / a) / b` to `x / (a * b)` for positive constants.
+///
+/// Signed integer division truncates toward zero, so this is exact when both
+/// divisors are positive. If their product is larger than every possible i32
+/// magnitude, the quotient is identically zero. The boundary product `2^31`
+/// is deliberately left alone because `i32::MIN / 2^31 == -1`.
+fn combine_positive_constant_divisions(
+    func: &mut Function,
+    quotient: ValueId,
+    outer_divisor: ValueId,
+) -> Option<InstKind> {
+    let outer = const_i32(func, outer_divisor)?;
+    if outer <= 0 {
+        return None;
+    }
+    let InstKind::Binary {
+        op: BinaryOp::Idiv,
+        lhs: dividend,
+        rhs: inner_divisor,
+    } = defining_inst(func, quotient)?.clone()
+    else {
+        return None;
+    };
+    let inner = const_i32(func, inner_divisor)?;
+    if inner <= 0 {
+        return None;
+    }
+
+    let product = i64::from(inner) * i64::from(outer);
+    if product <= i64::from(i32::MAX) {
+        return Some(InstKind::Binary {
+            op: BinaryOp::Idiv,
+            lhs: dividend,
+            rhs: get_or_add_i32_const(func, product as i32),
+        });
+    }
+    if product > i64::from(i32::MAX) + 1 {
+        return Some(InstKind::Binary {
+            op: BinaryOp::Iand,
+            lhs: dividend,
+            rhs: get_or_add_i32_const(func, 0),
+        });
+    }
+    None
 }
 
 /// Keeps constants on the right and otherwise orders operands by ValueId.
@@ -506,6 +558,116 @@ mod tests {
                     ..
                 }
             ));
+            assert!(func.verify().is_ok());
+        }
+    }
+
+    #[test]
+    fn reassociates_nested_positive_constant_divisions() {
+        let mut func = Function::new("generic_division_chain", Type::I32);
+        let dividend = func.add_param("value", Type::I32);
+        let four = func.add_const(Const::Int(4));
+        let eight = func.add_const(Const::Int(8));
+        let first = func
+            .append_inst(
+                func.entry,
+                InstKind::Binary {
+                    op: BinaryOp::Idiv,
+                    lhs: dividend,
+                    rhs: four,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let second = func
+            .append_inst(
+                func.entry,
+                InstKind::Binary {
+                    op: BinaryOp::Idiv,
+                    lhs: first,
+                    rhs: eight,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(func.entry, Terminator::Return(Some(second)));
+
+        combine_function(&mut func);
+
+        let ValueKind::Inst(block, inst_idx) = func.value(second).kind else {
+            panic!("quotient must remain instruction-backed");
+        };
+        assert!(matches!(
+            func.blocks[block.0].insts[inst_idx].kind,
+            InstKind::Binary {
+                op: BinaryOp::Idiv,
+                lhs,
+                rhs,
+            } if lhs == dividend && const_i32(&func, rhs) == Some(32)
+        ));
+        assert!(func.verify().is_ok());
+    }
+
+    #[test]
+    fn folds_only_provably_zero_oversized_positive_division_products() {
+        for (inner, outer, folds_to_zero) in [
+            (1 << 28, 16, true),
+            (1 << 28, 8, false),
+            (1 << 28, -16, false),
+        ] {
+            let mut func = Function::new("division_product_boundary", Type::I32);
+            let dividend = func.add_param("value", Type::I32);
+            let inner_divisor = func.add_const(Const::Int(inner));
+            let outer_divisor = func.add_const(Const::Int(outer));
+            let first = func
+                .append_inst(
+                    func.entry,
+                    InstKind::Binary {
+                        op: BinaryOp::Idiv,
+                        lhs: dividend,
+                        rhs: inner_divisor,
+                    },
+                    Some(Type::I32),
+                )
+                .unwrap();
+            let second = func
+                .append_inst(
+                    func.entry,
+                    InstKind::Binary {
+                        op: BinaryOp::Idiv,
+                        lhs: first,
+                        rhs: outer_divisor,
+                    },
+                    Some(Type::I32),
+                )
+                .unwrap();
+            func.set_terminator(func.entry, Terminator::Return(Some(second)));
+
+            combine_function(&mut func);
+
+            let ValueKind::Inst(block, inst_idx) = func.value(second).kind else {
+                panic!("quotient must remain instruction-backed");
+            };
+            let kind = &func.blocks[block.0].insts[inst_idx].kind;
+            if folds_to_zero {
+                assert!(matches!(
+                    kind,
+                    InstKind::Binary {
+                        op: BinaryOp::Iand,
+                        lhs,
+                        rhs,
+                    } if *lhs == dividend && const_i32(&func, *rhs) == Some(0)
+                ));
+            } else {
+                assert!(matches!(
+                    kind,
+                    InstKind::Binary {
+                        op: BinaryOp::Idiv,
+                        lhs,
+                        rhs,
+                    } if *lhs == first && *rhs == outer_divisor
+                ));
+            }
             assert!(func.verify().is_ok());
         }
     }

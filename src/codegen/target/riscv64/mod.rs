@@ -9,10 +9,11 @@ pub(in crate::codegen::target) mod regalloc;
 use crate::codegen::common::{IrFuncLayout, IrLocalRegs};
 use crate::ir::{Function, Module, ValueId};
 use regalloc::{Riscv64FloatRegAlloc, Riscv64RegAlloc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 struct Riscv64IrEmitter<'a> {
     ctx: crate::codegen::common::IrModuleCtx<'a>,
+    int_return_ranges: HashMap<String, crate::ir::int_range::IntRange>,
     out: String,
 }
 
@@ -25,7 +26,9 @@ struct Riscv64IrFuncEmitter<'a, 'b> {
     saved_area_size: i32,
     local_regs: IrLocalRegs,
     value_use_counts: Vec<usize>,
+    int_ranges: Vec<Option<crate::ir::int_range::IntRange>>,
     folded_memory_geps: HashMap<ValueId, memory::FoldedMemoryGep>,
+    elided_values: HashSet<ValueId>,
     body: String,
     return_label: String,
 }

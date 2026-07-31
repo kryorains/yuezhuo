@@ -3,17 +3,21 @@ use super::ModulePass;
 use crate::ir::{Const, Function, Global, InstKind, Module, Terminator, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
-pub(super) struct GlobalConstPropPass;
+pub(super) struct GlobalConstPropPass {
+    include_initialized_mutable: bool,
+}
 
 impl GlobalConstPropPass {
-    pub(super) fn new() -> Self {
-        Self
+    pub(super) fn new(include_initialized_mutable: bool) -> Self {
+        Self {
+            include_initialized_mutable,
+        }
     }
 }
 
 impl ModulePass for GlobalConstPropPass {
     fn run(&mut self, module: &mut Module) {
-        let mut candidates = collect_candidates(&module.globals);
+        let mut candidates = collect_candidates(&module.globals, self.include_initialized_mutable);
         reject_written_or_escaping_globals(&module.funcs, &mut candidates);
         if candidates.symbols.is_empty() {
             return;
@@ -36,7 +40,7 @@ struct Candidates {
     objects: Vec<Option<Candidate>>,
 }
 
-fn collect_candidates(globals: &[Global]) -> Candidates {
+fn collect_candidates(globals: &[Global], include_initialized_mutable: bool) -> Candidates {
     let mut seen = HashSet::new();
     let mut symbols = HashMap::new();
     let mut objects = vec![None; globals.len()];
@@ -48,7 +52,7 @@ fn collect_candidates(globals: &[Global]) -> Candidates {
             symbols.remove(&global.name);
             continue;
         }
-        if let Some(candidate) = candidate(global) {
+        if let Some(candidate) = candidate(global, include_initialized_mutable) {
             objects[object] = Some(candidate);
             symbols.insert(global.name.clone(), object);
         }
@@ -56,8 +60,10 @@ fn collect_candidates(globals: &[Global]) -> Candidates {
     Candidates { symbols, objects }
 }
 
-fn candidate(global: &Global) -> Option<Candidate> {
-    if !global.is_const || !matches!(global.ty, Type::I1 | Type::I32 | Type::F32) {
+fn candidate(global: &Global, include_initialized_mutable: bool) -> Option<Candidate> {
+    if (!global.is_const && !include_initialized_mutable)
+        || !matches!(global.ty, Type::I1 | Type::I32 | Type::F32)
+    {
         return None;
     }
     let init = global.init.as_ref()?;
@@ -201,5 +207,77 @@ fn propagate_function(func: &mut Function, candidates: &Candidates) {
             "global constant propagation produced invalid IR in {}: {:?}",
             func.name, errors
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn propagates_initialized_scalar_that_is_never_written() {
+        let mut module = Module::new();
+        module.globals.push(Global {
+            name: "runtime_size".into(),
+            ty: Type::I32,
+            is_const: false,
+            init: Some(Const::Int(37)),
+        });
+        let mut main = Function::new("main", Type::I32);
+        let global = main.add_global_ref("runtime_size", Type::Ptr(Box::new(Type::I32)));
+        let loaded = main
+            .append_inst(main.entry, InstKind::Load { ptr: global }, Some(Type::I32))
+            .unwrap();
+        main.set_terminator(main.entry, Terminator::Return(Some(loaded)));
+        module.add_func(main);
+
+        GlobalConstPropPass::new(true).run(&mut module);
+
+        assert!(matches!(
+            module.funcs[0].blocks[0].insts[0].kind,
+            InstKind::Nop
+        ));
+        let Some(Terminator::Return(Some(returned))) =
+            module.funcs[0].blocks[0].terminator.as_ref()
+        else {
+            panic!("expected scalar return");
+        };
+        assert!(matches!(
+            module.funcs[0].values[returned.0].kind,
+            ValueKind::Const(Const::Int(37))
+        ));
+    }
+
+    #[test]
+    fn keeps_mutable_scalar_when_any_store_exists() {
+        let mut module = Module::new();
+        module.globals.push(Global {
+            name: "mutable_size".into(),
+            ty: Type::I32,
+            is_const: false,
+            init: Some(Const::Int(11)),
+        });
+        let mut main = Function::new("main", Type::I32);
+        let global = main.add_global_ref("mutable_size", Type::Ptr(Box::new(Type::I32)));
+        let loaded = main
+            .append_inst(main.entry, InstKind::Load { ptr: global }, Some(Type::I32))
+            .unwrap();
+        main.append_inst(
+            main.entry,
+            InstKind::Store {
+                ptr: global,
+                value: loaded,
+            },
+            None,
+        );
+        main.set_terminator(main.entry, Terminator::Return(Some(loaded)));
+        module.add_func(main);
+
+        GlobalConstPropPass::new(true).run(&mut module);
+
+        assert!(matches!(
+            module.funcs[0].blocks[0].insts[0].kind,
+            InstKind::Load { .. }
+        ));
     }
 }

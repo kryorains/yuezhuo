@@ -753,16 +753,16 @@ float total(float values[], int count) {
 }
 
 int main() {
-    float values[4];
+    float values[9];
     int initialized = 0;
     int iteration = 0;
     float answer = 0;
-    while (iteration < 3) {
-        while (initialized < 4) {
+    while (iteration < 9) {
+        while (initialized < 9) {
             values[initialized] = initialized;
             initialized = initialized + 1;
         }
-        answer = answer + total(values, 4);
+        answer = answer + total(values, 9);
         iteration = iteration + 1;
     }
     return answer > 0;
@@ -771,7 +771,7 @@ int main() {
             true,
         );
         let main = function(&module, "main");
-        assert_eq!(call_count(main, "total"), 1);
+        assert_eq!(call_count_with_prefix(main, "total"), 1);
         assert!(main
             .blocks
             .iter()
@@ -798,17 +798,19 @@ float total(float values[], int count) {
 }
 
 int main() {
-    float values[4];
+    float values[16];
     int initialized = 0;
     int iteration = 0;
+    int rounds = getint();
+    int length = getint();
     float answer = 0;
-    while (iteration < 3) {
-        while (initialized < 4) {
+    while (iteration < rounds) {
+        while (initialized < length) {
             values[initialized] = initialized;
             initialized = initialized + 1;
         }
         values[0] = iteration;
-        answer = answer + total(values, 4);
+        answer = answer + total(values, length);
         iteration = iteration + 1;
     }
     return answer > 0;
@@ -834,16 +836,14 @@ int main() {
                 small_expr_inline_rounds: 1,
                 cfg_inline_rounds: 0,
                 cfg_inline_global_loads: false,
+                recursive_inline_rounds: 1,
                 enable_constant_address_count_reduction: false,
                 enable_recursive_const_specialization: false,
+                enable_initialized_global_propagation: false,
+                enable_uniform_constant_arguments: false,
                 enable_loop_call_memoize,
                 enable_loop_invariant_call_memoize: false,
-                enable_repeated_overwrite_elision: false,
-                enable_guarded_mulmod_idiom: false,
-                enable_guarded_pow2_digit_idiom: false,
                 enable_regional_global_scalar_promotion: false,
-                enable_producer_consumer_fusion: false,
-                enable_periodic_reduction_memoize: false,
                 enable_write_only_alloca_cleanup_before_inline: false,
             },
         );
@@ -859,7 +859,7 @@ int main() {
             .expect("test function must exist")
     }
 
-    fn call_count(func: &Function, name: &str) -> usize {
+    fn call_count_with_prefix(func: &Function, name: &str) -> usize {
         func.blocks
             .iter()
             .flat_map(|block| &block.insts)
@@ -869,7 +869,7 @@ int main() {
                     InstKind::Call {
                         name: target,
                         ..
-                    } if target == name
+                    } if target == name || target.starts_with(&format!("{name}.specialized."))
                 )
             })
             .count()

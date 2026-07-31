@@ -55,7 +55,13 @@ struct Candidate {
     latch: BlockId,
     pointer_ty: Type,
     step_index: i32,
-    affine_indices: HashMap<ValueId, i32>,
+    affine_indices: HashMap<ValueId, AffineOffset>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AffineOffset {
+    Constant(i32),
+    Invariant(ValueId),
 }
 
 fn strength_reduce_function(func: &mut Function) {
@@ -77,12 +83,12 @@ fn strength_reduce_function(func: &mut Function) {
     let mut claimed = HashSet::new();
 
     for natural_loop in &loops {
-        let (Some(preheader), Some(latch)) = (
-            natural_loop.dedicated_preheader,
-            natural_loop.unique_latch(),
-        ) else {
+        let Some(preheader) = natural_loop.dedicated_preheader else {
             continue;
         };
+        if natural_loop.unique_latch().is_none() {
+            continue;
+        }
         if natural_loop.unique_entering_pred != Some(preheader)
             || natural_loop.blocks.iter().any(|block| {
                 func.blocks[block.0]
@@ -127,15 +133,9 @@ fn strength_reduce_function(func: &mut Function) {
                     if !uses_are_internal_and_dominated(func, &dom, natural_loop, target) {
                         continue;
                     }
-                    if let Some(candidate) = analyze_candidate(
-                        func,
-                        &dom,
-                        natural_loop,
-                        induction,
-                        preheader,
-                        latch,
-                        target,
-                    ) {
+                    if let Some(candidate) =
+                        analyze_candidate(func, &dom, natural_loop, &loops, induction, target)
+                    {
                         if candidates.len().saturating_add(affine.len()) >= MAX_CANDIDATES {
                             return;
                         }
@@ -172,7 +172,7 @@ fn strength_reduce_function(func: &mut Function) {
                     .affine_indices
                     .values()
                     .copied()
-                    .filter(|offset| *offset != 0)
+                    .filter(|offset| *offset != AffineOffset::Constant(0))
                     .collect::<HashSet<_>>()
                     .len();
                 let new_instructions = candidate
@@ -226,11 +226,12 @@ fn analyze_candidate(
     func: &Function,
     dom: &Dominators,
     natural_loop: &NaturalLoop,
+    all_loops: &[NaturalLoop],
     induction: InductionVariable,
-    preheader: BlockId,
-    latch: BlockId,
     target: ValueId,
 ) -> Option<Candidate> {
+    let preheader = natural_loop.dedicated_preheader?;
+    let latch = natural_loop.unique_latch()?;
     let pointer_ty = func.values.get(target.0)?.ty.clone();
     let final_elem_size = match &pointer_ty {
         Type::Ptr(pointee) => checked_type_size(pointee)?.max(1),
@@ -264,7 +265,14 @@ fn analyze_candidate(
             }
             if let Some(offset) =
                 affine_induction_offset(func, *index, induction.phi).filter(|offset| {
-                    derived_index_does_not_wrap(func, natural_loop, induction, *offset)
+                    affine_offset_available(func, dom, natural_loop, preheader, *offset)
+                        && derived_index_does_not_wrap(
+                            func,
+                            natural_loop,
+                            all_loops,
+                            induction,
+                            *offset,
+                        )
                 })
             {
                 coefficient = coefficient.checked_add(stride)?;
@@ -319,27 +327,57 @@ fn analyze_candidate(
     })
 }
 
-fn affine_induction_offset(func: &Function, value: ValueId, induction: ValueId) -> Option<i32> {
+fn affine_induction_offset(
+    func: &Function,
+    value: ValueId,
+    induction: ValueId,
+) -> Option<AffineOffset> {
     if value == induction {
-        return Some(0);
+        return Some(AffineOffset::Constant(0));
     }
     match defining_inst(func, value)? {
         InstKind::Binary {
             op: crate::ir::BinaryOp::Iadd,
             lhs,
             rhs,
-        } if *lhs == induction => const_i32(func, *rhs),
+        } if *lhs == induction => Some(
+            const_i32(func, *rhs)
+                .map(AffineOffset::Constant)
+                .unwrap_or(AffineOffset::Invariant(*rhs)),
+        ),
         InstKind::Binary {
             op: crate::ir::BinaryOp::Iadd,
             lhs,
             rhs,
-        } if *rhs == induction => const_i32(func, *lhs),
+        } if *rhs == induction => Some(
+            const_i32(func, *lhs)
+                .map(AffineOffset::Constant)
+                .unwrap_or(AffineOffset::Invariant(*lhs)),
+        ),
         InstKind::Binary {
             op: crate::ir::BinaryOp::Isub,
             lhs,
             rhs,
-        } if *lhs == induction => const_i32(func, *rhs)?.checked_neg(),
+        } if *lhs == induction => const_i32(func, *rhs)?
+            .checked_neg()
+            .map(AffineOffset::Constant),
         _ => None,
+    }
+}
+
+fn affine_offset_available(
+    func: &Function,
+    dom: &Dominators,
+    natural_loop: &NaturalLoop,
+    preheader: BlockId,
+    offset: AffineOffset,
+) -> bool {
+    match offset {
+        AffineOffset::Constant(_) => true,
+        AffineOffset::Invariant(value) => {
+            is_loop_invariant(func, natural_loop, value)
+                && value_available_at(func, dom, value, preheader)
+        }
     }
 }
 
@@ -350,31 +388,32 @@ fn affine_induction_offset(func: &Function, value: ValueId, induction: ValueId) 
 fn derived_index_does_not_wrap(
     func: &Function,
     natural_loop: &NaturalLoop,
+    all_loops: &[NaturalLoop],
     induction: InductionVariable,
-    offset: i32,
+    offset: AffineOffset,
 ) -> bool {
-    if offset == 0 {
+    if offset == AffineOffset::Constant(0) {
         return true;
     }
-    let Some(initial) = const_i32(func, induction.initial).map(i64::from) else {
-        return false;
-    };
-    if let Some(trip_count) = analyze_const_i32_trip_count(func, natural_loop, induction) {
-        let Some(last) = i64::from(induction.step)
-            .checked_mul(i64::from(trip_count))
-            .and_then(|distance| initial.checked_add(distance))
-        else {
-            return false;
-        };
-        let minimum = initial.min(last);
-        let maximum = initial.max(last);
-        return minimum
-            .checked_add(i64::from(offset))
-            .zip(maximum.checked_add(i64::from(offset)))
+    if let (Some(induction_range), Some(offset_range)) = (
+        const_trip_induction_range(func, natural_loop, induction),
+        affine_offset_range(func, all_loops, offset),
+    ) {
+        return induction_range
+            .0
+            .checked_add(offset_range.0)
+            .zip(induction_range.1.checked_add(offset_range.1))
             .is_some_and(|(minimum, maximum)| {
                 minimum >= i64::from(i32::MIN) && maximum <= i64::from(i32::MAX)
             });
     }
+
+    let AffineOffset::Constant(offset) = offset else {
+        return false;
+    };
+    let Some(initial) = const_i32(func, induction.initial).map(i64::from) else {
+        return false;
+    };
 
     let modulus = gcd_u64(induction.step.unsigned_abs() as u64, 1u64 << 32) as i64;
     if modulus == 0 {
@@ -388,6 +427,38 @@ fn derived_index_does_not_wrap(
         .checked_add(i64::from(offset))
         .zip(maximum.checked_add(i64::from(offset)))
         .is_some_and(|(minimum, maximum)| minimum >= signed_minimum && maximum <= signed_maximum)
+}
+
+fn affine_offset_range(
+    func: &Function,
+    all_loops: &[NaturalLoop],
+    offset: AffineOffset,
+) -> Option<(i64, i64)> {
+    match offset {
+        AffineOffset::Constant(offset) => {
+            let offset = i64::from(offset);
+            Some((offset, offset))
+        }
+        AffineOffset::Invariant(value) => all_loops.iter().find_map(|natural_loop| {
+            let induction = analyze_i32_induction(func, natural_loop, value)?;
+            const_trip_induction_range(func, natural_loop, induction)
+        }),
+    }
+}
+
+fn const_trip_induction_range(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    induction: InductionVariable,
+) -> Option<(i64, i64)> {
+    let initial = i64::from(const_i32(func, induction.initial)?);
+    let trip_count = i64::from(analyze_const_i32_trip_count(func, natural_loop, induction)?);
+    let final_value = i64::from(induction.step)
+        .checked_mul(trip_count)?
+        .checked_add(initial)?;
+    let minimum = initial.min(final_value);
+    let maximum = initial.max(final_value);
+    (minimum >= i64::from(i32::MIN) && maximum <= i64::from(i32::MAX)).then_some((minimum, maximum))
 }
 
 fn gcd_u64(mut lhs: u64, mut rhs: u64) -> u64 {
@@ -469,8 +540,8 @@ fn induction_does_not_wrap(
 }
 
 fn build_pointer_recurrence(func: &mut Function, candidate: &Candidate) -> ValueId {
-    let mut affine_initials = HashMap::<i32, ValueId>::new();
-    affine_initials.insert(0, candidate.induction.initial);
+    let mut affine_initials = HashMap::<AffineOffset, ValueId>::new();
+    affine_initials.insert(AffineOffset::Constant(0), candidate.induction.initial);
     let mut initial_pointer = candidate.root;
     for node in &candidate.chain {
         let indices = node
@@ -483,18 +554,24 @@ fn build_pointer_recurrence(func: &mut Function, candidate: &Candidate) -> Value
                 if let Some(initial) = affine_initials.get(&offset).copied() {
                     return initial;
                 }
-                let offset_value = get_or_add_i32_const(func, offset);
-                let initial = func
-                    .append_inst(
+                let rhs = match offset {
+                    AffineOffset::Constant(offset) => get_or_add_i32_const(func, offset),
+                    AffineOffset::Invariant(value) => value,
+                };
+                let initial = if const_i32(func, candidate.induction.initial) == Some(0) {
+                    rhs
+                } else {
+                    func.append_inst(
                         candidate.preheader,
                         InstKind::Binary {
                             op: crate::ir::BinaryOp::Iadd,
                             lhs: candidate.induction.initial,
-                            rhs: offset_value,
+                            rhs,
                         },
                         Some(Type::I32),
                     )
-                    .expect("an affine recurrence start must produce i32");
+                    .expect("an affine recurrence start must produce i32")
+                };
                 affine_initials.insert(offset, initial);
                 initial
             })
@@ -914,6 +991,22 @@ mod tests {
     }
 
     #[test]
+    fn reduces_nested_induction_sum_only_with_proven_ranges() {
+        let (mut proven, target, inner_latch) = build_nested_sum_loop(Bound::Constant(10));
+        assert!(proven.verify().is_ok());
+        strength_reduce_function(&mut proven);
+        assert!(is_nop(&proven, target));
+        assert!(has_pointer_recurrence(&proven, inner_latch, 1));
+        assert!(proven.verify().is_ok());
+
+        let (mut unknown, target, _) = build_nested_sum_loop(Bound::Dynamic);
+        assert!(unknown.verify().is_ok());
+        strength_reduce_function(&mut unknown);
+        assert!(!is_nop(&unknown, target));
+        assert!(unknown.verify().is_ok());
+    }
+
+    #[test]
     fn rejects_call_crossing_loops_for_profitability() {
         let (mut func, target, body) = build_linear_loop(
             Type::Array {
@@ -1068,6 +1161,144 @@ mod tests {
         func.set_terminator(body, Terminator::Jump(header));
         func.set_terminator(exit, Terminator::Return(None));
         (func, target, body)
+    }
+
+    fn build_nested_sum_loop(outer_bound: Bound) -> (Function, ValueId, BlockId) {
+        let mut func = Function::new("nested_sum_address", Type::Void);
+        let base = func.add_param("buffer", Type::Ptr(Box::new(Type::I32)));
+        let dynamic_bound =
+            matches!(outer_bound, Bound::Dynamic).then(|| func.add_param("outer_end", Type::I32));
+        let zero = func.add_const(Const::Int(0));
+        let one = func.add_const(Const::Int(1));
+        let four = func.add_const(Const::Int(4));
+        let outer_bound = match outer_bound {
+            Bound::Dynamic => dynamic_bound.unwrap(),
+            Bound::Constant(value) => func.add_const(Const::Int(value)),
+        };
+        let outer_header = func.add_block("outer.header");
+        let inner_preheader = func.add_block("inner.preheader");
+        let inner_header = func.add_block("inner.header");
+        let inner_body = func.add_block("inner.body");
+        let inner_exit = func.add_block("inner.exit");
+        let exit = func.add_block("exit");
+        func.set_terminator(func.entry, Terminator::Jump(outer_header));
+
+        let outer = func
+            .append_inst(
+                outer_header,
+                InstKind::Phi {
+                    incomings: vec![(func.entry, zero), (inner_exit, zero)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let outer_condition = func
+            .append_inst(
+                outer_header,
+                InstKind::Icmp {
+                    op: CmpOp::Lt,
+                    lhs: outer,
+                    rhs: outer_bound,
+                },
+                Some(Type::I1),
+            )
+            .unwrap();
+        func.set_terminator(
+            outer_header,
+            Terminator::Branch {
+                cond: outer_condition,
+                then_target: inner_preheader,
+                else_target: exit,
+            },
+        );
+        func.set_terminator(inner_preheader, Terminator::Jump(inner_header));
+
+        let inner = func
+            .append_inst(
+                inner_header,
+                InstKind::Phi {
+                    incomings: vec![(inner_preheader, zero), (inner_body, zero)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let inner_condition = func
+            .append_inst(
+                inner_header,
+                InstKind::Icmp {
+                    op: CmpOp::Lt,
+                    lhs: inner,
+                    rhs: four,
+                },
+                Some(Type::I1),
+            )
+            .unwrap();
+        func.set_terminator(
+            inner_header,
+            Terminator::Branch {
+                cond: inner_condition,
+                then_target: inner_body,
+                else_target: inner_exit,
+            },
+        );
+        let index = func
+            .append_inst(
+                inner_body,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: outer,
+                    rhs: inner,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let target = func
+            .append_inst(
+                inner_body,
+                InstKind::Gep {
+                    base,
+                    indices: vec![index],
+                },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        func.append_inst(
+            inner_body,
+            InstKind::Store {
+                ptr: target,
+                value: inner,
+            },
+            None,
+        );
+        let inner_next = func
+            .append_inst(
+                inner_body,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: inner,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        set_phi_incoming(&mut func, inner, inner_body, inner_next);
+        func.set_terminator(inner_body, Terminator::Jump(inner_header));
+
+        let outer_next = func
+            .append_inst(
+                inner_exit,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: outer,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        set_phi_incoming(&mut func, outer, inner_exit, outer_next);
+        func.set_terminator(inner_exit, Terminator::Jump(outer_header));
+        func.set_terminator(exit, Terminator::Return(None));
+        (func, target, inner_body)
     }
 
     fn build_live_out_loop() -> (Function, ValueId) {
