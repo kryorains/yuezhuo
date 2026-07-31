@@ -56,13 +56,13 @@
   41. `SimplifyCfgPass`
   42. `DcePass`
 
-O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量特化、CFG 内联、常量折叠、CSE、LICM 等主动优化。O1 开头先传播只读全局常量，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；第一次标量提升会暴露 `NoMemory` 调用摘要，随后第二轮全局标量局部化和提升可安全跨纯调用保留状态。常量实参特化后立即折叠常量、清理 CFG 和死代码，再按统一成本模型执行递归及普通纯标量 CFG 内联。ReductionJam 前的一轮 InstCombine/ConstFold 会先把可证明安全的整除观察规范成无陷阱位运算，使严格 conditional reduction 可进入通用 loop matcher。O1 末尾再由 InstCombine 和 ConstFold 规范化局部整数算术，并执行通用 GEP 地址归纳强度削弱与 pointer recurrence 合并；第一轮 DCE 专门清掉被合并的 pointer `phi -> GEP -> phi` SCC，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。地址变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
+O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形式；不会执行 `GepInductionPass`、`InstCombinePass`、全局常量传播、常量特化、CFG 内联、常量折叠、CSE、LICM 等主动优化。O1 开头先传播已证明不可变的标量全局初值，让紧邻的 ConstFold 和 DCE 折叠其用户并清理原 load；第一次标量提升会暴露 `NoMemory` 调用摘要，随后第二轮全局标量局部化和提升可安全跨纯调用保留状态。常量实参特化先把闭世界全部调用点一致的标量参数直接传播进原函数，再为其余有收益的调用建立有预算变体；随后立即折叠常量、清理 CFG 和死代码，再按统一成本模型执行递归及普通纯标量 CFG 内联。ReductionJam 前的一轮 InstCombine/ConstFold 会先把可证明安全的整除观察规范成无陷阱位运算，使严格 conditional reduction 可进入通用 loop matcher。O1 末尾再由 InstCombine 和 ConstFold 规范化局部整数算术，并执行通用 GEP 地址归纳强度削弱与 pointer recurrence 合并；第一轮 DCE 专门清掉被合并的 pointer `phi -> GEP -> phi` SCC，最后由 SimplifyCfg 和 DCE 清理新暴露的控制流及死指令。地址变换放在 simple unroll 和其它依赖原始 loop-phi 集合的标准循环变换之后，避免新增 pointer phi 屏蔽已有收益。
 
 ## Pass 列表
 
 ### `GlobalConstPropPass` (`global_const_prop.rs`)
 
-通用的只读标量全局常量传播，仅接入 O1。pass 通过模块符号解析取得唯一全局对象；只有对象带有 `is_const`、对象类型是 i1/i32/f32，且初始化常量的 IR 类型与对象类型完全一致时，才会成为候选。
+通用的不可变标量全局初值传播，仅接入 O1。pass 通过模块符号解析取得唯一全局对象；对象类型必须是 i1/i32/f32，且初始化常量的 IR 类型与对象类型完全一致。源码 `const` 在所有目标进入证明流程；普通标量声明的“未写且不逃逸”闭世界扩展由目标成本模型控制，当前仅在经过整套回归的 RISC-V64 启用。
 
 模块中对候选地址的唯一合法使用是直接读取完整对象的 `load`；一旦地址参与 `store`、`memzero`、GEP、phi、调用或其它逃逸，整个对象都会保守退出传播。只有指针类型和结果类型都与对象精确一致的直接 load 会被替换；其它 load 保持原样。数组对象、数组元素和任何派生地址都不会传播。满足证明时，pass 在函数内建立对应的 IR `Const`，用共享 rewrite 工具改写用户并删除原 load；随后由 ConstFold 和 DCE 清理新暴露的常量表达式。变换不读取符号拼写，不依赖目标架构，重复运行幂等，并在改写后运行 verifier。
 
@@ -85,7 +85,9 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 
 ### `ConstSpecializePass` (`const_specialize.rs`)
 
-对具有标量常量实参的唯一内部调用目标创建有预算的函数变体，并在变体中把对应形参使用替换为常量。变换只使用符号唯一性、完整调用签名、参数 use-def 和统一的函数/模块代码增长预算；不读取函数名含义、变量名、块名或调用所在测例。只有至少被使用两次的形参参与特化；直接自递归函数保守跳过。每个函数的总变体数、轮数、块数、活动指令数和完整指令槽数均有固定上限，只传播 i1/i32/f32 标量常量。紧随其后的 ConstFold、SimplifyCfg 和 DCE 负责折叠分支及清理不可达路径。
+目标成本允许时，先对唯一内部目标执行无代码增长的闭世界实参传播：只有全部直接调用点在某个参数位置都传入同一个 i1/i32/f32 常量，才把原函数体中的该形参使用替换为常量；任一未知、非常量或不同常量调用都会让该参数保守退出。这条路径不受函数大小限制，并优先于变体克隆，因此既能优化过去无法克隆的大函数，也避免为只有一种实参状态的函数保留重复代码。当前只在 RISC-V64 启用；AArch64/x86-64 保持原有有预算变体路径，避免目标相关代码布局回退。
+
+随后对其余具有标量常量实参的唯一内部调用目标创建有预算的函数变体，并在变体中把对应形参使用替换为常量。变换只使用符号唯一性、完整调用签名、参数 use-def 和统一的函数/模块代码增长预算；不读取函数名含义、变量名、块名或调用所在测例。只有至少被使用两次的形参参与变体特化；直接自递归函数保守跳过。每个函数的总变体数、轮数、块数、活动指令数和完整指令槽数均有固定上限。紧随其后的 ConstFold、SimplifyCfg 和 DCE 负责折叠分支及清理不可达路径。
 
 ### `InstCombinePass` (`inst_combine.rs`)
 
@@ -201,7 +203,7 @@ O1 在首轮及标量提升/常量特化后的中间清理阶段，仅保护 `Lo
 
 ### `GepInductionPass` (`gep_induction.rs`)
 
-对自然循环中的仿射 GEP 地址构造 pointer recurrence。候选循环必须有唯一 entering predecessor、唯一 latch 和专用 preheader；pass 从 header 的直接 i32 induction、低深度 `iv ± constant` AddRec、GEP 类型大小、use-def 和支配关系证明地址为 `base + induction * constant stride + invariant offset`。derived index 只有在精确 trip endpoint（包含最终失败 header）或完整 modulo-`2^32` 同余类极值证明 signed 加减不回绕时才接受。循环内的 nested GEP chain 可以包含任意循环不变量索引，数组长度和正负 induction step 都不参与形状匹配。
+对自然循环中的仿射 GEP 地址构造 pointer recurrence。候选循环必须有唯一 entering predecessor、唯一 latch 和专用 preheader；pass 从 header 的直接 i32 induction、低深度 `iv ± constant` 或 `iv + invariant` AddRec、GEP 类型大小、use-def 和支配关系证明地址为 `base + induction * constant stride + invariant offset`。derived index 只有在精确 trip endpoint（包含最终失败 header）或完整 modulo-`2^32` 同余类极值证明 signed 加减不回绕时才接受；动态 invariant 必须是另一个具有常量 trip count 的已证明 induction，并对两者完整取值区间求和验证不溢出。循环内的 nested GEP chain 可以包含任意循环不变量索引，数组长度和正负 induction step 都不参与形状匹配。
 
 变换在 preheader 用 induction 初值重建完整地址，在 header 插入 pointer phi，在 latch 用单索引常量 GEP 生成固定步长 next pointer。只有全部使用都位于循环内且新 phi 支配普通使用及 phi edge 时才替换原 GEP；仅作为其它已选 nested GEP base 的中间地址不会单独生成死 recurrence。常量 trip-count 分析或 header signed comparison 还必须证明 i32 induction 在每个回边不 wrap，否则 sign extension 后的重算地址与 pointer increment 并不等价，pass 会拒绝。
 

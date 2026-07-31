@@ -13,6 +13,7 @@ impl<'a> Riscv64IrEmitter<'a> {
     fn new(module: &'a Module) -> Self {
         Self {
             ctx: IrModuleCtx::new(module),
+            int_return_ranges: crate::ir::int_range::collect_function_return_ranges(module),
             out: String::new(),
         }
     }
@@ -92,6 +93,8 @@ fn terminator_targets(terminator: Option<&Terminator>) -> Vec<BlockId> {
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     fn new(parent: &'a mut Riscv64IrEmitter<'b>, func: &'b Function) -> Self {
         let value_use_counts = crate::codegen::common::ir_value_use_counts(func);
+        let int_ranges =
+            crate::ir::int_range::collect_value_ranges(func, &parent.int_return_ranges);
         let folded_memory_geps = super::memory::collect_folded_memory_geps(func, &value_use_counts);
         let mut allocation_view = (!folded_memory_geps.is_empty()).then(|| func.clone());
         if let Some(allocation_view) = &mut allocation_view {
@@ -100,34 +103,46 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 &folded_memory_geps,
             );
         }
+        let elided_values = allocation_view
+            .as_mut()
+            .map(super::memory::eliminate_dead_folded_address_values)
+            .unwrap_or_default();
         let allocation_func = allocation_view.as_ref().unwrap_or(func);
         let regalloc = super::regalloc::Riscv64RegAlloc::new(allocation_func);
         let float_regalloc = super::regalloc::Riscv64FloatRegAlloc::new(allocation_func);
+        let local_regs = crate::codegen::common::IrLocalRegs::new(
+            allocation_func,
+            &["t3", "t4", "t5", "t6"],
+            true,
+        );
+        let layout = IrFuncLayout::new_with_stack_slots(func, |value| {
+            !elided_values.contains(&value)
+                && !folded_memory_geps.contains_key(&value)
+                && regalloc.reg(value).is_none()
+                && float_regalloc.reg(value).is_none()
+                && local_regs.reg(value).is_none()
+        });
         let saved_slot_count =
             regalloc.used_regs().len() + float_regalloc.used_callee_saved().len();
         let saved_area_size = ir_align_to((saved_slot_count as i32) * 8, 16);
         Self {
             parent,
             func,
-            layout: IrFuncLayout::new(func),
+            layout,
             regalloc,
             float_regalloc,
             saved_area_size,
-            local_regs: crate::codegen::common::IrLocalRegs::new(
-                allocation_func,
-                &["t3", "t4", "t5", "t6"],
-                true,
-            ),
+            local_regs,
             value_use_counts,
+            int_ranges,
             folded_memory_geps,
+            elided_values,
             body: String::new(),
             return_label: format!(".L_return_{}", func.name),
         }
     }
 
     fn emit(mut self) {
-        let guarded_mulmod = self.guarded_mulmod_prelude();
-        let guarded_pow2_digit = self.guarded_pow2_digit_prelude();
         let early_return = entry_early_return(self.func).and_then(|plan| {
             self.pre_prologue_early_return(&plan)
                 .map(|prelude| (plan, prelude))
@@ -208,12 +223,6 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             ".p2align {1}\n.globl {0}\n.type {0}, @function\n{0}:\n",
             self.func.name, function_alignment
         ));
-        if let Some(prelude) = &guarded_mulmod {
-            self.parent.out.push_str(prelude);
-        }
-        if let Some(prelude) = &guarded_pow2_digit {
-            self.parent.out.push_str(prelude);
-        }
         if let Some((_, prelude)) = &early_return {
             self.parent.out.push_str(prelude);
         }

@@ -85,6 +85,72 @@ fn does_not_add_float_frame_to_integer_only_function() {
 }
 
 #[test]
+fn reduces_a_twice_bounded_signed_remainder_without_magic_division() {
+    let mut reduce = Function::new("bounded_reduce", Type::I32);
+    let input = reduce.add_param("input", Type::I32);
+    let divisor = reduce.add_const(Const::Int(97));
+    let reduced = reduce
+        .append_inst(
+            reduce.entry,
+            InstKind::Binary {
+                op: BinaryOp::Imod,
+                lhs: input,
+                rhs: divisor,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    reduce.set_terminator(reduce.entry, Terminator::Return(Some(reduced)));
+
+    let mut caller = Function::new("double_bounded", Type::I32);
+    let input = caller.add_param("input", Type::I32);
+    let reduced = caller
+        .append_inst(
+            caller.entry,
+            InstKind::Call {
+                name: "bounded_reduce".into(),
+                args: vec![input],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let doubled = caller
+        .append_inst(
+            caller.entry,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: reduced,
+                rhs: reduced,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let divisor = caller.add_const(Const::Int(97));
+    let result = caller
+        .append_inst(
+            caller.entry,
+            InstKind::Binary {
+                op: BinaryOp::Imod,
+                lhs: doubled,
+                rhs: divisor,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    caller.set_terminator(caller.entry, Terminator::Return(Some(result)));
+
+    let mut module = Module::new();
+    module.add_func(reduce);
+    module.add_func(caller);
+    let asm = emit_ir_asm(&module);
+    let caller_asm = function_asm(&asm, "double_bounded");
+
+    assert!(caller_asm.contains("  addiw t2, t2, 1\n"));
+    assert!(caller_asm.contains("  slt t2,"));
+    assert!(!caller_asm.contains("  srai t0, t0, 32\n"));
+}
+
+#[test]
 fn clears_aligned_local_arrays_with_wide_stores() {
     let mut function = Function::new("clear_local", Type::Void);
     let array = function
@@ -417,6 +483,115 @@ fn folds_float_loads_and_stores_into_their_base_address() {
 }
 
 #[test]
+fn folds_same_block_affine_geps_into_one_base_address() {
+    let mut function = Function::new("folded_affine_memory", Type::F32);
+    let base = function.add_param("base", Type::Ptr(Box::new(Type::F32)));
+    let row = function.add_param("row", Type::I32);
+    let column = function.add_param("column", Type::I32);
+    let one = function.add_const(Const::Int(1));
+    let first_index = function
+        .append_inst(
+            function.entry,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: row,
+                rhs: column,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let first_ptr = function
+        .append_inst(
+            function.entry,
+            InstKind::Gep {
+                base,
+                indices: vec![first_index],
+            },
+            Some(Type::Ptr(Box::new(Type::F32))),
+        )
+        .unwrap();
+    let first = function
+        .append_inst(
+            function.entry,
+            InstKind::Load { ptr: first_ptr },
+            Some(Type::F32),
+        )
+        .unwrap();
+    let next_column = function
+        .append_inst(
+            function.entry,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: column,
+                rhs: one,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let second_index = function
+        .append_inst(
+            function.entry,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: row,
+                rhs: next_column,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let second_ptr = function
+        .append_inst(
+            function.entry,
+            InstKind::Gep {
+                base,
+                indices: vec![second_index],
+            },
+            Some(Type::Ptr(Box::new(Type::F32))),
+        )
+        .unwrap();
+    let second = function
+        .append_inst(
+            function.entry,
+            InstKind::Load { ptr: second_ptr },
+            Some(Type::F32),
+        )
+        .unwrap();
+    let sum = function
+        .append_inst(
+            function.entry,
+            InstKind::Binary {
+                op: BinaryOp::Fadd,
+                lhs: first,
+                rhs: second,
+            },
+            Some(Type::F32),
+        )
+        .unwrap();
+    function.set_terminator(function.entry, Terminator::Return(Some(sum)));
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let body = entry_block_asm(
+        function_asm(&asm, "folded_affine_memory"),
+        "folded_affine_memory",
+    );
+
+    assert_eq!(
+        body.lines()
+            .filter(|line| line.trim_start().starts_with("slli "))
+            .count(),
+        1
+    );
+    assert!(body
+        .lines()
+        .any(|line| line.trim_start().starts_with("flw ") && line.contains(", 4(")));
+    assert!(!body
+        .lines()
+        .any(|line| line.contains("addiw") && line.ends_with(", 1")));
+}
+
+#[test]
 fn routes_float_call_arguments_and_results_through_assigned_registers() {
     let mut callee = Function::new("float_identity", Type::F32);
     let callee_value = callee.add_param("value", Type::F32);
@@ -518,7 +693,7 @@ fn preserves_call_crossing_float_parameter() {
 }
 
 #[test]
-fn stores_assigned_float_parameter_for_direct_return() {
+fn keeps_assigned_float_parameter_off_the_stack() {
     let mut function = Function::new("return_float_parameter", Type::F32);
     let value = function.add_param("value", Type::F32);
     function.set_terminator(function.entry, Terminator::Return(Some(value)));
@@ -529,7 +704,7 @@ fn stores_assigned_float_parameter_for_direct_return() {
     let function_asm = function_asm(&asm, "return_float_parameter");
 
     assert!(function_asm.contains("fmv.s ft1, fa0"));
-    assert!(function_asm.contains("fsw fa0, -8(s0)"));
+    assert!(!function_asm.contains("fsw fa0,"));
     assert!(function_asm.contains("fmv.s fa0, ft1"));
     assert!(!function_asm.contains("lw a0, -8(s0)"));
 }
@@ -549,7 +724,7 @@ fn receives_ninth_float_parameter_from_integer_fallback_register() {
     let function_asm = function_asm(&asm, "return_ninth_float_parameter");
 
     assert!(function_asm.contains("fmv.w.x ft1, a0"));
-    assert!(function_asm.contains("fsw ft1, -72(s0)"));
+    assert!(!function_asm.contains("fsw ft1,"));
     assert!(function_asm.contains("fmv.s fa0, ft1"));
     assert!(!function_asm.contains("flw ft1, 16(s0)"));
     assert!(!function_asm.contains("lw a0, -72(s0)"));
@@ -570,7 +745,7 @@ fn receives_seventeenth_float_parameter_from_stack() {
     let function_asm = function_asm(&asm, "return_seventeenth_float_parameter");
 
     assert!(function_asm.contains("flw ft1, 16(s0)"));
-    assert!(function_asm.contains("fsw ft1, -136(s0)"));
+    assert!(!function_asm.contains("fsw ft1,"));
     assert!(function_asm.contains("fmv.s fa0, ft1"));
 }
 
@@ -611,7 +786,7 @@ fn keeps_stack_slots_below_float_callee_save_area() {
     let caller_asm = function_asm(&asm, "float_caller_with_stack_slot");
 
     assert!(caller_asm.contains("fsd fs0, -8(s0)"));
-    assert!(caller_asm.contains("sw a0, -32(s0)"));
+    assert!(caller_asm.contains("sw a0, -24(s0)"));
 }
 
 #[test]

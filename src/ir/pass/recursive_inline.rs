@@ -23,14 +23,23 @@ const MAX_FUNCTION_GROWTH_BLOCKS: usize = 40;
 const MAX_MODULE_GROWTH_INSTS: usize = 1024;
 const MAX_MODULE_GROWTH_BLOCKS: usize = 256;
 
-pub(super) struct RecursiveInlinePass;
+pub(super) struct RecursiveInlinePass {
+    expansion_rounds: usize,
+}
 pub(super) struct CfgInlinePass {
     allow_global_loads: bool,
 }
 
 impl RecursiveInlinePass {
     pub(super) fn new() -> Self {
-        Self
+        Self {
+            expansion_rounds: 1,
+        }
+    }
+
+    pub(super) fn with_rounds(expansion_rounds: usize) -> Self {
+        assert!(expansion_rounds > 0);
+        Self { expansion_rounds }
     }
 }
 
@@ -42,54 +51,76 @@ impl CfgInlinePass {
 
 impl ModulePass for RecursiveInlinePass {
     fn run(&mut self, module: &mut Module) {
-        // Every callee and call-site list comes from the pass-entry snapshot.
-        // Calls cloned below therefore cannot recursively expand in this run.
-        let snapshots = module.funcs.clone();
-        let targets = CallGraphTargets::new(&snapshots);
+        let initial = module.funcs.clone();
+        let initial_targets = CallGraphTargets::new(&initial);
+        let eligible = initial
+            .iter()
+            .enumerate()
+            .map(|(func_idx, source)| {
+                !module.funcs[func_idx].has_recursive_cfg_inline_decision()
+                    && Candidate::analyze(source, FunctionId(func_idx), &initial_targets).is_some()
+            })
+            .collect::<Vec<_>>();
         let mut module_growth = Growth::default();
+        let mut function_growth = vec![Growth::default(); module.funcs.len()];
 
-        for (func_idx, source) in snapshots.iter().enumerate() {
-            if module.funcs[func_idx].has_recursive_cfg_inline_decision() {
-                continue;
+        for _ in 0..self.expansion_rounds {
+            let snapshots = module.funcs.clone();
+            let targets = CallGraphTargets::new(&snapshots);
+            let mut changed = false;
+            for (func_idx, source) in snapshots.iter().enumerate() {
+                if !eligible[func_idx] {
+                    continue;
+                }
+                let Some(candidate) = Candidate::analyze(source, FunctionId(func_idx), &targets)
+                else {
+                    continue;
+                };
+
+                for site in candidate.sites.iter().rev() {
+                    let growth = candidate.growth;
+                    if !candidate.callsite_fits()
+                        || !function_growth[func_idx].fits_with(
+                            growth,
+                            MAX_FUNCTION_GROWTH_INSTS,
+                            MAX_FUNCTION_GROWTH_BLOCKS,
+                        )
+                        || !module_growth.fits_with(
+                            growth,
+                            MAX_MODULE_GROWTH_INSTS,
+                            MAX_MODULE_GROWTH_BLOCKS,
+                        )
+                    {
+                        continue;
+                    }
+                    if !inline_call_site(
+                        &mut module.funcs[func_idx],
+                        source,
+                        &candidate.reachable,
+                        site,
+                    ) {
+                        continue;
+                    }
+
+                    function_growth[func_idx].add(growth);
+                    module_growth.add(growth);
+                    changed = true;
+                    if let Err(errors) = module.funcs[func_idx].verify() {
+                        panic!(
+                            "recursive CFG inlining produced invalid IR in {}: {:?}",
+                            module.funcs[func_idx].name, errors
+                        );
+                    }
+                }
             }
-            let Some(candidate) = Candidate::analyze(source, FunctionId(func_idx), &targets) else {
+            if !changed {
+                break;
+            }
+        }
+
+        for (func_idx, eligible) in eligible.into_iter().enumerate() {
+            if !eligible {
                 continue;
-            };
-
-            let mut function_growth = Growth::default();
-            for site in candidate.sites.iter().rev() {
-                let growth = candidate.growth;
-                if !candidate.callsite_fits()
-                    || !function_growth.fits_with(
-                        growth,
-                        MAX_FUNCTION_GROWTH_INSTS,
-                        MAX_FUNCTION_GROWTH_BLOCKS,
-                    )
-                    || !module_growth.fits_with(
-                        growth,
-                        MAX_MODULE_GROWTH_INSTS,
-                        MAX_MODULE_GROWTH_BLOCKS,
-                    )
-                {
-                    continue;
-                }
-                if !inline_call_site(
-                    &mut module.funcs[func_idx],
-                    source,
-                    &candidate.reachable,
-                    site,
-                ) {
-                    continue;
-                }
-
-                function_growth.add(growth);
-                module_growth.add(growth);
-                if let Err(errors) = module.funcs[func_idx].verify() {
-                    panic!(
-                        "recursive CFG inlining produced invalid IR in {}: {:?}",
-                        module.funcs[func_idx].name, errors
-                    );
-                }
             }
             // Record the decision even when the module-wide budget refused all
             // sites. Otherwise a second pipeline run could spend a fresh module
@@ -206,15 +237,14 @@ struct GeneralCallee {
 
 impl GeneralCallee {
     fn analyze(func: &Function, allow_global_loads: bool) -> Option<Self> {
-        if !matches!(func.ret, Type::I1 | Type::I32)
-            || func.guarded_pow2_digit_shift().is_some()
+        if !matches!(func.ret, Type::I1 | Type::I32 | Type::F32)
             || func.blocks.is_empty()
             || func.blocks.len() > MAX_GENERAL_SOURCE_BLOCKS
             || func.verify().is_err()
             || func
                 .params
                 .iter()
-                .any(|param| !matches!(func.value(*param).ty, Type::I1 | Type::I32))
+                .any(|param| !is_general_inline_parameter(&func.value(*param).ty))
         {
             return None;
         }
@@ -242,7 +272,7 @@ impl GeneralCallee {
                     || (block
                         .insts
                         .iter()
-                        .all(|inst| is_pure_scalar_inline_inst(func, inst, allow_global_loads))
+                        .all(|inst| is_readonly_inline_inst(func, inst, allow_global_loads))
                         && !matches!(block.terminator, Some(Terminator::Return(None))))
             })
         {
@@ -264,13 +294,13 @@ impl GeneralCallee {
     }
 }
 
-fn is_pure_scalar_inline_inst(func: &Function, inst: &Inst, allow_global_loads: bool) -> bool {
+fn is_readonly_inline_inst(func: &Function, inst: &Inst, allow_global_loads: bool) -> bool {
     matches!(
         inst.kind,
         InstKind::Nop
             | InstKind::Phi { .. }
             | InstKind::Unary {
-                op: UnaryOp::Ineg | UnaryOp::Not,
+                op: UnaryOp::Ineg | UnaryOp::Fneg | UnaryOp::Not,
                 ..
             }
             | InstKind::Binary {
@@ -285,19 +315,55 @@ fn is_pure_scalar_inline_inst(func: &Function, inst: &Inst, allow_global_loads: 
                     | BinaryOp::Ishl
                     | BinaryOp::Iashr
                     | BinaryOp::And
-                    | BinaryOp::Or,
+                    | BinaryOp::Or
+                    | BinaryOp::Fadd
+                    | BinaryOp::Fsub
+                    | BinaryOp::Fmul
+                    | BinaryOp::Fdiv,
                 ..
             }
             | InstKind::Icmp { .. }
+            | InstKind::Fcmp { .. }
             | InstKind::Cast {
-                op: CastOp::BoolToI32 | CastOp::I32ToBool,
+                op: CastOp::BoolToI32
+                    | CastOp::I32ToBool
+                    | CastOp::I32ToF32
+                    | CastOp::F32ToI32
+                    | CastOp::F32ToBool,
                 ..
             }
+            | InstKind::Gep { .. }
     ) || matches!(
         inst.kind,
         InstKind::Load { ptr }
-            if allow_global_loads && matches!(func.value(ptr).kind, ValueKind::Global(_))
+            if inline_load_root(func, ptr).is_some_and(|root| {
+                matches!(func.value(root).kind, ValueKind::Param)
+                    || (allow_global_loads
+                        && matches!(func.value(root).kind, ValueKind::Global(_)))
+            })
     )
+}
+
+fn is_general_inline_parameter(ty: &Type) -> bool {
+    matches!(ty, Type::I1 | Type::I32 | Type::F32 | Type::Ptr(_))
+}
+
+fn inline_load_root(func: &Function, mut value: ValueId) -> Option<ValueId> {
+    for _ in 0..64 {
+        match func.value(value).kind {
+            ValueKind::Param | ValueKind::Global(_) => return Some(value),
+            ValueKind::Inst(block, inst_idx) => {
+                let InstKind::Gep { base, .. } =
+                    func.blocks.get(block.0)?.insts.get(inst_idx)?.kind
+                else {
+                    return None;
+                };
+                value = base;
+            }
+            ValueKind::Const(_) => return None,
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -529,8 +595,12 @@ fn call_types_match(
                 .values
                 .get(arg.0)
                 .zip(callee.values.get(param.0))
-                .is_some_and(|(arg, param)| arg.ty == param.ty)
+                .is_some_and(|(arg, param)| inline_types_compatible(&arg.ty, &param.ty))
         })
+}
+
+fn inline_types_compatible(argument: &Type, parameter: &Type) -> bool {
+    argument == parameter || matches!((argument, parameter), (Type::Ptr(_), Type::Ptr(_)))
 }
 
 fn is_tail_position(func: &Function, block: BlockId, inst_idx: usize, result: ValueId) -> bool {
@@ -822,6 +892,122 @@ mod tests {
     use crate::ir::{CmpOp, Const};
 
     #[test]
+    fn cfg_inlines_readonly_float_pointer_loops() {
+        let mut reduce = Function::new("reduce_values", Type::F32);
+        let values = reduce.add_param("values", Type::Ptr(Box::new(Type::F32)));
+        let count = reduce.add_param("count", Type::I32);
+        let zero_i32 = reduce.add_const(Const::Int(0));
+        let zero_f32 = reduce.add_const(Const::Float(0));
+        let one = reduce.add_const(Const::Int(1));
+        let header = reduce.add_block("header");
+        let body = reduce.add_block("body");
+        let exit = reduce.add_block("exit");
+        reduce.set_terminator(reduce.entry, Terminator::Jump(header));
+        let index = reduce
+            .append_inst(header, InstKind::Phi { incomings: vec![] }, Some(Type::I32))
+            .unwrap();
+        let sum = reduce
+            .append_inst(header, InstKind::Phi { incomings: vec![] }, Some(Type::F32))
+            .unwrap();
+        let condition = reduce
+            .append_inst(
+                header,
+                InstKind::Icmp {
+                    op: CmpOp::Lt,
+                    lhs: index,
+                    rhs: count,
+                },
+                Some(Type::I1),
+            )
+            .unwrap();
+        reduce.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: body,
+                else_target: exit,
+            },
+        );
+        let address = reduce
+            .append_inst(
+                body,
+                InstKind::Gep {
+                    base: values,
+                    indices: vec![index],
+                },
+                Some(Type::Ptr(Box::new(Type::F32))),
+            )
+            .unwrap();
+        let loaded = reduce
+            .append_inst(body, InstKind::Load { ptr: address }, Some(Type::F32))
+            .unwrap();
+        let next_sum = reduce
+            .append_inst(
+                body,
+                InstKind::Binary {
+                    op: BinaryOp::Fadd,
+                    lhs: sum,
+                    rhs: loaded,
+                },
+                Some(Type::F32),
+            )
+            .unwrap();
+        let next_index = reduce
+            .append_inst(
+                body,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: index,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        reduce.set_terminator(body, Terminator::Jump(header));
+        reduce.set_terminator(exit, Terminator::Return(Some(sum)));
+        reduce.blocks[header.0].insts[0].kind = InstKind::Phi {
+            incomings: vec![(reduce.entry, zero_i32), (body, next_index)],
+        };
+        reduce.blocks[header.0].insts[1].kind = InstKind::Phi {
+            incomings: vec![(reduce.entry, zero_f32), (body, next_sum)],
+        };
+
+        let mut caller = Function::new("caller", Type::F32);
+        let caller_values = caller.add_param(
+            "values",
+            Type::Ptr(Box::new(Type::Array {
+                elem: Box::new(Type::F32),
+                len: 16,
+            })),
+        );
+        let caller_count = caller.add_param("count", Type::I32);
+        let result = caller
+            .append_inst(
+                caller.entry,
+                InstKind::Call {
+                    name: "reduce_values".to_string(),
+                    args: vec![caller_values, caller_count],
+                },
+                Some(Type::F32),
+            )
+            .unwrap();
+        caller.set_terminator(caller.entry, Terminator::Return(Some(result)));
+
+        let mut module = Module::new();
+        module.add_func(reduce);
+        module.add_func(caller);
+        CfgInlinePass::new(false).run(&mut module);
+
+        assert!(module.funcs[1].blocks.iter().all(|block| {
+            block
+                .insts
+                .iter()
+                .all(|inst| !matches!(inst.kind, InstKind::Call { .. }))
+        }));
+        assert!(module.funcs.iter().all(|func| func.verify().is_ok()));
+    }
+
+    #[test]
     fn inlines_different_names_and_cfgs_from_one_snapshot() {
         let first = branching_recursion("spruce");
         let second = phi_recursion("willow");
@@ -987,16 +1173,14 @@ mod tests {
             small_expr_inline_rounds: 1,
             cfg_inline_rounds: 1,
             cfg_inline_global_loads: false,
+            recursive_inline_rounds: 1,
             enable_constant_address_count_reduction: false,
             enable_recursive_const_specialization: false,
+            enable_initialized_global_propagation: false,
+            enable_uniform_constant_arguments: false,
             enable_loop_call_memoize: false,
             enable_loop_invariant_call_memoize: false,
-            enable_repeated_overwrite_elision: false,
-            enable_guarded_mulmod_idiom: false,
-            enable_guarded_pow2_digit_idiom: false,
             enable_regional_global_scalar_promotion: false,
-            enable_producer_consumer_fusion: false,
-            enable_periodic_reduction_memoize: false,
             enable_write_only_alloca_cleanup_before_inline: true,
         };
 

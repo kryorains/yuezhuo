@@ -66,9 +66,10 @@ fn remove_write_only_allocas(func: &mut Function) {
             Inst {
                 result: Some(slot),
                 kind: InstKind::Alloca { .. },
-            } if alloca_is_write_only(func, *slot) => Some(*slot),
+            } => write_only_alloca_pointers(func, *slot),
             _ => None,
         })
+        .flatten()
         .collect::<HashSet<_>>();
     if write_only.is_empty() {
         return;
@@ -76,7 +77,11 @@ fn remove_write_only_allocas(func: &mut Function) {
 
     for block in &mut func.blocks {
         for inst in &mut block.insts {
-            if matches!(inst.kind, InstKind::Store { ptr, .. } if write_only.contains(&ptr)) {
+            if matches!(
+                inst.kind,
+                InstKind::Store { ptr, .. } | InstKind::MemZero { ptr, .. }
+                    if write_only.contains(&ptr)
+            ) {
                 inst.result = None;
                 inst.kind = InstKind::Nop;
             }
@@ -84,23 +89,58 @@ fn remove_write_only_allocas(func: &mut Function) {
     }
 }
 
-fn alloca_is_write_only(func: &Function, slot: ValueId) -> bool {
-    func.blocks.iter().all(|block| {
-        block.insts.iter().all(|inst| match &inst.kind {
-            InstKind::Store { ptr, value } if *ptr == slot => *value != slot,
-            _ => {
-                let mut operands = HashSet::new();
-                collect_inst_operands(inst, &mut operands);
-                !operands.contains(&slot)
+fn write_only_alloca_pointers(func: &Function, slot: ValueId) -> Option<HashSet<ValueId>> {
+    let mut pointers = HashSet::from([slot]);
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.insts {
+                let (Some(result), InstKind::Gep { base, .. }) = (inst.result, &inst.kind) else {
+                    continue;
+                };
+                if pointers.contains(base) {
+                    changed |= pointers.insert(result);
+                }
             }
-        }) && {
-            let mut operands = HashSet::new();
-            if let Some(terminator) = &block.terminator {
-                collect_terminator_operands(terminator, &mut operands);
-            }
-            !operands.contains(&slot)
         }
-    })
+        if !changed {
+            break;
+        }
+    }
+
+    for block in &func.blocks {
+        for inst in &block.insts {
+            match &inst.kind {
+                InstKind::Alloca { .. } if inst.result == Some(slot) => continue,
+                InstKind::Gep { base, indices }
+                    if pointers.contains(base)
+                        && indices.iter().all(|index| !pointers.contains(index)) =>
+                {
+                    continue;
+                }
+                InstKind::Store { ptr, value }
+                    if pointers.contains(ptr) && !pointers.contains(value) =>
+                {
+                    continue;
+                }
+                InstKind::MemZero { ptr, .. } if pointers.contains(ptr) => continue,
+                _ => {}
+            }
+            let mut operands = HashSet::new();
+            collect_inst_operands(inst, &mut operands);
+            if operands.iter().any(|operand| pointers.contains(operand)) {
+                return None;
+            }
+        }
+        let mut operands = HashSet::new();
+        if let Some(terminator) = &block.terminator {
+            collect_terminator_operands(terminator, &mut operands);
+        }
+        if operands.iter().any(|operand| pointers.contains(operand)) {
+            return None;
+        }
+    }
+    Some(pointers)
 }
 
 /// Marks values reachable from observable side effects and terminators.
@@ -295,6 +335,55 @@ mod tests {
             func.entry,
             InstKind::Store {
                 ptr: slot,
+                value: one,
+            },
+            None,
+        );
+        func.set_terminator(func.entry, Terminator::Return(Some(one)));
+
+        eliminate_dead_code(&mut func);
+
+        assert!(func.blocks[0]
+            .insts
+            .iter()
+            .all(|inst| matches!(inst.kind, InstKind::Nop)));
+        assert!(func.verify().is_ok());
+    }
+
+    #[test]
+    fn removes_writes_through_non_escaping_derived_array_addresses() {
+        let mut func = Function::new("write_only_array", Type::I32);
+        let array = func
+            .append_inst(
+                func.entry,
+                InstKind::Alloca {
+                    ty: Type::Array {
+                        elem: Box::new(Type::I32),
+                        len: 8,
+                    },
+                },
+                Some(Type::Ptr(Box::new(Type::Array {
+                    elem: Box::new(Type::I32),
+                    len: 8,
+                }))),
+            )
+            .unwrap();
+        let zero = func.add_const(Const::Int(0));
+        let one = func.add_const(Const::Int(1));
+        let element = func
+            .append_inst(
+                func.entry,
+                InstKind::Gep {
+                    base: array,
+                    indices: vec![zero],
+                },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        func.append_inst(
+            func.entry,
+            InstKind::Store {
+                ptr: element,
                 value: one,
             },
             None,

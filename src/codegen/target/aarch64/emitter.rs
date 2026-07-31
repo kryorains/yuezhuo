@@ -15,6 +15,7 @@ impl<'a> AArch64IrEmitter<'a> {
     fn new(module: &'a Module) -> Self {
         Self {
             ctx: IrModuleCtx::new(module),
+            int_return_ranges: crate::ir::int_range::collect_function_return_ranges(module),
             out: String::new(),
         }
     }
@@ -33,6 +34,8 @@ impl<'a> AArch64IrEmitter<'a> {
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     fn new(parent: &'a mut AArch64IrEmitter<'b>, func: &'b Function) -> Self {
         let value_use_counts = crate::codegen::common::ir_value_use_counts(func);
+        let int_ranges =
+            crate::ir::int_range::collect_value_ranges(func, &parent.int_return_ranges);
         let folded_memory_geps = super::memory::collect_folded_memory_geps(func, &value_use_counts);
         let mut allocation_view = (!folded_memory_geps.is_empty()).then(|| func.clone());
         if let Some(allocation_view) = &mut allocation_view {
@@ -62,6 +65,7 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             saved_area_size,
             local_regs,
             value_use_counts,
+            int_ranges,
             folded_memory_geps,
             frame_accessed: false,
             body: String::new(),

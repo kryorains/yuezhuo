@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 struct AArch64IrEmitter<'a> {
     ctx: crate::codegen::common::IrModuleCtx<'a>,
+    int_return_ranges: HashMap<String, crate::ir::int_range::IntRange>,
     out: String,
 }
 
@@ -28,6 +29,7 @@ struct AArch64IrFuncEmitter<'a, 'b> {
     saved_area_size: i32,
     local_regs: IrLocalRegs,
     value_use_counts: Vec<usize>,
+    int_ranges: Vec<Option<crate::ir::int_range::IntRange>>,
     folded_memory_geps: HashMap<crate::ir::ValueId, memory::FoldedMemoryGep>,
     frame_accessed: bool,
     body: String,

@@ -1,7 +1,7 @@
 use super::Riscv64IrFuncEmitter;
 use crate::codegen::common::{gep_elem_type, ir_size, pointee};
 use crate::ir::{Const, Function, InstKind, Type, ValueId, ValueKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const MAX_FOLDED_MEMORY_BLOCKS: usize = 1024;
 const MAX_FOLDED_MEMORY_VALUES: usize = 8192;
@@ -666,7 +666,158 @@ pub(super) fn collect_folded_memory_geps(
             );
         }
     }
+    fold_same_block_affine_memory_geps(
+        func,
+        value_use_counts,
+        &memory_pointer_uses,
+        &memory_pointer_types_are_exact,
+        &mut folded,
+    );
     folded
+}
+
+#[derive(PartialEq, Eq)]
+struct AffineIndex {
+    terms: HashMap<ValueId, i32>,
+    constant: i32,
+}
+
+struct AffineMemoryGep {
+    result: ValueId,
+    base: ValueId,
+    stride: i64,
+    index: AffineIndex,
+}
+
+/// Reuses an earlier address in the same straight-line block when two
+/// memory-only GEPs have identical affine dynamic terms and differ only by a
+/// load/store-encodable constant. Valid source accesses cannot cross the
+/// signed i32 boundary without leaving their object, so reassociating that
+/// constant into the byte offset preserves every defined access.
+fn fold_same_block_affine_memory_geps(
+    func: &Function,
+    value_use_counts: &[usize],
+    memory_pointer_uses: &[usize],
+    memory_pointer_types_are_exact: &[bool],
+    folded: &mut HashMap<ValueId, FoldedMemoryGep>,
+) {
+    for block in &func.blocks {
+        let mut earlier = Vec::<AffineMemoryGep>::new();
+        for inst in &block.insts {
+            let (Some(result), InstKind::Gep { base, indices }) = (inst.result, &inst.kind) else {
+                continue;
+            };
+            let [index] = indices.as_slice() else {
+                continue;
+            };
+            let Some(total_uses) = value_use_counts.get(result.0).copied() else {
+                continue;
+            };
+            if total_uses == 0
+                || memory_pointer_uses.get(result.0).copied() != Some(total_uses)
+                || memory_pointer_types_are_exact.get(result.0) != Some(&true)
+            {
+                continue;
+            }
+            let Some(stride) = strict_single_index_stride(func, *base, result) else {
+                continue;
+            };
+            let stride = i64::from(stride);
+            let Some(index) = affine_i32_index(func, *index, 0) else {
+                continue;
+            };
+            if !folded.contains_key(&result) {
+                let replacement = earlier.iter().rev().find_map(|candidate| {
+                    if candidate.base != *base
+                        || candidate.stride != stride
+                        || candidate.index.terms != index.terms
+                        || func.value(candidate.result).ty != func.value(result).ty
+                        || folded.contains_key(&candidate.result)
+                    {
+                        return None;
+                    }
+                    let delta_indices =
+                        i64::from(index.constant) - i64::from(candidate.index.constant);
+                    let offset = delta_indices
+                        .checked_mul(stride)
+                        .and_then(|offset| i32::try_from(offset).ok())
+                        .filter(|offset| fits_i12(*offset))?;
+                    Some(FoldedMemoryGep {
+                        base: candidate.result,
+                        offset,
+                    })
+                });
+                if let Some(replacement) = replacement {
+                    if folded.len() == MAX_FOLDED_MEMORY_GEPS {
+                        return;
+                    }
+                    folded.insert(result, replacement);
+                }
+            }
+            earlier.push(AffineMemoryGep {
+                result,
+                base: *base,
+                stride,
+                index,
+            });
+        }
+    }
+}
+
+fn affine_i32_index(func: &Function, value: ValueId, depth: usize) -> Option<AffineIndex> {
+    if depth > 16 || func.value(value).ty != Type::I32 {
+        return None;
+    }
+    if let ValueKind::Const(Const::Int(constant)) = func.value(value).kind {
+        return Some(AffineIndex {
+            terms: HashMap::new(),
+            constant,
+        });
+    }
+    let ValueKind::Inst(block, inst_idx) = func.value(value).kind else {
+        return Some(AffineIndex {
+            terms: HashMap::from([(value, 1)]),
+            constant: 0,
+        });
+    };
+    let inst = func
+        .blocks
+        .get(block.0)
+        .and_then(|block| block.insts.get(inst_idx))?;
+    let InstKind::Binary { op, lhs, rhs } = inst.kind else {
+        return Some(AffineIndex {
+            terms: HashMap::from([(value, 1)]),
+            constant: 0,
+        });
+    };
+    if !matches!(op, crate::ir::BinaryOp::Iadd | crate::ir::BinaryOp::Isub) {
+        return Some(AffineIndex {
+            terms: HashMap::from([(value, 1)]),
+            constant: 0,
+        });
+    }
+    let mut lhs = affine_i32_index(func, lhs, depth + 1)?;
+    let rhs = affine_i32_index(func, rhs, depth + 1)?;
+    let sign = if op == crate::ir::BinaryOp::Iadd {
+        1i32
+    } else {
+        -1i32
+    };
+    lhs.constant = lhs.constant.wrapping_add(rhs.constant.wrapping_mul(sign));
+    for (term, coefficient) in rhs.terms {
+        let next = lhs
+            .terms
+            .get(&term)
+            .copied()
+            .unwrap_or_default()
+            .wrapping_add(coefficient.wrapping_mul(sign));
+        if next == 0 {
+            lhs.terms.remove(&term);
+        } else {
+            lhs.terms.insert(term, next);
+        }
+    }
+    Some(lhs)
 }
 
 /// Makes register allocation see the same base live ranges that folded memory
@@ -697,6 +848,110 @@ pub(super) fn rewrite_folded_memory_uses_for_allocation(
                 inst.kind = InstKind::Nop;
             }
         }
+    }
+}
+
+/// Removes pure address-building instructions that become dead only after
+/// folded GEP uses are rewritten to their retained base address. This runs on
+/// the private allocation view; the returned stable ValueIds tell emission to
+/// skip the corresponding instructions in the original verified IR.
+pub(super) fn eliminate_dead_folded_address_values(func: &mut Function) -> HashSet<ValueId> {
+    let mut use_counts = crate::codegen::common::ir_value_use_counts(func);
+    let mut worklist = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let Some(result) = inst
+                .result
+                .filter(|result| use_counts[result.0] == 0 && is_removable(inst))
+            {
+                worklist.push(result);
+            }
+        }
+    }
+
+    let mut removed = HashSet::new();
+    while let Some(result) = worklist.pop() {
+        if removed.contains(&result) || use_counts[result.0] != 0 {
+            continue;
+        }
+        let ValueKind::Inst(block, inst_idx) = func.value(result).kind else {
+            continue;
+        };
+        let Some(inst) = func
+            .blocks
+            .get(block.0)
+            .and_then(|block| block.insts.get(inst_idx))
+        else {
+            continue;
+        };
+        if inst.result != Some(result) || !is_removable(inst) {
+            continue;
+        }
+        let operands = instruction_operands(&inst.kind);
+        let inst = &mut func.blocks[block.0].insts[inst_idx];
+        inst.result = None;
+        inst.kind = InstKind::Nop;
+        removed.insert(result);
+
+        for operand in operands {
+            let Some(count) = use_counts.get_mut(operand.0) else {
+                continue;
+            };
+            if *count == 0 {
+                continue;
+            }
+            *count -= 1;
+            if *count != 0 {
+                continue;
+            }
+            let ValueKind::Inst(owner, owner_idx) = func.value(operand).kind else {
+                continue;
+            };
+            if func.blocks[owner.0]
+                .insts
+                .get(owner_idx)
+                .is_some_and(is_removable)
+            {
+                worklist.push(operand);
+            }
+        }
+    }
+    removed
+}
+
+fn is_removable(inst: &crate::ir::Inst) -> bool {
+    matches!(
+        inst.kind,
+        InstKind::Nop
+            | InstKind::Phi { .. }
+            | InstKind::Alloca { .. }
+            | InstKind::Load { .. }
+            | InstKind::Unary { .. }
+            | InstKind::Binary { .. }
+            | InstKind::Icmp { .. }
+            | InstKind::Fcmp { .. }
+            | InstKind::Cast { .. }
+            | InstKind::Gep { .. }
+    )
+}
+
+fn instruction_operands(kind: &InstKind) -> Vec<ValueId> {
+    match kind {
+        InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
+        InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
+        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Store { ptr, value } => vec![*ptr, *value],
+        InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
+        InstKind::Binary { lhs, rhs, .. }
+        | InstKind::Icmp { lhs, rhs, .. }
+        | InstKind::Fcmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+        InstKind::Gep { base, indices } => {
+            let mut operands = Vec::with_capacity(indices.len() + 1);
+            operands.push(*base);
+            operands.extend(indices.iter().copied());
+            operands
+        }
+        InstKind::Call { args, .. } => args.clone(),
     }
 }
 
