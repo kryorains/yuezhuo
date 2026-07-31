@@ -1,3 +1,4 @@
+use super::imm::mov_w_imm;
 use super::AArch64IrFuncEmitter;
 use crate::codegen::common::{assign_arg_locations, resolve_call_sig, IrArgLocation};
 use crate::ir::{Type, ValueId};
@@ -34,7 +35,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     }
                 }
             }
-            self.body.push_str(&format!("  bl {}\n", name));
+            if !self.emit_guarded_modular_multiply_call(name) {
+                self.body.push_str(&format!("  bl {}\n", name));
+            }
             if sig.ret == Type::F32 {
                 if let Some(result) = result {
                     self.store_float_result(result, "s0");
@@ -94,5 +97,29 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             self.adjust_sp(cleanup);
         }
         sig.ret
+    }
+
+    fn emit_guarded_modular_multiply_call(&mut self, name: &str) -> bool {
+        let Some(modulus) = self
+            .parent
+            .ctx
+            .module
+            .funcs
+            .iter()
+            .find(|func| func.name == name)
+            .and_then(|func| func.guarded_mulmod_modulus())
+        else {
+            return false;
+        };
+        let fallback = self.parent.ctx.fresh_label("modular_multiply_fallback");
+        let done = self.parent.ctx.fresh_label("modular_multiply_done");
+        self.body.push_str(&format!(
+            "  tbnz w0, #31, {fallback}\n  tbnz w1, #31, {fallback}\n"
+        ));
+        self.body.push_str(&mov_w_imm("w9", modulus));
+        self.body.push_str(&format!(
+            "  cmp w0, w9\n  b.ge {fallback}\n  cmp w1, w9\n  b.ge {fallback}\n  umull x10, w0, w1\n  udiv x11, x10, x9\n  msub x0, x11, x9, x10\n  b {done}\n{fallback}:\n  bl {name}\n{done}:\n"
+        ));
+        true
     }
 }
