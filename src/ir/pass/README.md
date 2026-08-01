@@ -98,9 +98,22 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 - 在 wrapping 语义下重关联嵌套常量加法和乘法，例如 `(x * 2) * 2` 变为 `x * 4`；
 - 当 use-def 链精确证明相同 dividend 和相同已知非零 i32 常量除数时，把 `x - (x / d) * d` 改写为 `x % d`；
 - 当有符号余数的全部观察都只是与零比较，且除数绝对值为二次幂时，把 divisibility test 改写为低位掩码；负 dividend 的余数值若在其它位置可见则拒绝；
+- 当 i32 乘积的每一个使用都精确为 `product & 1` 时，以 `lhs & rhs` 代替乘法；二进制补码 wrapping 语义下两者最低位恒等，任何其它 value use 都会拒绝；
 - 把 `icmp` 常量换到 RHS，并同步反转大小比较谓词。
 
 pass 不重关联或以其它方式改写浮点运算，也不把局部常量二次幂乘除主动改写成 shift；这类局部指令选择继续由现有后端负责。IR 的动态 shift 仍采用计数低 5 位语义。
+
+### `BitwiseDigitLoopPass` (`bitwise_digit_loop.rs`)
+
+识别固定 32 轮、以 `% 2`/`/ 2` 和 doubling power 逐位构造 i32 AND/OR/XOR 的规范循环。识别过程验证自然循环、phi、trip count、每轮真值表、无副作用以及完整返回关系，不读取函数、参数、块或测试名称。通用路径只在两个实参均非负时使用原生位运算，负数保留原循环语义。
+
+AArch64 成本模型还允许 AND/OR 使用全域精确公式：由于有符号余数的负奇数 digit 为 `-1`，而候选条件只把 `+1` 当作置位，所以负操作数的所有 digit 都等价于零。pass 会先对完整 `{-1,0,1}²` digit 域复核真值表，再构造 `x & ~(x >> 31)`；AArch64 后端把每个 sanitization 合成单条 shifted-register `bic`。XOR 或证明不完整的循环仍走守卫/原 CFG，RISC-V64 与 x86-64 不启用这项目标收益选择。
+
+### `GuardedShiftDispatchPass` (`guarded_shift_dispatch.rs`)
+
+识别纯 i32 函数中完整、连续的 `selector == 1..N` 返回分派：每个 case 必须精确返回 `data * 2^selector` 或 `data / 2^selector`，默认分支必须原样返回 `data`，且全部基本块都属于该分派。变换不读取函数名、参数名、块名或调用点，只依据 CFG、SSA 参数身份、常量和返回表达式；case 缺口、混合运算、额外副作用或非 identity fallback 都会拒绝。
+
+新 CFG 先保护 `1 <= selector <= N`，范围外保留默认结果。乘法在 i32 wrapping 语义下直接改为动态左移；有符号除法先计算 `sign & ((1 << selector) - 1)` bias，再做算术右移，从而对负数仍严格保持向零截断，而不是错误使用向负无穷取整。当前只接受 3..30 个 case，并在改写后运行 verifier；后续常量特化、CFG 内联和 DCE 可继续折叠常量调用及清理原分派。
 
 ### `SimplifyCfgPass` (`simplify_cfg.rs`)
 
@@ -201,9 +214,19 @@ O1 在首轮及标量提升/常量特化后的中间清理阶段，仅保护 `Lo
 
 它在闭世界的 SysY 模块内检查所有直接调用点：只有当一对指针形参在每个调用点都来自两个不同的完整全局对象时，才把它们视为不别名；若某个指针形参在全部调用点都来自已知全局对象集合，则它还可与集合之外的唯一全局对象证明不别名。直接指向同一唯一全局 symbol 的不同 SSA 地址值会按对象 identity 统一 load key。函数内含未知调用、写入来源不明，或任一调用点可能别名时都会放弃。满足条件后，pass 沿支配树复用完全相同指针的已有 `load`，不会把加载推测执行到原控制流之前。
 
+### `RegionalInvariantGlobalLoadPass` (`regional_global_scalar.rs`)
+
+对循环内至少静态重复两次的直接标量全局 load 做区域型 LICM。候选自然循环必须有 dedicated preheader，循环内不能有 call 或 memzero，也不能直接写候选全局；每个其它 load/store 地址都要沿 GEP/phi 追溯到与候选不同的全局或独立 alloca，参数根、未知派生或同一对象内地址都会拒绝。直接全局对象始终可解引用，因此零次循环也可安全在 preheader 读取一次；随后统一替换循环内 load，并由 verifier 检查。变换只比较完整全局 symbol identity，不按名称内容分类，并受函数规模和每函数 hoist 数量预算约束。
+
+### `LoopMemoryPromotionPass` (`loop_memory_promotion.rs`)
+
+对 canonical 自然循环中反复读写的一个 loop-invariant 标量数组元素执行严格的 loop load/store promotion。候选要求 dedicated preheader、唯一 latch、唯一 header exit、无 call/memzero、无 loop value live-out，且 header 只能含 Nop/phi/直接整数比较；目标必须是完整 typed GEP path，循环 taken-successor 的首块就必须执行原目标 load。pass 复制第一次 header guard：零次循环直接走原 exit，不推测执行目标内存访问；非空循环才初始化临时标量，循环内同址 load/store 改写到该槽位，exit edge 只 flush 一次，紧随的 `ScalarPromotePass` 再把槽位变成 SSA phi。
+
+同对象别名证明只接受两类精确索引关系：严格 taken guard（如 `k < j`）直接证明对应维度 `k != j`；或步长为 `+1`、初值严格位于外层 induction 之上的内层 recurrence，在外层常量 trip range、初值加法和 taken-edge 单位偏移都证明不回绕后，证明 `k`/`k+1` 与外层索引不同。不同全局/alloca 根直接不别名，参数根之间、不同维数、未知算术、非严格 guard、范围或 dominance 证明缺失均保留原内存操作。匹配不读取函数、块、变量或测例名称，并设置函数规模及每函数 promotion 硬预算。
+
 ### `GepInductionPass` (`gep_induction.rs`)
 
-对自然循环中的仿射 GEP 地址构造 pointer recurrence。候选循环必须有唯一 entering predecessor、唯一 latch 和专用 preheader；pass 从 header 的直接 i32 induction、低深度 `iv ± constant` 或 `iv + invariant` AddRec、GEP 类型大小、use-def 和支配关系证明地址为 `base + induction * constant stride + invariant offset`。derived index 只有在精确 trip endpoint（包含最终失败 header）或完整 modulo-`2^32` 同余类极值证明 signed 加减不回绕时才接受；动态 invariant 必须是另一个具有常量 trip count 的已证明 induction，并对两者完整取值区间求和验证不溢出。循环内的 nested GEP chain 可以包含任意循环不变量索引，数组长度和正负 induction step 都不参与形状匹配。
+对自然循环中的仿射 GEP 地址构造 pointer recurrence。候选循环必须有唯一 entering predecessor、唯一 latch 和专用 preheader；pass 从 header 的直接 i32 induction、低深度 `iv ± constant` 或 `iv + invariant` AddRec、GEP 类型大小、use-def 和支配关系证明地址为 `base + induction * constant stride + invariant offset`。derived index 只有在精确 trip endpoint（包含最终失败 header）或完整 modulo-`2^32` 同余类极值证明 signed 加减不回绕时才接受；动态 invariant 必须是另一个具有常量 trip count 的已证明 induction，并对两者完整取值区间求和验证不溢出。另有严格的 taken-edge 单位偏移证明：`iv < bound` 的 taken successor 所支配区域可安全使用 `iv+1`，对称的 `iv > bound` 可使用 `iv-1`；header 本身、偏移绝对值大于 1 或不受 taken edge 支配的位置均拒绝。循环内的 nested GEP chain 可以包含任意循环不变量索引，数组长度和正负 induction step 都不参与形状匹配。
 
 变换在 preheader 用 induction 初值重建完整地址，在 header 插入 pointer phi，在 latch 用单索引常量 GEP 生成固定步长 next pointer。只有全部使用都位于循环内且新 phi 支配普通使用及 phi edge 时才替换原 GEP；仅作为其它已选 nested GEP base 的中间地址不会单独生成死 recurrence。常量 trip-count 分析或 header signed comparison 还必须证明 i32 induction 在每个回边不 wrap，否则 sign extension 后的重算地址与 pointer increment 并不等价，pass 会拒绝。
 
@@ -214,6 +237,8 @@ pass 不推测执行内存访问，也不要求唯一 exit；side exit 上没有
 合并同一自然循环中保持固定 byte distance 的 pointer recurrence。候选必须具有同一 header/latch、精确相同的 pointer type 和单索引常量 GEP step；初值会沿完整 typed GEP chain 展开为对象根、SSA 动态索引项及 checked 常量 byte offset，只有对象根和全部动态项系数完全相同的 recurrence 才能配对。索引中的 `iv + constant` 仅在 i32 addrec 初值/步长同余类的完整 signed 极值范围证明该加减不回绕时才提取常量；证明失败时该 SSA 表达式保持为不透明动态项，不假设源码维度或循环上界。
 
 secondary pointer 除唯一 backedge update 外，只能作为循环内、pointee/access type 精确一致的 load/store pointer；update 自身也只能回到该 phi。pass 在 header 从 primary pointer 建立一个可表示该 byte distance 的单索引常量 GEP，并只改写已证明的 memory pointer use；旧 secondary `phi/update` SCC 交给紧随其后的 mark-and-sweep DCE 删除。函数规模、use 数、recurrence 数、GEP chain/index、affine 深度、type nodes、pair proof 和总 work 都有固定预算；所有计划在改写前完成，预算或算术证明失败不产生部分 IR。改写后运行 verifier，重复执行不会再次处理已失去 memory use 的 secondary。
+
+流水线在 `GepInductionPass` 和本 pass 之间再运行一次 CSE，使不同候选独立重建但语义相同的 affine 初值先统一为同一 SSA key，再证明固定距离；这只做普通表达式规范化，不放宽 alias、nowrap 或类型证明。
 
 ### `ReductionJamPass` (`reduction_jam.rs`)
 

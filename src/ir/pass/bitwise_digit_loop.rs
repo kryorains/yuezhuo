@@ -6,30 +6,38 @@ use crate::ir::{
     ValueKind,
 };
 
-/// Replaces a non-negative, fixed-width digit-by-digit bitwise computation
-/// with the native integer operation while retaining the original loop as a
-/// fallback for signed inputs.
+/// Replaces a fixed-width digit-by-digit bitwise computation with an exact
+/// native integer formula. The default mode guards the non-negative domain and
+/// retains the original loop for signed inputs; a target profitability option
+/// may select a separately verified full-domain AND/OR formula.
 ///
 /// SysY has no source-level integer bitwise operators, so programs commonly
 /// spell AND/OR/XOR as 32 iterations of `% 2`, `/ 2`, and a doubling power.
 /// For non-negative i32 inputs that computation is exactly the corresponding
 /// native operation. Negative inputs use truncating division and have different
-/// semantics, hence the explicit runtime guard and untouched fallback CFG.
-pub(super) struct BitwiseDigitLoopPass;
+/// semantics, hence the default runtime guard; the full-domain option requires
+/// an additional proof of the exact negative digit truth table.
+pub(super) struct BitwiseDigitLoopPass {
+    full_domain: bool,
+}
 
 impl BitwiseDigitLoopPass {
-    pub(super) fn new() -> Self {
-        Self
+    pub(super) fn new(full_domain: bool) -> Self {
+        Self { full_domain }
     }
 }
 
 impl ModulePass for BitwiseDigitLoopPass {
     fn run(&mut self, module: &mut Module) {
         for func in &mut module.funcs {
-            let Some(op) = recognize_bitwise_digit_loop(func) else {
+            let Some(recognized) = recognize_bitwise_digit_loop(func) else {
                 continue;
             };
-            add_guarded_fast_path(func, op);
+            if self.full_domain && recognized.sanitizes_negative_digits {
+                add_full_domain_fast_path(func, recognized.op);
+            } else {
+                add_guarded_fast_path(func, recognized.op);
+            }
             if let Err(errors) = func.verify() {
                 panic!(
                     "guarded bitwise digit loop produced invalid IR in {}: {:?}",
@@ -40,7 +48,13 @@ impl ModulePass for BitwiseDigitLoopPass {
     }
 }
 
-fn recognize_bitwise_digit_loop(func: &Function) -> Option<BinaryOp> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecognizedDigitLoop {
+    op: BinaryOp,
+    sanitizes_negative_digits: bool,
+}
+
+fn recognize_bitwise_digit_loop(func: &Function) -> Option<RecognizedDigitLoop> {
     if func.ret != Type::I32
         || func.params.len() != 2
         || func
@@ -153,12 +167,47 @@ fn recognize_bitwise_digit_loop(func: &Function) -> Option<BinaryOp> {
         }
     }
 
-    match truth {
+    let op = match truth {
         [false, false, false, true] => Some(BinaryOp::Iand),
         [false, true, true, true] => Some(BinaryOp::Ior),
         [false, true, true, false] => Some(BinaryOp::Ixor),
         _ => None,
-    }
+    }?;
+
+    // Signed `% 2` produces -1 for a negative odd digit. AND/OR loops that
+    // compare digits specifically with +1 therefore observe every negative
+    // operand as zero. Verify the complete {-1,0,1} digit domain before
+    // selecting that exact, constant-time formula.
+    let sanitizes_negative_digits = matches!(op, BinaryOp::Iand | BinaryOp::Ior)
+        && [-1, 0, 1].into_iter().all(|lhs| {
+            [-1, 0, 1].into_iter().all(|rhs| {
+                let expected = match op {
+                    BinaryOp::Iand => lhs == 1 && rhs == 1,
+                    BinaryOp::Ior => lhs == 1 || rhs == 1,
+                    _ => unreachable!(),
+                };
+                evaluate_one_iteration(
+                    func,
+                    natural_loop.header,
+                    latch,
+                    &[
+                        (digit_phis[0], lhs),
+                        (digit_phis[1], rhs),
+                        (counter, 1),
+                        (power, 1),
+                        (result, 0),
+                        (func.params[0], lhs),
+                        (func.params[1], rhs),
+                    ],
+                    result,
+                ) == Some(i32::from(expected))
+            })
+        });
+
+    Some(RecognizedDigitLoop {
+        op,
+        sanitizes_negative_digits,
+    })
 }
 
 fn loop_has_unsupported_effects(
@@ -358,6 +407,63 @@ fn add_guarded_fast_path(func: &mut Function, op: BinaryOp) {
     func.entry = guard;
 }
 
+fn add_full_domain_fast_path(func: &mut Function, op: BinaryOp) {
+    debug_assert!(matches!(op, BinaryOp::Iand | BinaryOp::Ior));
+    let entry = func.add_block("bitwise.full.fast");
+    let shift = func.add_const(Const::Int(31));
+    let minus_one = func.add_const(Const::Int(-1));
+    let mut sanitized = Vec::with_capacity(2);
+    for param in func.params.clone() {
+        let sign = func
+            .append_inst(
+                entry,
+                InstKind::Binary {
+                    op: BinaryOp::Iashr,
+                    lhs: param,
+                    rhs: shift,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let nonnegative_mask = func
+            .append_inst(
+                entry,
+                InstKind::Binary {
+                    op: BinaryOp::Ixor,
+                    lhs: sign,
+                    rhs: minus_one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        sanitized.push(
+            func.append_inst(
+                entry,
+                InstKind::Binary {
+                    op: BinaryOp::Iand,
+                    lhs: param,
+                    rhs: nonnegative_mask,
+                },
+                Some(Type::I32),
+            )
+            .unwrap(),
+        );
+    }
+    let result = func
+        .append_inst(
+            entry,
+            InstKind::Binary {
+                op,
+                lhs: sanitized[0],
+                rhs: sanitized[1],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    func.set_terminator(entry, Terminator::Return(Some(result)));
+    func.entry = entry;
+}
+
 fn is_divide_by_two(func: &Function, value: ValueId, input: ValueId) -> bool {
     matches!(
         defining_inst(func, value),
@@ -456,9 +562,14 @@ int main() {{ return arbitrary(6, 3); }}
             super::super::ScalarPromotePass::new().run(&mut module);
             super::super::DcePass::new().run(&mut module);
             let func = &module.funcs[0];
-            assert_eq!(recognize_bitwise_digit_loop(func), Some(expected));
+            let recognized = recognize_bitwise_digit_loop(func).unwrap();
+            assert_eq!(recognized.op, expected);
+            assert_eq!(
+                recognized.sanitizes_negative_digits,
+                matches!(expected, BinaryOp::Iand | BinaryOp::Ior)
+            );
 
-            BitwiseDigitLoopPass::new().run(&mut module);
+            BitwiseDigitLoopPass::new(false).run(&mut module);
             let func = &module.funcs[0];
             assert!(func.blocks.iter().any(|block| {
                 block
@@ -503,5 +614,41 @@ int combine(int a, int b) {
         super::super::ScalarPromotePass::new().run(&mut module);
         super::super::DcePass::new().run(&mut module);
         assert_eq!(recognize_bitwise_digit_loop(&module.funcs[0]), None);
+    }
+
+    #[test]
+    fn full_domain_mode_uses_the_proven_negative_sanitization() {
+        let source = r#"
+int combine(int a, int b) {
+    int len = 32, result = 0, power = 1;
+    while (len) {
+        int da = a % 2;
+        int db = b % 2;
+        a = a / 2;
+        b = b / 2;
+        if (da == 1 || db == 1) result = result + power;
+        power = power * 2;
+        len = len - 1;
+    }
+    return result;
+}
+int main() { return combine(-3, 5); }
+"#;
+        let mut module = lower_program(&Parser::new(source).parse_program()).unwrap();
+        super::super::ScalarPromotePass::new().run(&mut module);
+        super::super::DcePass::new().run(&mut module);
+        BitwiseDigitLoopPass::new(true).run(&mut module);
+
+        let func = &module.funcs[0];
+        assert!(func.block(func.entry).name.starts_with("bitwise.full.fast"));
+        assert_eq!(
+            func.block(func.entry)
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Binary { .. }))
+                .count(),
+            7
+        );
+        assert!(func.verify().is_ok());
     }
 }

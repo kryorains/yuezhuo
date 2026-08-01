@@ -31,6 +31,7 @@ impl ModulePass for InstCombinePass {
         for func in &mut module.funcs {
             if self.divisibility_only {
                 combine_divisibility_remainders(func);
+                combine_parity_products(func);
                 if let Err(errors) = func.verify() {
                     panic!(
                         "divisibility combining produced invalid IR in {}: {:?}",
@@ -46,6 +47,7 @@ impl ModulePass for InstCombinePass {
 
 fn combine_function(func: &mut Function) {
     combine_divisibility_remainders(func);
+    combine_parity_products(func);
 
     // Reassociation can expose another constant-bearing definition, so keep
     // scanning until every local expression reaches its canonical form.
@@ -71,6 +73,109 @@ fn combine_function(func: &mut Function) {
             "instruction combining produced invalid IR in {}: {:?}",
             func.name, errors
         );
+    }
+}
+
+/// Replaces a product with a bitwise AND when every observation retains only
+/// bit zero. In two's-complement modular arithmetic the low bit of `a * b` is
+/// exactly the low bit of `a & b`; keeping the users' `& 1` preserves their
+/// complete i32 result while avoiding a multiply on parity-only paths.
+fn combine_parity_products(func: &mut Function) {
+    const MAX_VALUES: usize = 16_384;
+    const MAX_INSTRUCTIONS: usize = 65_536;
+    const MAX_OPERAND_WORK: usize = 262_144;
+
+    let instruction_count = func
+        .blocks
+        .iter()
+        .try_fold(0usize, |total, block| total.checked_add(block.insts.len()));
+    if func.values.len() > MAX_VALUES
+        || instruction_count.is_none_or(|count| count > MAX_INSTRUCTIONS)
+    {
+        return;
+    }
+
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        block: usize,
+        inst: usize,
+        lhs: ValueId,
+        rhs: ValueId,
+        found_use: bool,
+        valid: bool,
+    }
+
+    let mut candidates = vec![None; func.values.len()];
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.insts.iter().enumerate() {
+            let (
+                Some(result),
+                InstKind::Binary {
+                    op: BinaryOp::Imul,
+                    lhs,
+                    rhs,
+                },
+            ) = (inst.result, &inst.kind)
+            else {
+                continue;
+            };
+            candidates[result.0] = Some(Candidate {
+                block: block_idx,
+                inst: inst_idx,
+                lhs: *lhs,
+                rhs: *rhs,
+                found_use: false,
+                valid: true,
+            });
+        }
+    }
+
+    let mut operand_work = 0usize;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let operands = inst_operands(&inst.kind);
+            operand_work = operand_work.saturating_add(operands.len());
+            if operand_work > MAX_OPERAND_WORK {
+                return;
+            }
+            for product in operands {
+                let Some(candidate) = candidates.get_mut(product.0).and_then(Option::as_mut) else {
+                    continue;
+                };
+                candidate.found_use = true;
+                candidate.valid &= matches!(
+                    &inst.kind,
+                    InstKind::Binary {
+                        op: BinaryOp::Iand,
+                        lhs,
+                        rhs,
+                    } if (*lhs == product && const_i32(func, *rhs) == Some(1))
+                        || (*rhs == product && const_i32(func, *lhs) == Some(1))
+                );
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            for product in terminator_operands(terminator) {
+                operand_work = operand_work.saturating_add(1);
+                if operand_work > MAX_OPERAND_WORK {
+                    return;
+                }
+                if let Some(candidate) = candidates.get_mut(product.0).and_then(Option::as_mut) {
+                    candidate.found_use = true;
+                    candidate.valid = false;
+                }
+            }
+        }
+    }
+
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.found_use && candidate.valid {
+            func.blocks[candidate.block].insts[candidate.inst].kind = InstKind::Binary {
+                op: BinaryOp::Iand,
+                lhs: candidate.lhs,
+                rhs: candidate.rhs,
+            };
+        }
     }
 }
 
@@ -557,6 +662,56 @@ mod tests {
                     op: BinaryOp::Imod,
                     ..
                 }
+            ));
+            assert!(func.verify().is_ok());
+        }
+    }
+
+    #[test]
+    fn replaces_products_observed_only_through_parity_masks() {
+        for extra_value_use in [false, true] {
+            let mut func = Function::new("masked_product", Type::I32);
+            let lhs = func.add_param("lhs", Type::I32);
+            let rhs = func.add_param("rhs", Type::I32);
+            let one = func.add_const(Const::Int(1));
+            let product = func
+                .append_inst(
+                    func.entry,
+                    InstKind::Binary {
+                        op: BinaryOp::Imul,
+                        lhs,
+                        rhs,
+                    },
+                    Some(Type::I32),
+                )
+                .unwrap();
+            let parity = func
+                .append_inst(
+                    func.entry,
+                    InstKind::Binary {
+                        op: BinaryOp::Iand,
+                        lhs: product,
+                        rhs: one,
+                    },
+                    Some(Type::I32),
+                )
+                .unwrap();
+            func.set_terminator(
+                func.entry,
+                Terminator::Return(Some(if extra_value_use { product } else { parity })),
+            );
+
+            combine_function(&mut func);
+
+            let ValueKind::Inst(block, inst_idx) = func.value(product).kind else {
+                panic!("product must remain instruction-backed");
+            };
+            assert!(matches!(
+                func.blocks[block.0].insts[inst_idx].kind,
+                InstKind::Binary { op, lhs: actual_lhs, rhs: actual_rhs }
+                    if op == if extra_value_use { BinaryOp::Imul } else { BinaryOp::Iand }
+                        && [actual_lhs, actual_rhs].contains(&lhs)
+                        && [actual_lhs, actual_rhs].contains(&rhs)
             ));
             assert!(func.verify().is_ok());
         }

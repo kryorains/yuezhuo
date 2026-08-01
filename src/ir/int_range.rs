@@ -99,40 +99,51 @@ fn value_range(
         ValueKind::Const(Const::Int(value)) => Some(IntRange::exact(*value)),
         ValueKind::Const(Const::Bool(value)) => Some(IntRange::exact(if *value { 1 } else { 0 })),
         ValueKind::Const(Const::Zero(Type::I32 | Type::I1)) => Some(IntRange::exact(0)),
-        ValueKind::Inst(block, index) => match &func.block(*block).insts[*index].kind {
-            InstKind::Phi { incomings } => union_ranges(incomings.iter().map(|(_, incoming)| {
-                value_range(func, *incoming, return_ranges, ranges, visiting)
-            })),
-            InstKind::Unary { op, value } => {
-                let input = value_range(func, *value, return_ranges, ranges, visiting)?;
-                match op {
-                    UnaryOp::Ineg => IntRange::checked_i32(-input.max, -input.min),
-                    UnaryOp::Not => Some(IntRange { min: 0, max: 1 }),
-                    UnaryOp::Fneg => None,
+        ValueKind::Inst(block, index) => match func
+            .blocks
+            .get(block.0)
+            .and_then(|block| block.insts.get(*index))
+            .filter(|inst| inst.result == Some(value))
+            .map(|inst| &inst.kind)
+        {
+            None => None,
+            Some(kind) => match kind {
+                InstKind::Phi { incomings } => {
+                    union_ranges(incomings.iter().map(|(_, incoming)| {
+                        value_range(func, *incoming, return_ranges, ranges, visiting)
+                    }))
                 }
-            }
-            InstKind::Binary { op, lhs, rhs } => {
-                binary_range(func, *op, *lhs, *rhs, return_ranges, ranges, visiting)
-            }
-            InstKind::Icmp { .. } => Some(IntRange { min: 0, max: 1 }),
-            InstKind::Cast { op, value } => match op {
-                CastOp::BoolToI32 | CastOp::I32ToBool | CastOp::F32ToBool => {
-                    Some(IntRange { min: 0, max: 1 })
+                InstKind::Unary { op, value } => {
+                    let input = value_range(func, *value, return_ranges, ranges, visiting)?;
+                    match op {
+                        UnaryOp::Ineg => IntRange::checked_i32(-input.max, -input.min),
+                        UnaryOp::Not => Some(IntRange { min: 0, max: 1 }),
+                        UnaryOp::Fneg => None,
+                    }
                 }
-                CastOp::F32ToI32 => None,
-                CastOp::I32ToF32 => {
-                    let _ = value;
-                    None
+                InstKind::Binary { op, lhs, rhs } => {
+                    binary_range(func, *op, *lhs, *rhs, return_ranges, ranges, visiting)
                 }
+                InstKind::Icmp { .. } => Some(IntRange { min: 0, max: 1 }),
+                InstKind::Cast { op, value } => match op {
+                    CastOp::BoolToI32 | CastOp::I32ToBool | CastOp::F32ToBool => {
+                        Some(IntRange { min: 0, max: 1 })
+                    }
+                    CastOp::F32ToI32 => None,
+                    CastOp::I32ToF32 => {
+                        let _ = value;
+                        None
+                    }
+                },
+                InstKind::Call { name, .. } => return_ranges.get(name).copied(),
+                InstKind::Nop
+                | InstKind::Alloca { .. }
+                | InstKind::Load { .. }
+                | InstKind::Store { .. }
+                | InstKind::MemZero { .. }
+                | InstKind::Fcmp { .. }
+                | InstKind::Gep { .. } => None,
             },
-            InstKind::Call { name, .. } => return_ranges.get(name).copied(),
-            InstKind::Nop
-            | InstKind::Alloca { .. }
-            | InstKind::Load { .. }
-            | InstKind::Store { .. }
-            | InstKind::MemZero { .. }
-            | InstKind::Fcmp { .. }
-            | InstKind::Gep { .. } => None,
         },
         ValueKind::Param
         | ValueKind::Global(_)
@@ -225,5 +236,32 @@ fn const_i32(func: &Function, value: ValueId) -> Option<i32> {
         ValueKind::Const(Const::Int(value)) => Some(*value),
         ValueKind::Const(Const::Zero(Type::I32)) => Some(0),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignores_an_instruction_value_whose_definition_was_removed() {
+        let mut func = Function::new("stale_value", Type::I32);
+        let one = func.add_const(Const::Int(1));
+        let stale = func
+            .append_inst(
+                func.entry,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: one,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.block_mut(func.entry).insts.clear();
+
+        let ranges = collect_value_ranges(&func, &HashMap::new());
+        assert_eq!(ranges[one.0], Some(IntRange { min: 1, max: 1 }));
+        assert_eq!(ranges[stale.0], None);
     }
 }

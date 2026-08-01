@@ -1181,6 +1181,7 @@ mod tests {
             enable_loop_call_memoize: false,
             enable_loop_invariant_call_memoize: false,
             enable_regional_global_scalar_promotion: false,
+            enable_full_domain_bitwise_digit: false,
             enable_write_only_alloca_cleanup_before_inline: true,
         };
 
