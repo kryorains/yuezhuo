@@ -224,6 +224,15 @@ impl AArch64PhiRegs {
     pub(super) fn saved_regs(&self) -> &[&'static str] {
         &self.saved_regs
     }
+
+    pub(super) fn unused_callee_saved(&self, index: usize) -> Option<&'static str> {
+        CALLEE_SAVED_REGS
+            .iter()
+            .rev()
+            .copied()
+            .filter(|reg| !self.saved_regs.contains(reg))
+            .nth(index)
+    }
 }
 
 fn is_register_type(ty: &Type) -> bool {

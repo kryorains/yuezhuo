@@ -12,11 +12,12 @@ use crate::codegen::common::{IrFuncLayout, IrLocalRegs};
 use crate::ir::{Function, Module};
 use float_regs::AArch64FloatRegs;
 use phi_regs::AArch64PhiRegs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 struct AArch64IrEmitter<'a> {
     ctx: crate::codegen::common::IrModuleCtx<'a>,
     int_return_ranges: HashMap<String, crate::ir::int_range::IntRange>,
+    nonnegative_globals: HashSet<String>,
     out: String,
 }
 
@@ -31,6 +32,8 @@ struct AArch64IrFuncEmitter<'a, 'b> {
     value_use_counts: Vec<usize>,
     int_ranges: Vec<Option<crate::ir::int_range::IntRange>>,
     folded_memory_geps: HashMap<crate::ir::ValueId, memory::FoldedMemoryGep>,
+    cached_i32_constant: Option<(i32, &'static str)>,
+    cached_i32_double_constant: Option<(i32, &'static str)>,
     frame_accessed: bool,
     body: String,
     return_label: String,

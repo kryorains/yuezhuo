@@ -341,6 +341,11 @@ fn is_readonly_inline_inst(func: &Function, inst: &Inst, allow_global_loads: boo
                     || (allow_global_loads
                         && matches!(func.value(root).kind, ValueKind::Global(_)))
             })
+    ) || matches!(
+        inst.kind,
+        InstKind::Store { ptr, .. }
+            if allow_global_loads
+                && matches!(func.value(ptr).kind, ValueKind::Global(_))
     )
 }
 
