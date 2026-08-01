@@ -268,10 +268,12 @@ fn analyze_candidate(
                     affine_offset_available(func, dom, natural_loop, preheader, *offset)
                         && derived_index_does_not_wrap(
                             func,
+                            dom,
                             natural_loop,
                             all_loops,
                             induction,
                             *offset,
+                            target,
                         )
                 })
             {
@@ -387,10 +389,12 @@ fn affine_offset_available(
 /// complete modulo-2^32 congruence class.
 fn derived_index_does_not_wrap(
     func: &Function,
+    dom: &Dominators,
     natural_loop: &NaturalLoop,
     all_loops: &[NaturalLoop],
     induction: InductionVariable,
     offset: AffineOffset,
+    target: ValueId,
 ) -> bool {
     if offset == AffineOffset::Constant(0) {
         return true;
@@ -411,6 +415,9 @@ fn derived_index_does_not_wrap(
     let AffineOffset::Constant(offset) = offset else {
         return false;
     };
+    if active_header_guard_proves_unit_offset(func, dom, natural_loop, induction, offset, target) {
+        return true;
+    }
     let Some(initial) = const_i32(func, induction.initial).map(i64::from) else {
         return false;
     };
@@ -427,6 +434,37 @@ fn derived_index_does_not_wrap(
         .checked_add(i64::from(offset))
         .zip(maximum.checked_add(i64::from(offset)))
         .is_some_and(|(minimum, maximum)| minimum >= signed_minimum && maximum <= signed_maximum)
+}
+
+/// A strict header guard proves a unit derived index safe on the taken path:
+/// `iv < bound` over i32 implies `iv <= INT_MAX - 1`, and symmetrically
+/// `iv > bound` implies `iv >= INT_MIN + 1`. The address must be formed in a
+/// block dominated by that taken successor; an expression in the header would
+/// also execute on the final failed test and cannot use this proof.
+fn active_header_guard_proves_unit_offset(
+    func: &Function,
+    dom: &Dominators,
+    natural_loop: &NaturalLoop,
+    induction: InductionVariable,
+    offset: i32,
+    target: ValueId,
+) -> bool {
+    let Some(ValueKind::Inst(target_block, _)) = func.values.get(target.0).map(|value| &value.kind)
+    else {
+        return false;
+    };
+    let Some((op, _, taken_successor)) =
+        active_header_comparison(func, natural_loop, induction.phi)
+    else {
+        return false;
+    };
+    if *target_block == natural_loop.header || !dom.dominates(taken_successor, *target_block) {
+        return false;
+    }
+    matches!(
+        (induction.step, op, offset),
+        (1, CmpOp::Lt, 1) | (-1, CmpOp::Gt, -1)
+    )
 }
 
 fn affine_offset_range(
@@ -483,32 +521,9 @@ fn induction_does_not_wrap(
         return true;
     }
 
-    let Some(Terminator::Branch {
-        cond,
-        then_target,
-        else_target,
-    }) = func.blocks[natural_loop.header.0].terminator.as_ref()
-    else {
+    let Some((op, bound, _)) = active_header_comparison(func, natural_loop, induction.phi) else {
         return false;
     };
-    let then_inside = natural_loop.blocks.contains(then_target);
-    let else_inside = natural_loop.blocks.contains(else_target);
-    if then_inside == else_inside {
-        return false;
-    }
-    let Some(InstKind::Icmp { op, lhs, rhs }) = defining_inst(func, *cond) else {
-        return false;
-    };
-    let (mut op, bound) = if *lhs == induction.phi {
-        (*op, *rhs)
-    } else if *rhs == induction.phi {
-        (reverse_cmp(*op), *lhs)
-    } else {
-        return false;
-    };
-    if !then_inside {
-        op = negate_cmp(op);
-    }
     let Some(preheader) = natural_loop.dedicated_preheader else {
         return false;
     };
@@ -537,6 +552,49 @@ fn induction_does_not_wrap(
         }
         _ => false,
     }
+}
+
+/// Returns the comparison as observed on the loop-entering header edge.
+fn active_header_comparison(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    induction: ValueId,
+) -> Option<(CmpOp, ValueId, BlockId)> {
+    let Terminator::Branch {
+        cond,
+        then_target,
+        else_target,
+    } = func.blocks[natural_loop.header.0].terminator.as_ref()?
+    else {
+        return None;
+    };
+    let then_inside = natural_loop.blocks.contains(then_target);
+    let else_inside = natural_loop.blocks.contains(else_target);
+    if then_inside == else_inside {
+        return None;
+    }
+    let InstKind::Icmp { op, lhs, rhs } = defining_inst(func, *cond)? else {
+        return None;
+    };
+    let (mut op, bound) = if *lhs == induction {
+        (*op, *rhs)
+    } else if *rhs == induction {
+        (reverse_cmp(*op), *lhs)
+    } else {
+        return None;
+    };
+    if !then_inside {
+        op = negate_cmp(op);
+    }
+    Some((
+        op,
+        bound,
+        if then_inside {
+            *then_target
+        } else {
+            *else_target
+        },
+    ))
 }
 
 fn build_pointer_recurrence(func: &mut Function, candidate: &Candidate) -> ValueId {
@@ -1007,6 +1065,29 @@ mod tests {
     }
 
     #[test]
+    fn reduces_taken_path_unit_offsets_with_dynamic_bounds() {
+        let (mut increasing, target, latch) = build_dynamic_derived_loop(1, 1, CmpOp::Lt);
+        assert!(increasing.verify().is_ok());
+        strength_reduce_function(&mut increasing);
+        assert!(is_nop(&increasing, target));
+        assert!(has_pointer_recurrence(&increasing, latch, 1));
+        assert!(increasing.verify().is_ok());
+
+        let (mut decreasing, target, latch) = build_dynamic_derived_loop(-1, -1, CmpOp::Gt);
+        assert!(decreasing.verify().is_ok());
+        strength_reduce_function(&mut decreasing);
+        assert!(is_nop(&decreasing, target));
+        assert!(has_pointer_recurrence(&decreasing, latch, -1));
+        assert!(decreasing.verify().is_ok());
+
+        let (mut wider_offset, target, _) = build_dynamic_derived_loop(1, 2, CmpOp::Lt);
+        assert!(wider_offset.verify().is_ok());
+        strength_reduce_function(&mut wider_offset);
+        assert!(!is_nop(&wider_offset, target));
+        assert!(wider_offset.verify().is_ok());
+    }
+
+    #[test]
     fn rejects_call_crossing_loops_for_profitability() {
         let (mut func, target, body) = build_linear_loop(
             Type::Array {
@@ -1299,6 +1380,103 @@ mod tests {
         func.set_terminator(inner_exit, Terminator::Jump(outer_header));
         func.set_terminator(exit, Terminator::Return(None));
         (func, target, inner_body)
+    }
+
+    fn build_dynamic_derived_loop(
+        step: i32,
+        offset: i32,
+        comparison: CmpOp,
+    ) -> (Function, ValueId, BlockId) {
+        let mut func = Function::new("guarded_derived_address", Type::Void);
+        let base = func.add_param("buffer", Type::Ptr(Box::new(Type::I32)));
+        let initial = func.add_param("start", Type::I32);
+        let bound = func.add_param("end", Type::I32);
+        let header = func.add_block("header");
+        let body = func.add_block("body");
+        let exit = func.add_block("exit");
+        let step_value = func.add_const(Const::Int(step.unsigned_abs() as i32));
+        let offset_value = func.add_const(Const::Int(offset.unsigned_abs() as i32));
+        func.set_terminator(func.entry, Terminator::Jump(header));
+        let induction = func
+            .append_inst(
+                header,
+                InstKind::Phi {
+                    incomings: vec![(func.entry, initial), (body, initial)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let condition = func
+            .append_inst(
+                header,
+                InstKind::Icmp {
+                    op: comparison,
+                    lhs: induction,
+                    rhs: bound,
+                },
+                Some(Type::I1),
+            )
+            .unwrap();
+        func.set_terminator(
+            header,
+            Terminator::Branch {
+                cond: condition,
+                then_target: body,
+                else_target: exit,
+            },
+        );
+        let derived = func
+            .append_inst(
+                body,
+                InstKind::Binary {
+                    op: if offset > 0 {
+                        BinaryOp::Iadd
+                    } else {
+                        BinaryOp::Isub
+                    },
+                    lhs: induction,
+                    rhs: offset_value,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let target = func
+            .append_inst(
+                body,
+                InstKind::Gep {
+                    base,
+                    indices: vec![derived],
+                },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        func.append_inst(
+            body,
+            InstKind::Store {
+                ptr: target,
+                value: induction,
+            },
+            None,
+        );
+        let next = func
+            .append_inst(
+                body,
+                InstKind::Binary {
+                    op: if step > 0 {
+                        BinaryOp::Iadd
+                    } else {
+                        BinaryOp::Isub
+                    },
+                    lhs: induction,
+                    rhs: step_value,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        set_phi_incoming(&mut func, induction, body, next);
+        func.set_terminator(body, Terminator::Jump(header));
+        func.set_terminator(exit, Terminator::Return(None));
+        (func, target, body)
     }
 
     fn build_live_out_loop() -> (Function, ValueId) {

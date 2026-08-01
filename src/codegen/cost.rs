@@ -20,6 +20,7 @@ pub struct TargetCostModel {
     loop_call_memoize: bool,
     loop_invariant_call_memoize: bool,
     regional_global_scalar_promotion: bool,
+    full_domain_bitwise_digit: bool,
     contract_float_madd: bool,
     cleanup_write_only_allocas_before_inline: bool,
     max_reduction_jam_factor: usize,
@@ -43,6 +44,7 @@ impl TargetCostModel {
                 loop_call_memoize: false,
                 loop_invariant_call_memoize: false,
                 regional_global_scalar_promotion: false,
+                full_domain_bitwise_digit: false,
                 contract_float_madd: false,
                 cleanup_write_only_allocas_before_inline: true,
                 max_reduction_jam_factor: 2,
@@ -62,6 +64,7 @@ impl TargetCostModel {
                 loop_call_memoize: true,
                 loop_invariant_call_memoize: false,
                 regional_global_scalar_promotion: false,
+                full_domain_bitwise_digit: true,
                 contract_float_madd: false,
                 cleanup_write_only_allocas_before_inline: false,
                 max_reduction_jam_factor: 4,
@@ -81,6 +84,7 @@ impl TargetCostModel {
                 loop_call_memoize: false,
                 loop_invariant_call_memoize: true,
                 regional_global_scalar_promotion: true,
+                full_domain_bitwise_digit: false,
                 contract_float_madd: false,
                 cleanup_write_only_allocas_before_inline: true,
                 max_reduction_jam_factor: 4,
@@ -136,6 +140,10 @@ impl TargetCostModel {
 
     pub const fn enable_regional_global_scalar_promotion(self) -> bool {
         self.regional_global_scalar_promotion
+    }
+
+    pub const fn enable_full_domain_bitwise_digit(self) -> bool {
+        self.full_domain_bitwise_digit
     }
 
     pub(crate) const fn contract_float_madd(self) -> bool {
@@ -200,10 +208,12 @@ mod tests {
         assert!(riscv64.enable_uniform_constant_arguments());
         assert!(aarch64.enable_initialized_global_propagation());
         assert!(aarch64.enable_uniform_constant_arguments());
+        assert!(aarch64.enable_full_domain_bitwise_digit());
         assert_eq!(aarch64.max_reduction_jam_factor(), 4);
         assert!(!riscv64.enable_loop_call_memoize());
         assert!(riscv64.enable_loop_invariant_call_memoize());
         assert!(riscv64.enable_regional_global_scalar_promotion());
+        assert!(!riscv64.enable_full_domain_bitwise_digit());
         assert!(!riscv64.contract_float_madd());
         assert!(riscv64.cleanup_write_only_allocas_before_inline());
         assert_eq!(riscv64.max_reduction_jam_factor(), 4);

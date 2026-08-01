@@ -1,0 +1,1049 @@
+use super::dominators::{ControlFlowGraph, Dominators};
+use super::loop_analysis::{
+    analyze_const_i32_trip_count, analyze_i32_induction, InductionVariable, LoopInfo, NaturalLoop,
+};
+use super::ModulePass;
+use crate::ir::{
+    BinaryOp, BlockId, CmpOp, Const, Function, InstKind, Module, Terminator, Type, ValueId,
+    ValueKind,
+};
+use std::collections::HashSet;
+
+const MAX_BLOCKS: usize = 1024;
+const MAX_VALUES: usize = 16_384;
+const MAX_PROMOTIONS_PER_FUNCTION: usize = 8;
+
+/// Promotes one invariant array element across a canonical loop when every
+/// competing memory access is proven not to alias it.
+///
+/// This is the narrow loop load/store promotion performed by mature LICM
+/// implementations.  The pass deliberately accepts only typed GEP paths and
+/// two exact induction proofs; unknown pointer arithmetic remains in memory.
+pub(super) struct LoopMemoryPromotionPass;
+
+impl LoopMemoryPromotionPass {
+    pub(super) fn new() -> Self {
+        Self
+    }
+}
+
+impl ModulePass for LoopMemoryPromotionPass {
+    fn run(&mut self, module: &mut Module) {
+        for func in &mut module.funcs {
+            for _ in 0..MAX_PROMOTIONS_PER_FUNCTION {
+                let Some(candidate) = find_candidate(func) else {
+                    break;
+                };
+                promote_candidate(func, candidate);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccessPath {
+    root: ValueId,
+    indices: Vec<ValueId>,
+}
+
+#[derive(Clone, Debug)]
+struct Candidate {
+    pointer: ValueId,
+    path: AccessPath,
+    value_ty: Type,
+    preheader: BlockId,
+    header: BlockId,
+    exit_from: BlockId,
+    exit: BlockId,
+    initial: ValueId,
+    guard_op: CmpOp,
+    guard_bound: ValueId,
+    loop_blocks: HashSet<BlockId>,
+}
+
+fn find_candidate(func: &Function) -> Option<Candidate> {
+    if func.blocks.len() > MAX_BLOCKS
+        || func.values.len() > MAX_VALUES
+        // A call can invalidate the simple dereferenceability argument used
+        // for the speculative preheader load.  SysY kernels normally keep
+        // their hot arithmetic loops in call-free functions.
+        || func.blocks.iter().any(|block| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Call { .. }))
+        })
+    {
+        return None;
+    }
+
+    let cfg = ControlFlowGraph::new(func);
+    let dom = Dominators::new(func, &cfg);
+    let loop_info = LoopInfo::new(&cfg, &dom);
+    let all_loops = loop_info.loops();
+
+    for natural_loop in all_loops {
+        let Some(preheader) = natural_loop.dedicated_preheader else {
+            continue;
+        };
+        if natural_loop.unique_latch().is_none() {
+            continue;
+        }
+        let [(exit_from, exit)] = natural_loop.exit_edges.as_slice() else {
+            continue;
+        };
+        if *exit_from != natural_loop.header
+            || !matches!(
+                func.blocks[preheader.0].terminator,
+                Some(Terminator::Jump(target)) if target == natural_loop.header
+            )
+            || func.blocks[natural_loop.header.0].insts.iter().any(|inst| {
+                !matches!(
+                    inst.kind,
+                    InstKind::Nop | InstKind::Phi { .. } | InstKind::Icmp { .. }
+                )
+            })
+            || func.blocks[exit.0]
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Phi { .. }))
+            || natural_loop.blocks.iter().any(|block| {
+                func.blocks[block.0].insts.iter().any(|inst| {
+                    matches!(inst.kind, InstKind::Call { .. } | InstKind::MemZero { .. })
+                })
+            })
+        {
+            continue;
+        }
+
+        let Some(induction) = header_induction(func, natural_loop) else {
+            continue;
+        };
+        let Some((guard_op, guard_bound, taken)) =
+            active_header_comparison(func, natural_loop, induction.phi)
+        else {
+            continue;
+        };
+        if !value_available_at(func, &dom, induction.initial, preheader)
+            || !value_available_at(func, &dom, guard_bound, preheader)
+            || !loop_definitions_do_not_escape(func, natural_loop)
+        {
+            continue;
+        }
+        let mut pointers = Vec::new();
+        for block in sorted_loop_blocks(natural_loop) {
+            for inst in &func.blocks[block.0].insts {
+                let pointer = match inst.kind {
+                    InstKind::Load { ptr } | InstKind::Store { ptr, .. } => ptr,
+                    _ => continue,
+                };
+                if !pointers.contains(&pointer) {
+                    pointers.push(pointer);
+                }
+            }
+        }
+
+        for pointer in pointers {
+            let invariant = is_loop_invariant(func, natural_loop, pointer);
+            let available = value_available_at(func, &dom, pointer, preheader);
+            if !invariant || !available {
+                continue;
+            }
+            let Some(path) = access_path(func, pointer) else {
+                continue;
+            };
+            if path.indices.len() < 2 || is_alloca_root(func, path.root) {
+                continue;
+            }
+            let Some(value_ty) = scalar_pointee(func, pointer) else {
+                continue;
+            };
+
+            let (loads, stores) = count_equivalent_accesses(func, natural_loop, &path);
+            if loads == 0 || stores == 0 {
+                continue;
+            }
+            if !has_must_execute_target_load(func, &dom, natural_loop, taken, &path)
+                || !loop_memory_is_disjoint(func, &dom, natural_loop, all_loops, induction, &path)
+            {
+                continue;
+            }
+
+            return Some(Candidate {
+                pointer,
+                path,
+                value_ty,
+                preheader,
+                header: natural_loop.header,
+                exit_from: *exit_from,
+                exit: *exit,
+                initial: induction.initial,
+                guard_op,
+                guard_bound,
+                loop_blocks: natural_loop.blocks.clone(),
+            });
+        }
+    }
+    None
+}
+
+fn header_induction(func: &Function, natural_loop: &NaturalLoop) -> Option<InductionVariable> {
+    func.blocks[natural_loop.header.0]
+        .insts
+        .iter()
+        .filter_map(|inst| inst.result)
+        .find_map(|phi| analyze_i32_induction(func, natural_loop, phi))
+}
+
+fn sorted_loop_blocks(natural_loop: &NaturalLoop) -> Vec<BlockId> {
+    let mut blocks = natural_loop.blocks.iter().copied().collect::<Vec<_>>();
+    blocks.sort_by_key(|block| block.0);
+    blocks
+}
+
+fn scalar_pointee(func: &Function, pointer: ValueId) -> Option<Type> {
+    let Type::Ptr(pointee) = &func.values.get(pointer.0)?.ty else {
+        return None;
+    };
+    matches!(pointee.as_ref(), Type::I1 | Type::I32 | Type::F32).then(|| pointee.as_ref().clone())
+}
+
+fn access_path(func: &Function, pointer: ValueId) -> Option<AccessPath> {
+    let mut current = pointer;
+    let mut reverse_indices = Vec::new();
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return None;
+        }
+        let value = func.values.get(current.0)?;
+        match value.kind {
+            ValueKind::Inst(block, inst_idx) => {
+                let inst = func.blocks.get(block.0)?.insts.get(inst_idx)?;
+                if inst.result != Some(current) {
+                    return None;
+                }
+                match &inst.kind {
+                    InstKind::Gep { base, indices } if !indices.is_empty() => {
+                        reverse_indices.extend(indices.iter().rev().copied());
+                        current = *base;
+                    }
+                    InstKind::Alloca { .. } if reverse_indices.is_empty() => return None,
+                    InstKind::Alloca { .. } => break,
+                    _ => break,
+                }
+            }
+            ValueKind::Param | ValueKind::Global(_) => break,
+            ValueKind::Const(_) => return None,
+        }
+    }
+    reverse_indices.reverse();
+    (!reverse_indices.is_empty()).then_some(AccessPath {
+        root: current,
+        indices: reverse_indices,
+    })
+}
+
+fn count_equivalent_accesses(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    target: &AccessPath,
+) -> (usize, usize) {
+    let mut loads = 0;
+    let mut stores = 0;
+    for block in &natural_loop.blocks {
+        for inst in &func.blocks[block.0].insts {
+            match inst.kind {
+                InstKind::Load { ptr } if access_path(func, ptr).as_ref() == Some(target) => {
+                    loads += 1;
+                }
+                InstKind::Store { ptr, .. } if access_path(func, ptr).as_ref() == Some(target) => {
+                    stores += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    (loads, stores)
+}
+
+/// Once the first header test succeeds, an original load of the target must be
+/// unavoidable before the backedge.  The transform guards its initialization
+/// with an equivalent first-iteration test, so zero-trip paths never load it.
+fn has_must_execute_target_load(
+    func: &Function,
+    _dom: &Dominators,
+    _natural_loop: &NaturalLoop,
+    taken: BlockId,
+    target: &AccessPath,
+) -> bool {
+    func.blocks[taken.0].insts.iter().any(|inst| {
+        matches!(
+            inst.kind,
+            InstKind::Load { ptr }
+                if access_path(func, ptr).as_ref() == Some(target)
+        )
+    })
+}
+
+fn loop_definitions_do_not_escape(func: &Function, natural_loop: &NaturalLoop) -> bool {
+    let definitions = natural_loop
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            func.blocks[block.0]
+                .insts
+                .iter()
+                .filter_map(|inst| inst.result)
+        })
+        .collect::<HashSet<_>>();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        if natural_loop.blocks.contains(&BlockId(block_idx)) {
+            continue;
+        }
+        if block
+            .insts
+            .iter()
+            .flat_map(|inst| operands(&inst.kind))
+            .any(|operand| definitions.contains(&operand))
+            || block
+                .terminator
+                .as_ref()
+                .into_iter()
+                .flat_map(terminator_operands)
+                .any(|operand| definitions.contains(&operand))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn operands(kind: &InstKind) -> Vec<ValueId> {
+    match kind {
+        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Store { ptr, value } => vec![*ptr, *value],
+        InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
+        InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
+        InstKind::Binary { lhs, rhs, .. }
+        | InstKind::Icmp { lhs, rhs, .. }
+        | InstKind::Fcmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+        InstKind::Gep { base, indices } => {
+            let mut operands = vec![*base];
+            operands.extend(indices.iter().copied());
+            operands
+        }
+        InstKind::Call { args, .. } => args.clone(),
+        InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
+    }
+}
+
+fn terminator_operands(terminator: &Terminator) -> Vec<ValueId> {
+    match terminator {
+        Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => vec![*value],
+        Terminator::Return(None) | Terminator::Jump(_) => Vec::new(),
+    }
+}
+
+fn loop_memory_is_disjoint(
+    func: &Function,
+    dom: &Dominators,
+    natural_loop: &NaturalLoop,
+    all_loops: &[NaturalLoop],
+    induction: InductionVariable,
+    target: &AccessPath,
+) -> bool {
+    natural_loop.blocks.iter().all(|block| {
+        func.blocks[block.0].insts.iter().all(|inst| {
+            let pointer = match inst.kind {
+                InstKind::Load { ptr } | InstKind::Store { ptr, .. } => ptr,
+                InstKind::MemZero { .. } | InstKind::Call { .. } => return false,
+                _ => return true,
+            };
+            let Some(other) = access_path(func, pointer) else {
+                return false;
+            };
+            other == *target
+                || paths_proven_disjoint(
+                    func,
+                    dom,
+                    natural_loop,
+                    all_loops,
+                    induction,
+                    target,
+                    &other,
+                    *block,
+                )
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paths_proven_disjoint(
+    func: &Function,
+    dom: &Dominators,
+    natural_loop: &NaturalLoop,
+    all_loops: &[NaturalLoop],
+    induction: InductionVariable,
+    target: &AccessPath,
+    other: &AccessPath,
+    access_block: BlockId,
+) -> bool {
+    if target.root != other.root {
+        return roots_proven_disjoint(func, target.root, other.root);
+    }
+    if target.indices.len() != other.indices.len() {
+        return false;
+    }
+    target
+        .indices
+        .iter()
+        .zip(&other.indices)
+        .any(|(target_index, other_index)| {
+            *target_index != *other_index
+                && indices_proven_distinct(
+                    func,
+                    dom,
+                    natural_loop,
+                    all_loops,
+                    induction,
+                    *target_index,
+                    *other_index,
+                    access_block,
+                )
+        })
+}
+
+fn roots_proven_disjoint(func: &Function, lhs: ValueId, rhs: ValueId) -> bool {
+    match (&func.values[lhs.0].kind, &func.values[rhs.0].kind) {
+        (ValueKind::Global(lhs), ValueKind::Global(rhs)) => lhs != rhs,
+        (ValueKind::Inst(_, _), _) if is_alloca_root(func, lhs) => true,
+        (_, ValueKind::Inst(_, _)) if is_alloca_root(func, rhs) => true,
+        _ => false,
+    }
+}
+
+fn is_alloca_root(func: &Function, value: ValueId) -> bool {
+    matches!(defining_inst(func, value), Some(InstKind::Alloca { .. }))
+}
+
+fn indices_proven_distinct(
+    func: &Function,
+    dom: &Dominators,
+    natural_loop: &NaturalLoop,
+    all_loops: &[NaturalLoop],
+    induction: InductionVariable,
+    target: ValueId,
+    other: ValueId,
+    access_block: BlockId,
+) -> bool {
+    let Some((op, bound, taken)) = active_header_comparison(func, natural_loop, induction.phi)
+    else {
+        return false;
+    };
+    if !dom.dominates(taken, access_block) {
+        return false;
+    }
+
+    // On the taken edge a strict loop guard directly separates the induction
+    // value and its invariant bound, e.g. `k < j` proves `[i][k] != [i][j]`.
+    if ((target == bound && other == induction.phi) || (other == bound && target == induction.phi))
+        && matches!(op, CmpOp::Lt | CmpOp::Gt)
+    {
+        return true;
+    }
+
+    // A no-wrap positive recurrence that begins strictly above an outer
+    // induction stays above it.  This proves forms such as
+    // `k = i + 1; ... table[k + 1][j]` disjoint from `table[i][j]`.
+    if op != CmpOp::Lt || induction.step != 1 {
+        return false;
+    }
+    let Some(initial_delta) = affine_delta(func, induction.initial, target) else {
+        return false;
+    };
+    let Some(other_delta) = affine_delta(func, other, induction.phi) else {
+        return false;
+    };
+    if initial_delta <= 0 || !(0..=1).contains(&other_delta) {
+        return false;
+    }
+    let Some((minimum, maximum)) =
+        enclosing_induction_range(func, dom, all_loops, target, access_block)
+    else {
+        return false;
+    };
+    minimum
+        .checked_add(i64::from(initial_delta))
+        .zip(maximum.checked_add(i64::from(initial_delta)))
+        .is_some_and(|(minimum, maximum)| {
+            minimum >= i64::from(i32::MIN) && maximum <= i64::from(i32::MAX)
+        })
+}
+
+fn enclosing_induction_range(
+    func: &Function,
+    dom: &Dominators,
+    all_loops: &[NaturalLoop],
+    value: ValueId,
+    access_block: BlockId,
+) -> Option<(i64, i64)> {
+    all_loops.iter().find_map(|natural_loop| {
+        let induction = analyze_i32_induction(func, natural_loop, value)?;
+        let (_, _, taken) = active_header_comparison(func, natural_loop, value)?;
+        if !natural_loop.blocks.contains(&access_block) || !dom.dominates(taken, access_block) {
+            return None;
+        }
+        let initial = i64::from(const_i32(func, induction.initial)?);
+        let trip_count = i64::from(analyze_const_i32_trip_count(func, natural_loop, induction)?);
+        if trip_count == 0 {
+            return None;
+        }
+        let last = i64::from(induction.step)
+            .checked_mul(trip_count - 1)?
+            .checked_add(initial)?;
+        Some((initial.min(last), initial.max(last)))
+    })
+}
+
+fn affine_delta(func: &Function, value: ValueId, base: ValueId) -> Option<i32> {
+    if value == base {
+        return Some(0);
+    }
+    match defining_inst(func, value)? {
+        InstKind::Binary {
+            op: BinaryOp::Iadd,
+            lhs,
+            rhs,
+        } if *lhs == base => const_i32(func, *rhs),
+        InstKind::Binary {
+            op: BinaryOp::Iadd,
+            lhs,
+            rhs,
+        } if *rhs == base => const_i32(func, *lhs),
+        InstKind::Binary {
+            op: BinaryOp::Isub,
+            lhs,
+            rhs,
+        } if *lhs == base => const_i32(func, *rhs)?.checked_neg(),
+        _ => None,
+    }
+}
+
+fn active_header_comparison(
+    func: &Function,
+    natural_loop: &NaturalLoop,
+    induction: ValueId,
+) -> Option<(CmpOp, ValueId, BlockId)> {
+    let Terminator::Branch {
+        cond,
+        then_target,
+        else_target,
+    } = func.blocks[natural_loop.header.0].terminator.as_ref()?
+    else {
+        return None;
+    };
+    let then_inside = natural_loop.blocks.contains(then_target);
+    let else_inside = natural_loop.blocks.contains(else_target);
+    if then_inside == else_inside {
+        return None;
+    }
+    let InstKind::Icmp { op, lhs, rhs } = defining_inst(func, *cond)? else {
+        return None;
+    };
+    let mut normalized = *op;
+    let bound = if *lhs == induction {
+        *rhs
+    } else if *rhs == induction {
+        normalized = reverse_cmp(normalized);
+        *lhs
+    } else {
+        return None;
+    };
+    if !then_inside {
+        normalized = negate_cmp(normalized);
+    }
+    Some((
+        normalized,
+        bound,
+        if then_inside {
+            *then_target
+        } else {
+            *else_target
+        },
+    ))
+}
+
+fn reverse_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
+    }
+}
+
+fn negate_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Ne,
+        CmpOp::Ne => CmpOp::Eq,
+        CmpOp::Lt => CmpOp::Ge,
+        CmpOp::Le => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::Le,
+        CmpOp::Ge => CmpOp::Lt,
+    }
+}
+
+fn defining_inst(func: &Function, value: ValueId) -> Option<&InstKind> {
+    let ValueKind::Inst(block, inst_idx) = func.values.get(value.0)?.kind else {
+        return None;
+    };
+    let inst = func.blocks.get(block.0)?.insts.get(inst_idx)?;
+    (inst.result == Some(value)).then_some(&inst.kind)
+}
+
+fn const_i32(func: &Function, value: ValueId) -> Option<i32> {
+    match func.values.get(value.0)? {
+        crate::ir::Value {
+            ty: Type::I32,
+            kind: ValueKind::Const(Const::Int(value)),
+            ..
+        } => Some(*value),
+        crate::ir::Value {
+            ty: Type::I32,
+            kind: ValueKind::Const(Const::Zero(Type::I32)),
+            ..
+        } => Some(0),
+        _ => None,
+    }
+}
+
+fn is_loop_invariant(func: &Function, natural_loop: &NaturalLoop, value: ValueId) -> bool {
+    match &func.values.get(value.0).map(|value| &value.kind) {
+        Some(ValueKind::Param | ValueKind::Const(_) | ValueKind::Global(_)) => true,
+        Some(ValueKind::Inst(block, _)) => !natural_loop.blocks.contains(block),
+        None => false,
+    }
+}
+
+fn value_available_at(func: &Function, dom: &Dominators, value: ValueId, block: BlockId) -> bool {
+    match func.values.get(value.0).map(|value| &value.kind) {
+        Some(ValueKind::Param | ValueKind::Const(_) | ValueKind::Global(_)) => true,
+        Some(ValueKind::Inst(def_block, _)) => {
+            *def_block == block || dom.dominates(*def_block, block)
+        }
+        None => false,
+    }
+}
+
+fn promote_candidate(func: &mut Function, candidate: Candidate) {
+    let slot = func
+        .append_inst(
+            candidate.preheader,
+            InstKind::Alloca {
+                ty: candidate.value_ty.clone(),
+            },
+            Some(Type::Ptr(Box::new(candidate.value_ty.clone()))),
+        )
+        .expect("a promoted loop element needs a scalar slot");
+    let guard = func
+        .append_inst(
+            candidate.preheader,
+            InstKind::Icmp {
+                op: candidate.guard_op,
+                lhs: candidate.initial,
+                rhs: candidate.guard_bound,
+            },
+            Some(Type::I1),
+        )
+        .expect("a guarded loop promotion needs a first-iteration test");
+
+    let initialize = func.add_block("loop.memory.initialize");
+    let initial = func
+        .append_inst(
+            initialize,
+            InstKind::Load {
+                ptr: candidate.pointer,
+            },
+            Some(candidate.value_ty.clone()),
+        )
+        .expect("a promoted loop element needs an initial value");
+    func.append_inst(
+        initialize,
+        InstKind::Store {
+            ptr: slot,
+            value: initial,
+        },
+        None,
+    );
+    func.set_terminator(initialize, Terminator::Jump(candidate.header));
+
+    func.blocks[candidate.preheader.0].terminator = Some(Terminator::Branch {
+        cond: guard,
+        then_target: initialize,
+        else_target: candidate.exit,
+    });
+    for inst in &mut func.blocks[candidate.header.0].insts {
+        let InstKind::Phi { incomings } = &mut inst.kind else {
+            continue;
+        };
+        for (predecessor, _) in incomings {
+            if *predecessor == candidate.preheader {
+                *predecessor = initialize;
+            }
+        }
+    }
+
+    for block in &candidate.loop_blocks {
+        for inst_idx in 0..func.blocks[block.0].insts.len() {
+            let replacement = match func.blocks[block.0].insts[inst_idx].kind {
+                InstKind::Load { ptr }
+                    if access_path(func, ptr).as_ref() == Some(&candidate.path) =>
+                {
+                    Some(InstKind::Load { ptr: slot })
+                }
+                InstKind::Store { ptr, value }
+                    if access_path(func, ptr).as_ref() == Some(&candidate.path) =>
+                {
+                    Some(InstKind::Store { ptr: slot, value })
+                }
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                func.blocks[block.0].insts[inst_idx].kind = replacement;
+            }
+        }
+    }
+
+    let flush = func.add_block("loop.memory.flush");
+    let final_value = func
+        .append_inst(
+            flush,
+            InstKind::Load { ptr: slot },
+            Some(candidate.value_ty),
+        )
+        .expect("a promoted loop element needs a final value");
+    func.append_inst(
+        flush,
+        InstKind::Store {
+            ptr: candidate.pointer,
+            value: final_value,
+        },
+        None,
+    );
+    func.set_terminator(flush, Terminator::Jump(candidate.exit));
+
+    redirect_edge(func, candidate.exit_from, candidate.exit, flush);
+    for inst in &mut func.blocks[candidate.exit.0].insts {
+        let InstKind::Phi { incomings } = &mut inst.kind else {
+            continue;
+        };
+        for (predecessor, _) in incomings {
+            if *predecessor == candidate.exit_from {
+                *predecessor = flush;
+            }
+        }
+    }
+
+    if let Err(errors) = func.verify() {
+        panic!(
+            "loop memory promotion produced invalid IR in {}: {:?}",
+            func.name, errors
+        );
+    }
+}
+
+fn redirect_edge(func: &mut Function, from: BlockId, old: BlockId, new: BlockId) {
+    let terminator = func.blocks[from.0]
+        .terminator
+        .as_mut()
+        .expect("a loop exit edge needs a terminator");
+    match terminator {
+        Terminator::Jump(target) => {
+            debug_assert_eq!(*target, old);
+            *target = new;
+        }
+        Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        } => {
+            if *then_target == old {
+                *then_target = new;
+            }
+            if *else_target == old {
+                *else_target = new;
+            }
+        }
+        Terminator::Return(_) => unreachable!("a return cannot be a loop exit edge"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promotes_a_guarded_two_dimensional_element_with_proven_distinct_indices() {
+        let mut module = Module::new();
+        let mut func = Function::new("promote_matrix_element", Type::I32);
+        let matrix_ty = Type::Array {
+            elem: Box::new(Type::Array {
+                elem: Box::new(Type::I32),
+                len: 8,
+            }),
+            len: 8,
+        };
+        let row_ptr_ty = Type::Ptr(Box::new(Type::Array {
+            elem: Box::new(Type::I32),
+            len: 8,
+        }));
+        let elem_ptr_ty = Type::Ptr(Box::new(Type::I32));
+        let matrix = func.add_global_ref("matrix", Type::Ptr(Box::new(matrix_ty)));
+        let zero = func.add_const(Const::Int(0));
+        let one = func.add_const(Const::Int(1));
+        let three = func.add_const(Const::Int(3));
+        let four = func.add_const(Const::Int(4));
+
+        let outer_header = func.add_block("outer.header");
+        let inner_preheader = func.add_block("inner.preheader");
+        let inner_header = func.add_block("inner.header");
+        let inner_body = func.add_block("inner.body");
+        let inner_exit = func.add_block("inner.exit");
+        let outer_latch = func.add_block("outer.latch");
+        let exit = func.add_block("exit");
+        func.set_terminator(func.entry, Terminator::Jump(outer_header));
+
+        let outer_index = func
+            .append_inst(
+                outer_header,
+                InstKind::Phi {
+                    incomings: vec![(func.entry, zero)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let outer_condition = func
+            .append_inst(
+                outer_header,
+                InstKind::Icmp {
+                    op: CmpOp::Lt,
+                    lhs: outer_index,
+                    rhs: three,
+                },
+                Some(Type::I1),
+            )
+            .unwrap();
+        func.set_terminator(
+            outer_header,
+            Terminator::Branch {
+                cond: outer_condition,
+                then_target: inner_preheader,
+                else_target: exit,
+            },
+        );
+
+        let target_row = func
+            .append_inst(
+                inner_preheader,
+                InstKind::Gep {
+                    base: matrix,
+                    indices: vec![outer_index],
+                },
+                Some(row_ptr_ty.clone()),
+            )
+            .unwrap();
+        let target = func
+            .append_inst(
+                inner_preheader,
+                InstKind::Gep {
+                    base: target_row,
+                    indices: vec![four],
+                },
+                Some(elem_ptr_ty.clone()),
+            )
+            .unwrap();
+        let inner_initial = func
+            .append_inst(
+                inner_preheader,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: outer_index,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(inner_preheader, Terminator::Jump(inner_header));
+
+        let inner_index = func
+            .append_inst(
+                inner_header,
+                InstKind::Phi {
+                    incomings: vec![(inner_preheader, inner_initial)],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let inner_condition = func
+            .append_inst(
+                inner_header,
+                InstKind::Icmp {
+                    op: CmpOp::Lt,
+                    lhs: inner_index,
+                    rhs: four,
+                },
+                Some(Type::I1),
+            )
+            .unwrap();
+        func.set_terminator(
+            inner_header,
+            Terminator::Branch {
+                cond: inner_condition,
+                then_target: inner_body,
+                else_target: inner_exit,
+            },
+        );
+
+        let current = func
+            .append_inst(inner_body, InstKind::Load { ptr: target }, Some(Type::I32))
+            .unwrap();
+        let same_row_element = func
+            .append_inst(
+                inner_body,
+                InstKind::Gep {
+                    base: target_row,
+                    indices: vec![inner_index],
+                },
+                Some(elem_ptr_ty.clone()),
+            )
+            .unwrap();
+        let lhs = func
+            .append_inst(
+                inner_body,
+                InstKind::Load {
+                    ptr: same_row_element,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let inner_next = func
+            .append_inst(
+                inner_body,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: inner_index,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let next_row = func
+            .append_inst(
+                inner_body,
+                InstKind::Gep {
+                    base: matrix,
+                    indices: vec![inner_next],
+                },
+                Some(row_ptr_ty),
+            )
+            .unwrap();
+        let next_row_element = func
+            .append_inst(
+                inner_body,
+                InstKind::Gep {
+                    base: next_row,
+                    indices: vec![four],
+                },
+                Some(elem_ptr_ty),
+            )
+            .unwrap();
+        let rhs = func
+            .append_inst(
+                inner_body,
+                InstKind::Load {
+                    ptr: next_row_element,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let pair = func
+            .append_inst(
+                inner_body,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs,
+                    rhs,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        let updated = func
+            .append_inst(
+                inner_body,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: current,
+                    rhs: pair,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.append_inst(
+            inner_body,
+            InstKind::Store {
+                ptr: target,
+                value: updated,
+            },
+            None,
+        );
+        func.set_terminator(inner_body, Terminator::Jump(inner_header));
+        let InstKind::Phi { incomings } = &mut func.blocks[inner_header.0].insts[0].kind else {
+            panic!();
+        };
+        incomings.push((inner_body, inner_next));
+
+        func.set_terminator(inner_exit, Terminator::Jump(outer_latch));
+        let outer_next = func
+            .append_inst(
+                outer_latch,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: outer_index,
+                    rhs: one,
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        func.set_terminator(outer_latch, Terminator::Jump(outer_header));
+        let InstKind::Phi { incomings } = &mut func.blocks[outer_header.0].insts[0].kind else {
+            panic!();
+        };
+        incomings.push((outer_latch, outer_next));
+        func.set_terminator(exit, Terminator::Return(Some(zero)));
+        assert!(func.verify().is_ok());
+        module.funcs.push(func);
+
+        LoopMemoryPromotionPass::new().run(&mut module);
+
+        let func = &module.funcs[0];
+        assert!(func.verify().is_ok());
+        assert!(func
+            .blocks
+            .iter()
+            .any(|block| block.name == "loop.memory.initialize"));
+        assert!(func
+            .blocks
+            .iter()
+            .any(|block| block.name == "loop.memory.flush"));
+        assert!(func.blocks[inner_body.0].insts.iter().all(|inst| {
+            let pointer = match inst.kind {
+                InstKind::Load { ptr } | InstKind::Store { ptr, .. } => ptr,
+                _ => return true,
+            };
+            access_path(func, pointer).as_ref() != access_path(func, target).as_ref()
+        }));
+    }
+}

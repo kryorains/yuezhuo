@@ -127,6 +127,7 @@ fn main() {
         enable_loop_call_memoize: costs.enable_loop_call_memoize(),
         enable_loop_invariant_call_memoize: costs.enable_loop_invariant_call_memoize(),
         enable_regional_global_scalar_promotion: costs.enable_regional_global_scalar_promotion(),
+        enable_full_domain_bitwise_digit: costs.enable_full_domain_bitwise_digit(),
         enable_write_only_alloca_cleanup_before_inline: costs
             .cleanup_write_only_allocas_before_inline(),
     };

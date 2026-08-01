@@ -26,7 +26,8 @@ const MAX_CONDITIONAL_REGISTER_CANDIDATES: usize = 64;
 const MAX_CONDITIONAL_CODE_GROWTH: usize = 96;
 const MAX_CONDITIONAL_GROWTH_MULTIPLIER: usize = 4;
 const MAX_CONDITIONAL_PEAK_LIVE_VALUES: usize = 20;
-const CONDITIONAL_ADDED_BLOCKS: usize = 10;
+const MAX_CONDITIONAL_FACTOR_FOUR_POINTER_VALUES: usize = 20;
+const MAX_CONDITIONAL_FACTOR_FOUR_PEAK_LIVE_VALUES: usize = 32;
 const MAX_FUNCTION_BLOCKS: usize = 1024;
 const MAX_FUNCTION_VALUES: usize = 8192;
 const MAX_MEMORY_GEP_CHAIN_DEPTH: usize = 64;
@@ -39,7 +40,7 @@ const MAX_FUNCTION_INSTRUCTIONS: usize = 65_536;
 ///
 /// The established path accepts a canonical two-level loop whose inner loop is
 /// a single pure reduction block and selects two or four lanes. RISC targets
-/// may additionally select a conservative two-lane conditional reduction whose
+/// may additionally select a conservative conditional reduction whose
 /// original diamond and branch-only work are cloned per lane. In both cases the
 /// only outer-iteration side effect is one store and the complete original loop
 /// handles every dynamic tail. Memory independence is proved from global-object
@@ -125,11 +126,13 @@ fn jam_one_nest_with_factor(func: &mut Function, max_factor: usize) {
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
     let loops = LoopInfo::new(&cfg, &dom).loops().to_vec();
-    // Conditional jamming is intentionally tied to the RISC profitability
-    // entry (`max_factor == 4`). Other targets retain their previous behavior.
+    // Conditional jamming is enabled only by target cost profiles that accept
+    // the wider factor-four pressure budget. Other targets retain factor two.
     if max_factor >= 4 {
-        if let Some(candidate) = find_conditional_candidate(func, &loops, &dom) {
-            apply_conditional_candidate(func, &candidate);
+        if let Some((candidate, factor)) =
+            find_conditional_candidate(func, &loops, &dom, max_factor)
+        {
+            apply_conditional_candidate(func, &candidate, factor);
             verify_jammed_function(func);
             return;
         }
@@ -383,7 +386,8 @@ fn find_conditional_candidate(
     func: &Function,
     loops: &[NaturalLoop],
     dom: &Dominators,
-) -> Option<ConditionalJamCandidate> {
+    max_factor: usize,
+) -> Option<(ConditionalJamCandidate, usize)> {
     let mut inner_loops = loops.iter().collect::<Vec<_>>();
     inner_loops.sort_by_key(|natural_loop| natural_loop.blocks.len());
     for inner in inner_loops {
@@ -642,8 +646,9 @@ fn find_conditional_candidate(
             accumulator_next,
             store_ptr: *store_ptr,
         };
-        if conditional_factor_two_is_profitable(func, &candidate) {
-            return Some(candidate);
+        let factor = select_conditional_jam_factor(func, &candidate, outer_initial, max_factor)?;
+        if conditional_factor_is_profitable(func, &candidate, factor) {
+            return Some((candidate, factor));
         }
     }
     None
@@ -971,25 +976,75 @@ fn estimate_jam_cost(func: &Function, candidate: &JamCandidate, factor: usize) -
     })
 }
 
-fn conditional_factor_two_is_profitable(
+fn select_conditional_jam_factor(
     func: &Function,
     candidate: &ConditionalJamCandidate,
+    outer_initial: i32,
+    max_factor: usize,
+) -> Option<usize> {
+    let aligned = outer_initial & 3 == 0;
+    let independent = proves_lane_independence_in_blocks(
+        func,
+        candidate.store_ptr,
+        candidate.accumulator,
+        candidate.outer_induction.phi,
+        &[candidate.condition, candidate.update],
+        4,
+    );
+    let profitable = conditional_factor_is_profitable(func, candidate, 4);
+    if max_factor >= 4 && aligned && independent && profitable {
+        Some(4)
+    } else {
+        Some(2)
+    }
+}
+
+fn conditional_factor_is_profitable(
+    func: &Function,
+    candidate: &ConditionalJamCandidate,
+    factor: usize,
 ) -> bool {
-    let Some(cost) = estimate_conditional_jam_cost(func, candidate) else {
+    let Some(cost) = estimate_conditional_jam_cost(func, candidate, factor) else {
         return false;
     };
-    let Some(relative_growth_budget) = cost
-        .original_region
-        .checked_mul(MAX_CONDITIONAL_GROWTH_MULTIPLIER)
-    else {
+    let added_blocks = factor.saturating_mul(3).saturating_add(4);
+    let (
+        max_pointer_values,
+        max_mapped_values,
+        max_register_candidates,
+        max_peak_live_values,
+        max_code_growth,
+    ) = if factor == 4 {
+        (
+            MAX_CONDITIONAL_FACTOR_FOUR_POINTER_VALUES,
+            MAX_FACTOR_FOUR_MAPPED_VALUES,
+            MAX_FACTOR_FOUR_REGISTER_CANDIDATES,
+            MAX_CONDITIONAL_FACTOR_FOUR_PEAK_LIVE_VALUES,
+            MAX_FACTOR_FOUR_CODE_GROWTH,
+        )
+    } else {
+        (
+            MAX_CONDITIONAL_POINTER_VALUES,
+            MAX_CONDITIONAL_MAPPED_VALUES,
+            MAX_CONDITIONAL_REGISTER_CANDIDATES,
+            MAX_CONDITIONAL_PEAK_LIVE_VALUES,
+            MAX_CONDITIONAL_CODE_GROWTH,
+        )
+    };
+    let Some(relative_growth_budget) = cost.original_region.checked_mul(if factor == 4 {
+        MAX_FACTOR_FOUR_GROWTH_MULTIPLIER
+    } else {
+        MAX_CONDITIONAL_GROWTH_MULTIPLIER
+    }) else {
         return false;
     };
-    factor_is_within_hard_budgets(func, &cost, 2, CONDITIONAL_ADDED_BLOCKS)
-        && cost.active_accumulators == 2
-        && cost.pointer_values <= MAX_CONDITIONAL_POINTER_VALUES
-        && cost.mapped_values <= MAX_CONDITIONAL_MAPPED_VALUES
-        && cost.register_candidates <= MAX_CONDITIONAL_REGISTER_CANDIDATES
-        && cost.peak_live_values <= MAX_CONDITIONAL_PEAK_LIVE_VALUES
+    factor_is_within_hard_budgets(func, &cost, factor, added_blocks)
+        && cost.active_accumulators == factor
+        && (factor == 2 || cost.shared_load_streams > 0)
+        && cost.pointer_values <= max_pointer_values
+        && cost.mapped_values <= max_mapped_values
+        && cost.register_candidates <= max_register_candidates
+        && cost.peak_live_values <= max_peak_live_values
         && cse_projection_within_budget(func, &cost)
         && func
             .values
@@ -1001,19 +1056,22 @@ fn conditional_factor_two_is_profitable(
                     && func
                         .blocks
                         .len()
-                        .checked_add(CONDITIONAL_ADDED_BLOCKS)
+                        .checked_add(added_blocks)
                         .and_then(|blocks| blocks.checked_mul(values))
                         .is_some_and(|work| work <= 262_144)
             })
-        && cost.code_growth <= MAX_CONDITIONAL_CODE_GROWTH
+        && cost.code_growth <= max_code_growth
         && cost.code_growth <= relative_growth_budget
 }
 
 fn estimate_conditional_jam_cost(
     func: &Function,
     candidate: &ConditionalJamCandidate,
+    factor: usize,
 ) -> Option<JamCost> {
-    let factor = 2usize;
+    if !matches!(factor, 2 | 4) {
+        return None;
+    }
     let candidate_blocks = HashSet::from([
         candidate.outer_header,
         candidate.inner_preheader,
@@ -1128,8 +1186,9 @@ fn estimate_conditional_jam_cost(
     let original_region = candidate_blocks.iter().try_fold(0usize, |total, block| {
         total.checked_add(executable_instruction_count(func, *block))
     })?;
-    projected_cse_keys = projected_cse_keys.checked_add(4)?;
-    projected_cse_operands = projected_cse_operands.checked_add(12)?;
+    let generated_keys = factor.checked_add(2)?;
+    projected_cse_keys = projected_cse_keys.checked_add(generated_keys)?;
+    projected_cse_operands = projected_cse_operands.checked_add(generated_keys.checked_mul(3)?)?;
     let pointer_values = factor.checked_add(1)?.checked_add(load_pointer_values)?;
 
     Some(JamCost {
@@ -1145,9 +1204,11 @@ fn estimate_conditional_jam_cost(
             // remapped pointer; the last lane also retains inner.next.
             .checked_add(condition_loads.checked_mul(2)?)?
             .checked_add(1)?,
-        // Eleven generated result values cover both fast headers, selectors,
-        // the shared inner next value, and the fast outer next value.
-        register_candidates: factor.checked_mul(cloned_results)?.checked_add(11)?,
+        // `3 * factor + 5` covers both fast headers, lane selectors, the
+        // shared inner next value, and the fast outer next value.
+        register_candidates: factor
+            .checked_mul(cloned_results)?
+            .checked_add(factor.checked_mul(3)?.checked_add(5)?)?,
         projected_cse_keys,
         projected_cse_operands,
         peak_live_values: factor
@@ -1158,9 +1219,11 @@ fn estimate_conditional_jam_cost(
             .checked_add(factor.checked_mul(condition_cross_edge_results.len())?)?
             // Keep one conservative branch-condition temporary per lane.
             .checked_add(factor)?,
-        // Generated headers/selectors/stores/next values contribute thirteen
-        // instructions in addition to the twice-cloned source blocks.
-        code_growth: factor.checked_mul(cloned_instructions)?.checked_add(13)?,
+        // Generated headers/selectors/stores/next values contribute
+        // `4 * factor + 5` instructions beyond cloned source blocks.
+        code_growth: factor
+            .checked_mul(cloned_instructions)?
+            .checked_add(factor.checked_mul(4)?.checked_add(5)?)?,
         original_region,
     })
 }
@@ -1343,12 +1406,16 @@ fn apply_candidate(func: &mut Function, candidate: &JamCandidate, factor: usize)
     func.mark_reduction_jammed();
 }
 
-fn apply_conditional_candidate(func: &mut Function, candidate: &ConditionalJamCandidate) {
-    const FACTOR: usize = 2;
+fn apply_conditional_candidate(
+    func: &mut Function,
+    candidate: &ConditionalJamCandidate,
+    factor: usize,
+) {
+    assert!(matches!(factor, 2 | 4));
     let fast_header = func.add_block("conditional.reduction.jam.header");
     let fast_setup = func.add_block("conditional.reduction.jam.setup");
     let fast_inner_header = func.add_block("conditional.reduction.jam.inner");
-    let lane_blocks = (0..FACTOR)
+    let lane_blocks = (0..factor)
         .map(|lane| {
             (
                 func.add_block(format!("conditional.reduction.jam.condition.{lane}")),
@@ -1373,24 +1440,33 @@ fn apply_conditional_candidate(func: &mut Function, candidate: &ConditionalJamCa
         )
         .unwrap();
     let one = get_or_add_i32_const(func, 1);
-    let two = get_or_add_i32_const(func, 2);
-    let lane_one_index = func
-        .append_inst(
-            fast_header,
-            InstKind::Binary {
-                op: BinaryOp::Iadd,
-                lhs: fast_outer,
-                rhs: one,
-            },
-            Some(Type::I32),
-        )
-        .unwrap();
+    let factor_value = get_or_add_i32_const(func, factor as i32);
+    let mut lane_indices = vec![fast_outer];
+    for lane in 1..factor {
+        let offset = if lane == 1 {
+            one
+        } else {
+            get_or_add_i32_const(func, lane as i32)
+        };
+        lane_indices.push(
+            func.append_inst(
+                fast_header,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: fast_outer,
+                    rhs: offset,
+                },
+                Some(Type::I32),
+            )
+            .unwrap(),
+        );
+    }
     let group_condition = func
         .append_inst(
             fast_header,
             InstKind::Icmp {
                 op: CmpOp::Lt,
-                lhs: lane_one_index,
+                lhs: *lane_indices.last().unwrap(),
                 rhs: candidate.outer_bound,
             },
             Some(Type::I1),
@@ -1405,7 +1481,7 @@ fn apply_conditional_candidate(func: &mut Function, candidate: &ConditionalJamCa
         },
     );
 
-    let mut lane_values = [fast_outer, lane_one_index]
+    let mut lane_values = lane_indices
         .into_iter()
         .map(|index| HashMap::from([(candidate.outer_induction.phi, index)]))
         .collect::<Vec<_>>();
@@ -1427,7 +1503,7 @@ fn apply_conditional_candidate(func: &mut Function, candidate: &ConditionalJamCa
             Some(Type::I32),
         )
         .unwrap();
-    let mut fast_accumulators = Vec::with_capacity(FACTOR);
+    let mut fast_accumulators = Vec::with_capacity(factor);
     for values in &lane_values {
         let initial = map_value(candidate.accumulator_initial, values);
         let accumulator = func
@@ -1473,7 +1549,7 @@ fn apply_conditional_candidate(func: &mut Function, candidate: &ConditionalJamCa
         .unwrap()
         .clone();
     let mut fast_inner_next = None;
-    for lane in 0..FACTOR {
+    for lane in 0..factor {
         let (condition_block, update_block, merge_block) = lane_blocks[lane];
         let shared_condition_values = (lane > 0)
             .then(|| conditional_shared_load_values(func, candidate.condition, &lane_values[0]));
@@ -1534,7 +1610,7 @@ fn apply_conditional_candidate(func: &mut Function, candidate: &ConditionalJamCa
             .unwrap();
         values.insert(candidate.accumulator_next, selected);
 
-        if lane + 1 == FACTOR {
+        if lane + 1 == factor {
             let kind = remap_pure_kind(&inner_next_kind, values)
                 .expect("validated conditional induction update must be pure");
             let next = func
@@ -1543,7 +1619,7 @@ fn apply_conditional_candidate(func: &mut Function, candidate: &ConditionalJamCa
             values.insert(candidate.inner_induction.next, next);
             fast_inner_next = Some(next);
         }
-        let next_target = if lane + 1 == FACTOR {
+        let next_target = if lane + 1 == factor {
             fast_inner_header
         } else {
             lane_blocks[lane + 1].0
@@ -1582,7 +1658,7 @@ fn apply_conditional_candidate(func: &mut Function, candidate: &ConditionalJamCa
             InstKind::Binary {
                 op: BinaryOp::Iadd,
                 lhs: fast_outer,
-                rhs: two,
+                rhs: factor_value,
             },
             Some(Type::I32),
         )

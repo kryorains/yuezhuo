@@ -7,6 +7,25 @@ use crate::ir::{
     ValueKind,
 };
 
+#[derive(Clone, Copy)]
+struct EvenHalvingPlan {
+    header: BlockId,
+    body: BlockId,
+    state: ValueId,
+    depth: ValueId,
+    division: ValueId,
+    add: ValueId,
+}
+
+fn phi_incoming(func: &crate::ir::Function, phi: ValueId, pred: BlockId) -> Option<ValueId> {
+    let InstKind::Phi { incomings } = defining_inst_kind(func, phi)? else {
+        return None;
+    };
+    incomings
+        .iter()
+        .find_map(|(incoming_pred, value)| (*incoming_pred == pred).then_some(*value))
+}
+
 impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
     pub(super) fn emit_inst(&mut self, inst: &Inst) {
         match &inst.kind {
@@ -52,6 +71,23 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Binary { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
+                if *op == BinaryOp::Idiv {
+                    if let Some(plan) = self.even_halving_plan(result) {
+                        self.emit_even_halving_run(plan);
+                        return;
+                    }
+                }
+                if *op == BinaryOp::Iadd && self.is_compressed_halving_add(result) {
+                    return;
+                }
+                if matches!(*op, BinaryOp::Iashr | BinaryOp::Ixor)
+                    && self.is_negative_sanitize_intermediate(result)
+                {
+                    return;
+                }
+                if *op == BinaryOp::Iand && self.emit_negative_sanitize(result) {
+                    return;
+                }
                 if matches!(*op, BinaryOp::And | BinaryOp::Or)
                     && self.emit_fused_boolean_compare(result, *op, *lhs, *rhs)
                 {
@@ -194,6 +230,9 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 self.body.push_str(&format!("  b {}\n", self.return_label));
             }
             Terminator::Jump(target) => {
+                if self.emit_known_even_backedge(block_idx, *target) {
+                    return;
+                }
                 self.emit_phi_copies(block_idx, target.0);
                 if next_block != Some(target.0) {
                     self.body
@@ -833,6 +872,11 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             BinaryOp::Idiv | BinaryOp::Imod => {
                 if let Some(divisor) = const_i32(self.func, rhs) {
+                    if op == BinaryOp::Imod
+                        && self.emit_guarded_additive_remainder(result, lhs, divisor, &destination)
+                    {
+                        return true;
+                    }
                     self.emit_signed_divmod_const_into(
                         lhs,
                         divisor,
@@ -845,6 +889,406 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             _ => {}
         }
         false
+    }
+
+    /// Selects `x & ~((x >> 31))` as AArch64's shifted-register BIC. This is
+    /// exactly `x` for non-negative i32 values and zero for negative values.
+    /// Both intermediate values must be single-use so their standalone ASR and
+    /// XOR instructions can be suppressed safely.
+    fn negative_sanitize_operands(
+        &self,
+        sanitized: ValueId,
+    ) -> Option<(ValueId, ValueId, ValueId)> {
+        let InstKind::Binary {
+            op: BinaryOp::Iand,
+            lhs,
+            rhs,
+        } = defining_inst_kind(self.func, sanitized)?
+        else {
+            return None;
+        };
+        for (source, mask) in [(*lhs, *rhs), (*rhs, *lhs)] {
+            let InstKind::Binary {
+                op: BinaryOp::Ixor,
+                lhs: xor_lhs,
+                rhs: xor_rhs,
+            } = defining_inst_kind(self.func, mask)?
+            else {
+                continue;
+            };
+            let sign = if const_i32(self.func, *xor_rhs) == Some(-1) {
+                *xor_lhs
+            } else if const_i32(self.func, *xor_lhs) == Some(-1) {
+                *xor_rhs
+            } else {
+                continue;
+            };
+            let InstKind::Binary {
+                op: BinaryOp::Iashr,
+                lhs: shifted,
+                rhs: shift,
+            } = defining_inst_kind(self.func, sign)?
+            else {
+                continue;
+            };
+            if *shifted == source
+                && const_i32(self.func, *shift) == Some(31)
+                && self.value_use_counts[sign.0] == 1
+                && self.value_use_counts[mask.0] == 1
+            {
+                return Some((source, sign, mask));
+            }
+        }
+        None
+    }
+
+    fn is_negative_sanitize_intermediate(&self, value: ValueId) -> bool {
+        let ValueKind::Inst(block, inst_idx) = self.func.value(value).kind else {
+            return false;
+        };
+        self.func.blocks[block.0].insts
+            [inst_idx + 1..(inst_idx + 4).min(self.func.blocks[block.0].insts.len())]
+            .iter()
+            .filter_map(|inst| inst.result)
+            .any(|candidate| {
+                self.negative_sanitize_operands(candidate)
+                    .is_some_and(|(_, sign, mask)| value == sign || value == mask)
+            })
+    }
+
+    fn emit_negative_sanitize(&mut self, result: ValueId) -> bool {
+        let Some((source, _, _)) = self.negative_sanitize_operands(result) else {
+            return false;
+        };
+        let assigned_destination = self.assigned_w_reg(result);
+        let destination = assigned_destination.clone().unwrap_or_else(|| "w0".into());
+        let source = if let Some(source) = self.assigned_w_reg(source) {
+            source
+        } else {
+            self.load_value_into(source, "x1");
+            "w1".into()
+        };
+        self.body.push_str(&format!(
+            "  bic {destination}, {source}, {source}, asr #31\n"
+        ));
+        if assigned_destination.is_none() {
+            self.store_result(result);
+        }
+        true
+    }
+
+    fn even_halving_plan(&self, division: ValueId) -> Option<EvenHalvingPlan> {
+        let ValueKind::Inst(body, _) = self.func.value(division).kind else {
+            return None;
+        };
+        let InstKind::Binary {
+            op: BinaryOp::Idiv,
+            lhs: state,
+            rhs: divisor,
+        } = defining_inst_kind(self.func, division)?
+        else {
+            return None;
+        };
+        if const_i32(self.func, *divisor) != Some(2) {
+            return None;
+        }
+        let Terminator::Jump(header) = self.func.block(body).terminator.as_ref()? else {
+            return None;
+        };
+        let phis = self
+            .func
+            .block(*header)
+            .insts
+            .iter()
+            .filter_map(|inst| {
+                let result = inst.result?;
+                matches!(inst.kind, InstKind::Phi { .. }).then_some(result)
+            })
+            .collect::<Vec<_>>();
+        if phis.len() != 2
+            || phis.iter().any(|phi| self.func.value(*phi).ty != Type::I32)
+            || !phis.contains(state)
+        {
+            return None;
+        }
+        let depth = phis.iter().copied().find(|phi| phi != state)?;
+        if phi_incoming(self.func, *state, body) != Some(division) {
+            return None;
+        }
+        let add = self.func.block(body).insts.iter().find_map(|inst| {
+            let (
+                Some(result),
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs,
+                    rhs,
+                },
+            ) = (inst.result, &inst.kind)
+            else {
+                return None;
+            };
+            ((*lhs == depth && const_i32(self.func, *rhs) == Some(1))
+                || (*rhs == depth && const_i32(self.func, *lhs) == Some(1)))
+            .then_some(result)
+        })?;
+        if phi_incoming(self.func, depth, body) != Some(add)
+            || self.func.block(body).insts.iter().any(|inst| {
+                !matches!(inst.kind, InstKind::Nop)
+                    && !matches!(inst.result, Some(result) if result == division || result == add)
+            })
+        {
+            return None;
+        }
+
+        let header_active = self
+            .func
+            .block(*header)
+            .insts
+            .iter()
+            .filter(|inst| !matches!(inst.kind, InstKind::Nop | InstKind::Phi { .. }))
+            .collect::<Vec<_>>();
+        let [compare] = header_active.as_slice() else {
+            return None;
+        };
+        let (Some(condition), InstKind::Icmp { op, lhs, rhs }) = (compare.result, &compare.kind)
+        else {
+            return None;
+        };
+        if !matches!(op, CmpOp::Eq | CmpOp::Ne)
+            || !((*lhs == *state && const_i32(self.func, *rhs) == Some(1))
+                || (*rhs == *state && const_i32(self.func, *lhs) == Some(1)))
+            || !matches!(
+                self.func.block(*header).terminator,
+                Some(Terminator::Branch { cond, .. }) if cond == condition
+            )
+        {
+            return None;
+        }
+
+        if [*state, depth, division, add]
+            .into_iter()
+            .any(|value| self.assigned_w_reg(value).is_none())
+        {
+            return None;
+        }
+
+        Some(EvenHalvingPlan {
+            header: *header,
+            body,
+            state: *state,
+            depth,
+            division,
+            add,
+        })
+    }
+
+    fn is_compressed_halving_add(&self, add: ValueId) -> bool {
+        let ValueKind::Inst(block, _) = self.func.value(add).kind else {
+            return false;
+        };
+        self.func.block(block).insts.iter().any(|inst| {
+            inst.result
+                .and_then(|result| self.even_halving_plan(result))
+                .is_some_and(|plan| plan.add == add)
+        })
+    }
+
+    fn emit_even_halving_run(&mut self, plan: EvenHalvingPlan) {
+        let (Some(state), Some(depth), Some(division), Some(add)) = (
+            self.assigned_w_reg(plan.state),
+            self.assigned_w_reg(plan.depth),
+            self.assigned_w_reg(plan.division),
+            self.assigned_w_reg(plan.add),
+        ) else {
+            unreachable!("halving plan requires assigned loop registers");
+        };
+        let odd = self.parent.ctx.fresh_label("halving_odd");
+        let negative = self.parent.ctx.fresh_label("halving_negative");
+        let done = self.parent.ctx.fresh_label("halving_done");
+        self.body.push_str(&format!(
+            "  tbnz {state}, #0, {odd}\n  rbit w2, {state}\n  clz w2, w2\n  tbnz {state}, #31, {negative}\n  lsr {division}, {state}, w2\n  add {add}, {depth}, w2\n  b {done}\n{negative}:\n  asr {division}, {state}, w2\n  add {add}, {depth}, w2\n  b {done}\n{odd}:\n  add {division}, {state}, {state}, lsr #31\n  asr {division}, {division}, #1\n  add {add}, {depth}, #1\n{done}:\n"
+        ));
+    }
+
+    /// Folds an odd affine transition directly into the following pure
+    /// halving loop. For example, an odd `n` makes `3*n+1` even; entering the
+    /// header only to re-test `n != 1` and its low bit is redundant. The
+    /// matcher proves the odd edge, the affine result parity, the exact phi
+    /// inputs, and that the skipped header/guard/body contain no other work.
+    fn emit_known_even_backedge(&mut self, pred_idx: usize, header: BlockId) -> bool {
+        let pred = BlockId(pred_idx);
+        let plan = self
+            .func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find_map(|inst| {
+                let result = inst.result?;
+                self.even_halving_plan(result)
+                    .filter(|plan| plan.header == header && plan.body != pred)
+            });
+        let Some(plan) = plan else {
+            return false;
+        };
+        let (Some(state_incoming), Some(depth_incoming)) = (
+            phi_incoming(self.func, plan.state, pred),
+            phi_incoming(self.func, plan.depth, pred),
+        ) else {
+            return false;
+        };
+        if parity_given_odd(self.func, state_incoming, plan.state, 0) != Some(false) {
+            return false;
+        }
+
+        let header_condition =
+            self.func
+                .block(header)
+                .insts
+                .iter()
+                .find_map(|inst| match (inst.result, &inst.kind) {
+                    (Some(result), InstKind::Icmp { op, lhs, rhs })
+                        if matches!(op, CmpOp::Eq | CmpOp::Ne)
+                            && ((*lhs == plan.state && const_i32(self.func, *rhs) == Some(1))
+                                || (*rhs == plan.state
+                                    && const_i32(self.func, *lhs) == Some(1))) =>
+                    {
+                        Some((result, *op))
+                    }
+                    _ => None,
+                });
+        let Some((header_condition, header_op)) = header_condition else {
+            return false;
+        };
+        let Some(Terminator::Branch {
+            cond,
+            then_target,
+            else_target,
+        }) = self.func.block(header).terminator.as_ref()
+        else {
+            return false;
+        };
+        if *cond != header_condition {
+            return false;
+        }
+        let parity_block = if header_op == CmpOp::Ne {
+            *then_target
+        } else {
+            *else_target
+        };
+        let Some(Terminator::Branch {
+            cond: parity_condition,
+            then_target,
+            else_target,
+        }) = self.func.block(parity_block).terminator.as_ref()
+        else {
+            return false;
+        };
+        let Some((parity_op, parity_value, mask, masked)) =
+            self.direct_branch_bit_test(*parity_condition)
+        else {
+            return false;
+        };
+        if parity_value != plan.state
+            || mask != 1
+            || self.func.block(parity_block).insts.iter().any(|inst| {
+                !matches!(inst.kind, InstKind::Nop)
+                    && !matches!(inst.result, Some(result) if result == masked || result == *parity_condition)
+            })
+        {
+            return false;
+        }
+        let (even_target, odd_target) = if parity_op == CmpOp::Eq {
+            (*then_target, *else_target)
+        } else {
+            (*else_target, *then_target)
+        };
+        if even_target != plan.body || !unique_forward_path(self.func, odd_target, pred, 8) {
+            return false;
+        }
+
+        let (Some(state), Some(depth), Some(state_source), Some(depth_source)) = (
+            self.assigned_w_reg(plan.state),
+            self.assigned_w_reg(plan.depth),
+            self.assigned_w_reg(state_incoming),
+            self.assigned_w_reg(depth_incoming),
+        ) else {
+            return false;
+        };
+        if state == depth_source {
+            return false;
+        }
+
+        let negative = self.parent.ctx.fresh_label("known_even_negative");
+        self.body.push_str(&format!(
+            "  rbit w2, {state_source}\n  clz w2, w2\n  tbnz {state_source}, #31, {negative}\n  lsr {state}, {state_source}, w2\n  add {depth}, {depth_source}, w2\n  b {header}\n{negative}:\n  asr {state}, {state_source}, w2\n  add {depth}, {depth_source}, w2\n  b {header}\n",
+            header = self.block_label(header.0)
+        ));
+        true
+    }
+
+    fn emit_guarded_additive_remainder(
+        &mut self,
+        result: ValueId,
+        dividend: ValueId,
+        divisor: i32,
+        destination: &str,
+    ) -> bool {
+        let Some(twice_divisor) = divisor
+            .checked_mul(2)
+            .filter(|twice| divisor >= 1024 && *twice > divisor)
+        else {
+            return false;
+        };
+        if !self.is_additive_modular_recurrence(result, dividend) {
+            return false;
+        }
+
+        let source = if let Some(source) = self.assigned_w_reg(dividend) {
+            source
+        } else {
+            self.load_value(dividend);
+            "w0".to_string()
+        };
+        let identity = self.parent.ctx.fresh_label("mod_identity");
+        let slow = self.parent.ctx.fresh_label("mod_slow");
+        let done = self.parent.ctx.fresh_label("mod_done");
+        self.body
+            .push_str(&format!("  tbnz {source}, #31, {slow}\n"));
+        self.body.push_str(&mov_w_imm("w1", divisor));
+        self.body
+            .push_str(&format!("  cmp {source}, w1\n  b.lt {identity}\n"));
+        self.body.push_str(&mov_w_imm("w2", twice_divisor));
+        self.body.push_str(&format!(
+            "  cmp {source}, w2\n  b.ge {slow}\n  sub {destination}, {source}, w1\n  b {done}\n{identity}:\n"
+        ));
+        if destination != source {
+            self.body
+                .push_str(&format!("  mov {destination}, {source}\n"));
+        }
+        self.body.push_str(&format!("  b {done}\n{slow}:\n"));
+        self.emit_signed_divmod_const_into(dividend, divisor, true, destination);
+        self.body.push_str(&format!("{done}:\n"));
+        true
+    }
+
+    fn is_additive_modular_recurrence(&self, remainder: ValueId, dividend: ValueId) -> bool {
+        let Some(InstKind::Binary {
+            op: BinaryOp::Iadd,
+            lhs,
+            rhs,
+        }) = defining_inst_kind(self.func, dividend)
+        else {
+            return false;
+        };
+        self.func.blocks.iter().any(|block| {
+            block.insts.iter().any(|inst| {
+                let (Some(phi), InstKind::Phi { incomings }) = (inst.result, &inst.kind) else {
+                    return false;
+                };
+                (*lhs == phi || *rhs == phi)
+                    && incomings.iter().any(|(_, incoming)| *incoming == remainder)
+            })
+        })
     }
 
     fn emit_assigned_binary(
@@ -1450,6 +1894,73 @@ fn const_i32(func: &crate::ir::Function, value: ValueId) -> Option<i32> {
 
 fn pow2_shift(func: &crate::ir::Function, value: ValueId) -> Option<u32> {
     positive_pow2_shift(const_i32(func, value)?)
+}
+
+fn parity_given_odd(
+    func: &crate::ir::Function,
+    value: ValueId,
+    odd_value: ValueId,
+    depth: usize,
+) -> Option<bool> {
+    if depth > 8 {
+        return None;
+    }
+    if value == odd_value {
+        return Some(true);
+    }
+    if let Some(constant) = const_i32(func, value) {
+        return Some(constant & 1 != 0);
+    }
+    let InstKind::Binary { op, lhs, rhs } = defining_inst_kind(func, value)? else {
+        return None;
+    };
+    let lhs = parity_given_odd(func, *lhs, odd_value, depth + 1)?;
+    let rhs = parity_given_odd(func, *rhs, odd_value, depth + 1)?;
+    match op {
+        BinaryOp::Iadd | BinaryOp::Isub | BinaryOp::Ixor => Some(lhs ^ rhs),
+        BinaryOp::Imul | BinaryOp::Iand => Some(lhs & rhs),
+        BinaryOp::Ior => Some(lhs | rhs),
+        _ => None,
+    }
+}
+
+fn unique_forward_path(
+    func: &crate::ir::Function,
+    start: BlockId,
+    target: BlockId,
+    limit: usize,
+) -> bool {
+    let mut current = target;
+    for _ in 0..=limit {
+        if current == start {
+            return true;
+        }
+        let mut predecessors = func
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(block_idx, block)| match block.terminator.as_ref() {
+                Some(Terminator::Jump(successor)) if *successor == current => {
+                    Some(BlockId(block_idx))
+                }
+                Some(Terminator::Branch {
+                    then_target,
+                    else_target,
+                    ..
+                }) if *then_target == current || *else_target == current => {
+                    Some(BlockId(block_idx))
+                }
+                _ => None,
+            });
+        let Some(predecessor) = predecessors.next() else {
+            return false;
+        };
+        if predecessors.next().is_some() {
+            return false;
+        }
+        current = predecessor;
+    }
+    false
 }
 
 fn positive_pow2_shift(value: i32) -> Option<u32> {
