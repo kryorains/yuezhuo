@@ -6,6 +6,7 @@ use crate::ir::{
     BinaryOp, BlockId, CastOp, CmpOp, Const, Inst, InstKind, Terminator, Type, UnaryOp, ValueId,
     ValueKind,
 };
+use std::collections::HashSet;
 
 #[derive(Clone, Copy)]
 struct EvenHalvingPlan {
@@ -15,6 +16,36 @@ struct EvenHalvingPlan {
     depth: ValueId,
     division: ValueId,
     add: ValueId,
+    known_even_entry: bool,
+}
+
+#[derive(Clone, Copy)]
+struct BranchlessPhiPlan {
+    block: BlockId,
+    condition: ValueId,
+    compare: (CmpOp, ValueId, ValueId),
+    merge: BlockId,
+    old_value: ValueId,
+    merged_value: ValueId,
+    multiply_pointers: [ValueId; 2],
+    update_on_true: bool,
+}
+
+struct NonnegativeShiftPlan {
+    source: ValueId,
+    shift: ValueId,
+    intermediates: Vec<ValueId>,
+}
+
+#[derive(Clone, Copy)]
+struct PureBranchlessPhiPlan {
+    compare: (CmpOp, ValueId, ValueId),
+    update: BlockId,
+    merge: BlockId,
+    old_value: ValueId,
+    updated_value: ValueId,
+    merged_value: ValueId,
+    update_on_true: bool,
 }
 
 fn phi_incoming(func: &crate::ir::Function, phi: ValueId, pred: BlockId) -> Option<ValueId> {
@@ -71,6 +102,21 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             }
             InstKind::Binary { op, lhs, rhs } => {
                 let result = inst.result.unwrap();
+                if *op == BinaryOp::Iashr && self.emit_fused_nonnegative_adjusted_shift(result) {
+                    return;
+                }
+                if matches!(
+                    *op,
+                    BinaryOp::Iadd | BinaryOp::Isub | BinaryOp::Iand | BinaryOp::Ishl
+                ) && self.fused_nonnegative_shift_user(result)
+                {
+                    return;
+                }
+                if matches!(*op, BinaryOp::Ishl | BinaryOp::Imul)
+                    && self.fused_shifted_add_user(result)
+                {
+                    return;
+                }
                 if *op == BinaryOp::Idiv {
                     if let Some(plan) = self.even_halving_plan(result) {
                         self.emit_even_halving_run(plan);
@@ -253,6 +299,25 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                     return;
                 }
 
+                if self.emit_safe_branchless_phi_update(
+                    block_idx,
+                    *cond,
+                    *then_target,
+                    *else_target,
+                    next_block,
+                ) {
+                    return;
+                }
+                if self.emit_pure_branchless_phi_update(
+                    block_idx,
+                    *cond,
+                    *then_target,
+                    *else_target,
+                    next_block,
+                ) {
+                    return;
+                }
+
                 if !self.edge_has_phi_copy(block_idx, then_target.0)
                     && !self.edge_has_phi_copy(block_idx, else_target.0)
                 {
@@ -346,6 +411,74 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             return;
         }
 
+        if copies.iter().all(|(result, value)| {
+            self.func.value(*result).ty != Type::F32
+                && self.assigned_x_reg(*result).is_some()
+                && (self.assigned_x_reg(*value).is_some()
+                    || phi_copy_constant(self.func, *value).is_some())
+        }) {
+            let mut register_copies = copies
+                .iter()
+                .map(|(result, value)| {
+                    (
+                        self.assigned_x_reg(*result)
+                            .expect("checked phi destination register"),
+                        self.assigned_x_reg(*value),
+                        *value,
+                        matches!(self.func.value(*result).ty, Type::Ptr(_)),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            while !register_copies.is_empty() {
+                if let Some(ready) = register_copies.iter().position(|(destination, _, _, _)| {
+                    !register_copies
+                        .iter()
+                        .any(|(_, source, _, _)| *source == Some(*destination))
+                }) {
+                    let (destination, source, value, is_pointer) = register_copies.remove(ready);
+                    if let Some(source) = source {
+                        if is_pointer {
+                            self.body
+                                .push_str(&format!("  mov {}, {}\n", destination, source));
+                        } else {
+                            self.body.push_str(&format!(
+                                "  mov {}, {}\n",
+                                w_reg_name(destination),
+                                w_reg_name(source)
+                            ));
+                        }
+                    } else if is_pointer {
+                        self.body.push_str(&format!("  mov {}, xzr\n", destination));
+                    } else {
+                        self.body.push_str(&mov_w_imm(
+                            &w_reg_name(destination),
+                            phi_copy_constant(self.func, value)
+                                .expect("checked integer phi constant"),
+                        ));
+                    }
+                    continue;
+                }
+
+                // Every remaining destination is still needed as a source.
+                // Preserve one full physical register in the reserved x16
+                // scratch, then schedule the opened cycle without touching the
+                // stack.  Saving all 64 bits also covers a mixed i32/pointer
+                // register cycle; word consumers simply read w16.
+                let preserved = register_copies
+                    .iter()
+                    .find_map(|(destination, source, _, _)| source.map(|_| *destination))
+                    .expect("only register sources can form a phi-copy cycle");
+                self.body.push_str(&format!("  mov x16, {}\n", preserved));
+                for (_, source, _, _) in &mut register_copies {
+                    if *source == Some(preserved) {
+                        *source = Some("x16");
+                    }
+                }
+            }
+            return;
+        }
+
         for (_, value) in &copies {
             self.load_value(*value);
             self.push_x0();
@@ -355,6 +488,501 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             self.body.push_str("  mov x0, x1\n");
             self.store_result(*result);
         }
+    }
+
+    fn emit_safe_branchless_phi_update(
+        &mut self,
+        block_idx: usize,
+        cond: ValueId,
+        then_target: BlockId,
+        else_target: BlockId,
+        next_block: Option<usize>,
+    ) -> bool {
+        let Some(plans) = self.branchless_phi_plans(block_idx, cond, then_target, else_target)
+        else {
+            return false;
+        };
+
+        let all_multiply_pointers = plans
+            .iter()
+            .flat_map(|plan| plan.multiply_pointers)
+            .collect::<Vec<_>>();
+        let cached_pointer = all_multiply_pointers
+            .iter()
+            .copied()
+            .max_by_key(|pointer| {
+                all_multiply_pointers
+                    .iter()
+                    .filter(|candidate| *candidate == pointer)
+                    .count()
+            })
+            .expect("branchless multiply always has two load pointers");
+        self.emit_branchless_i32_load(cached_pointer, "w0");
+
+        for (index, plan) in plans.iter().copied().enumerate() {
+            if index != 0 {
+                let condition_insts = self.func.block(plan.block).insts.clone();
+                for inst in &condition_insts {
+                    if !matches!(inst.kind, InstKind::Phi { .. }) {
+                        self.emit_inst(inst);
+                    }
+                }
+            }
+
+            if let Some((_, value, mask, _)) = self.direct_branch_bit_test(plan.condition) {
+                let source = if let Some(source) = self.assigned_w_reg(value) {
+                    source
+                } else {
+                    self.load_value(value);
+                    "w0".to_string()
+                };
+                self.body
+                    .push_str(&format!("  tst {}, #{}\n", source, mask));
+            } else {
+                self.emit_int_compare(plan.compare.1, plan.compare.2);
+            }
+
+            let old_register = self
+                .assigned_w_reg(plan.old_value)
+                .expect("branchless chain register eligibility checked");
+            let mut operand_regs = ["w0", "w0"];
+            let mut next_scratch = 1;
+            for (operand_idx, pointer) in plan.multiply_pointers.iter().copied().enumerate() {
+                if pointer != cached_pointer {
+                    let scratch = if next_scratch == 1 { "w1" } else { "w2" };
+                    self.emit_branchless_i32_load(pointer, scratch);
+                    operand_regs[operand_idx] = scratch;
+                    next_scratch += 1;
+                }
+            }
+            self.body.push_str(&format!(
+                "  madd w16, {}, {}, {}\n",
+                operand_regs[0], operand_regs[1], old_register
+            ));
+
+            let condition = if plan.update_on_true {
+                cmp_cc(plan.compare.0)
+            } else {
+                inverse_cmp_cc(plan.compare.0)
+            };
+            let destination = self
+                .assigned_w_reg(plan.merged_value)
+                .expect("branchless chain register eligibility checked");
+            self.body.push_str(&format!(
+                "  csel {}, w16, {}, {}\n",
+                destination, old_register, condition
+            ));
+        }
+
+        let merge = plans.last().expect("non-empty branchless chain").merge;
+        if next_block != Some(merge.0) {
+            self.body
+                .push_str(&format!("  b {}\n", self.block_label(merge.0)));
+        }
+        true
+    }
+
+    fn branchless_phi_plans(
+        &self,
+        block_idx: usize,
+        cond: ValueId,
+        then_target: BlockId,
+        else_target: BlockId,
+    ) -> Option<Vec<BranchlessPhiPlan>> {
+        let first_plan = self.branchless_phi_plan(block_idx, cond, then_target, else_target)?;
+        let mut plans = vec![first_plan];
+        let mut visited = HashSet::from([first_plan.block]);
+        while plans.len() < 8 {
+            let merge = plans.last()?.merge;
+            if !visited.insert(merge) {
+                break;
+            }
+            let Some(Terminator::Branch {
+                cond,
+                then_target,
+                else_target,
+            }) = self.func.block(merge).terminator.as_ref()
+            else {
+                break;
+            };
+            let Some(next) = self.branchless_phi_plan(merge.0, *cond, *then_target, *else_target)
+            else {
+                break;
+            };
+            plans.push(next);
+        }
+
+        if plans.iter().any(|plan| {
+            self.assigned_w_reg(plan.old_value).is_none()
+                || self.assigned_w_reg(plan.merged_value).is_none()
+        }) {
+            return None;
+        }
+
+        // Keep w0 available as a chain-wide cached load. Every instruction in
+        // the later condition blocks must therefore either be elided/folded or
+        // have an assigned register; otherwise generic lowering could use w0.
+        if plans.iter().skip(1).any(|plan| {
+            self.func.block(plan.block).insts.iter().any(|inst| {
+                inst.result.is_some_and(|result| {
+                    result != plan.condition
+                        && self.assigned_x_reg(result).is_none()
+                        && !self.skips_folded_memory_gep(result)
+                })
+            })
+        }) {
+            return None;
+        }
+        Some(plans)
+    }
+
+    pub(super) fn safe_branchless_phi_final_merge(
+        &self,
+        block_idx: usize,
+        cond: ValueId,
+        then_target: BlockId,
+        else_target: BlockId,
+    ) -> Option<BlockId> {
+        self.branchless_phi_plans(block_idx, cond, then_target, else_target)
+            .and_then(|plans| plans.last().map(|plan| plan.merge))
+            .or_else(|| {
+                self.pure_branchless_phi_plan(block_idx, cond, then_target, else_target)
+                    .map(|plan| plan.merge)
+            })
+    }
+
+    fn pure_branchless_phi_plan(
+        &self,
+        block_idx: usize,
+        cond: ValueId,
+        then_target: BlockId,
+        else_target: BlockId,
+    ) -> Option<PureBranchlessPhiPlan> {
+        let compare = self.direct_branch_icmp(cond)?;
+        let (update, merge, update_on_true) = if self.block_jumps_to(then_target, else_target) {
+            (then_target, else_target, true)
+        } else if self.block_jumps_to(else_target, then_target) {
+            (else_target, then_target, false)
+        } else {
+            return None;
+        };
+        if self.predecessor_count(update) != 1 || self.predecessor_count(merge) != 2 {
+            return None;
+        }
+        let phis = self
+            .func
+            .block(merge)
+            .insts
+            .iter()
+            .filter_map(|inst| match (&inst.kind, inst.result) {
+                (InstKind::Phi { incomings }, Some(result)) => Some((result, incomings)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(merged_value, incomings)] = phis.as_slice() else {
+            return None;
+        };
+        let old_value = incomings
+            .iter()
+            .find_map(|(pred, value)| (*pred == BlockId(block_idx)).then_some(*value))?;
+        let updated_value = incomings
+            .iter()
+            .find_map(|(pred, value)| (*pred == update).then_some(*value))?;
+        if incomings.len() != 2
+            || [*merged_value, old_value, updated_value]
+                .into_iter()
+                .any(|value| {
+                    self.func.value(value).ty != Type::I32 || self.assigned_w_reg(value).is_none()
+                })
+            || !matches!(
+                self.func.value(updated_value).kind,
+                ValueKind::Inst(owner, _) if owner == update
+            ) || self.func.block(update).insts.iter().any(|inst| {
+            !matches!(inst.kind, InstKind::Nop)
+                && !matches!(
+                    inst.kind,
+                    InstKind::Binary {
+                        op: BinaryOp::Iadd
+                            | BinaryOp::Isub
+                            | BinaryOp::Imul
+                            | BinaryOp::Iand
+                            | BinaryOp::Ior
+                            | BinaryOp::Ixor
+                            | BinaryOp::Ishl
+                            | BinaryOp::Iashr,
+                        ..
+                    } if inst.result.is_some_and(|result| self.func.value(result).ty == Type::I32)
+                )
+        }) {
+            return None;
+        }
+        Some(PureBranchlessPhiPlan {
+            compare,
+            update,
+            merge,
+            old_value,
+            updated_value,
+            merged_value: *merged_value,
+            update_on_true,
+        })
+    }
+
+    fn emit_pure_branchless_phi_update(
+        &mut self,
+        block_idx: usize,
+        cond: ValueId,
+        then_target: BlockId,
+        else_target: BlockId,
+        next_block: Option<usize>,
+    ) -> bool {
+        let Some(plan) = self.pure_branchless_phi_plan(block_idx, cond, then_target, else_target)
+        else {
+            return false;
+        };
+        self.emit_int_compare(plan.compare.1, plan.compare.2);
+        let old = self
+            .assigned_w_reg(plan.old_value)
+            .expect("pure branchless old value register checked");
+        let (updated, preserved_old) = if self.emit_pure_shifted_add_into_scratch(plan) {
+            ("w16".to_string(), old.clone())
+        } else {
+            self.body.push_str(&format!("  mov w16, {old}\n"));
+            for inst in &self.func.block(plan.update).insts.clone() {
+                self.emit_inst(inst);
+            }
+            (
+                self.assigned_w_reg(plan.updated_value)
+                    .expect("pure branchless updated value register checked"),
+                "w16".to_string(),
+            )
+        };
+        let destination = self
+            .assigned_w_reg(plan.merged_value)
+            .expect("pure branchless destination register checked");
+        let condition = if plan.update_on_true {
+            cmp_cc(plan.compare.0)
+        } else {
+            inverse_cmp_cc(plan.compare.0)
+        };
+        self.body.push_str(&format!(
+            "  csel {destination}, {updated}, {preserved_old}, {condition}\n"
+        ));
+        if next_block != Some(plan.merge.0) {
+            self.body
+                .push_str(&format!("  b {}\n", self.block_label(plan.merge.0)));
+        }
+        true
+    }
+
+    fn emit_pure_shifted_add_into_scratch(&mut self, plan: PureBranchlessPhiPlan) -> bool {
+        let Some(InstKind::Binary {
+            op: BinaryOp::Iadd,
+            lhs,
+            rhs,
+        }) = defining_inst_kind(self.func, plan.updated_value)
+        else {
+            return false;
+        };
+        let shifted_add = [(*lhs, *rhs), (*rhs, *lhs)]
+            .into_iter()
+            .find_map(|(shifted, addend)| {
+                let (source, shift) = match defining_inst_kind(self.func, shifted)? {
+                    InstKind::Binary {
+                        op: BinaryOp::Ishl,
+                        lhs,
+                        rhs,
+                    } => (*lhs, const_i32(self.func, *rhs)?),
+                    InstKind::Binary {
+                        op: BinaryOp::Imul,
+                        lhs,
+                        rhs,
+                    } => {
+                        if let Some(shift) = pow2_shift(self.func, *rhs) {
+                            (*lhs, shift as i32)
+                        } else {
+                            (*rhs, pow2_shift(self.func, *lhs)? as i32)
+                        }
+                    }
+                    _ => return None,
+                };
+                let shift = (0..=4).contains(&shift).then_some(shift)?;
+                (self.value_use_counts[shifted.0] == 1
+                    && matches!(
+                        self.func.value(shifted).kind,
+                        ValueKind::Inst(owner, _) if owner == plan.update
+                    ))
+                .then_some((shifted, source, addend, shift))
+            });
+        let Some((shifted, source, addend, shift)) = shifted_add else {
+            return false;
+        };
+        let (Some(source), Some(addend)) =
+            (self.assigned_w_reg(source), self.assigned_w_reg(addend))
+        else {
+            return false;
+        };
+        for inst in &self.func.block(plan.update).insts.clone() {
+            if !matches!(inst.result, Some(result) if result == shifted || result == plan.updated_value)
+            {
+                self.emit_inst(inst);
+            }
+        }
+        self.body
+            .push_str(&format!("  add w16, {addend}, {source}, lsl #{shift}\n"));
+        true
+    }
+
+    fn emit_branchless_i32_load(&mut self, pointer: ValueId, destination: &str) {
+        let (base, offset) = self.memory_address(pointer);
+        let base = self
+            .assigned_x_reg(base)
+            .expect("branchless load address eligibility checked");
+        if offset == 0 {
+            self.body
+                .push_str(&format!("  ldr {}, [{}]\n", destination, base));
+        } else {
+            debug_assert!((-256..=255).contains(&offset));
+            self.body.push_str(&format!(
+                "  ldur {}, [{}, #{}]\n",
+                destination, base, offset
+            ));
+        }
+    }
+
+    fn branchless_phi_plan(
+        &self,
+        block_idx: usize,
+        cond: ValueId,
+        then_target: BlockId,
+        else_target: BlockId,
+    ) -> Option<BranchlessPhiPlan> {
+        let compare = self.direct_branch_icmp(cond)?;
+        let (update, merge, update_on_true) = if self.block_jumps_to(then_target, else_target) {
+            (then_target, else_target, true)
+        } else if self.block_jumps_to(else_target, then_target) {
+            (else_target, then_target, false)
+        } else {
+            return None;
+        };
+        if self.predecessor_count(update) != 1 || self.predecessor_count(merge) != 2 {
+            return None;
+        }
+
+        let phis = self
+            .func
+            .block(merge)
+            .insts
+            .iter()
+            .filter_map(|inst| match (&inst.kind, inst.result) {
+                (InstKind::Phi { incomings }, Some(result)) => Some((result, incomings)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(merged_value, incomings)] = phis.as_slice() else {
+            return None;
+        };
+        if self.func.value(*merged_value).ty != Type::I32 {
+            return None;
+        }
+        let old_value = incomings
+            .iter()
+            .find_map(|(pred, value)| (*pred == BlockId(block_idx)).then_some(*value))?;
+        let updated_value = incomings
+            .iter()
+            .find_map(|(pred, value)| (*pred == update).then_some(*value))?;
+        if incomings.len() != 2
+            || self.func.value(old_value).ty != Type::I32
+            || self.func.value(updated_value).ty != Type::I32
+            || !matches!(
+                self.func.value(updated_value).kind,
+                ValueKind::Inst(owner, _) if owner == update
+            )
+        {
+            return None;
+        }
+
+        let update_insts = &self.func.block(update).insts;
+        let mut update_loads = Vec::new();
+        for inst in update_insts {
+            match inst.kind {
+                InstKind::Nop => {}
+                InstKind::Load { ptr }
+                    if inst
+                        .result
+                        .is_some_and(|result| self.func.value(result).ty == Type::I32)
+                        && {
+                            let (base, offset) = self.memory_address(ptr);
+                            self.assigned_x_reg(base).is_some() && (-256..=255).contains(&offset)
+                        } =>
+                {
+                    update_loads.push(ptr);
+                }
+                InstKind::Binary {
+                    op: BinaryOp::Imul | BinaryOp::Iadd,
+                    ..
+                } if inst
+                    .result
+                    .is_some_and(|result| self.func.value(result).ty == Type::I32) => {}
+                _ => return None,
+            }
+        }
+        if update_loads.is_empty() {
+            return None;
+        }
+
+        let multiply_pointers =
+            branchless_madd_load_pointers(self.func, updated_value, old_value, update)?;
+
+        let mut condition_loads = Vec::new();
+        collect_condition_load_pointers(self.func, cond, &mut HashSet::new(), &mut condition_loads);
+        if condition_loads.is_empty()
+            || update_loads.iter().any(|update_ptr| {
+                !condition_loads.iter().any(|condition_ptr| {
+                    same_typed_global_address_shape(
+                        self.func,
+                        *update_ptr,
+                        *condition_ptr,
+                        &mut HashSet::new(),
+                    )
+                })
+            })
+        {
+            return None;
+        }
+
+        Some(BranchlessPhiPlan {
+            block: BlockId(block_idx),
+            condition: cond,
+            compare,
+            merge,
+            old_value,
+            merged_value: *merged_value,
+            multiply_pointers,
+            update_on_true,
+        })
+    }
+
+    fn block_jumps_to(&self, block: BlockId, target: BlockId) -> bool {
+        matches!(
+            self.func.block(block).terminator,
+            Some(Terminator::Jump(actual)) if actual == target
+        )
+    }
+
+    fn predecessor_count(&self, target: BlockId) -> usize {
+        self.func
+            .blocks
+            .iter()
+            .filter(|block| match block.terminator {
+                Some(Terminator::Jump(successor)) => successor == target,
+                Some(Terminator::Branch {
+                    then_target,
+                    else_target,
+                    ..
+                }) => then_target == target || else_target == target,
+                Some(Terminator::Return(_)) | None => false,
+            })
+            .count()
     }
 
     fn edge_has_phi_copy(&self, pred_idx: usize, target_idx: usize) -> bool {
@@ -817,6 +1445,17 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         };
         match op {
             BinaryOp::Iadd => {
+                if let Some((addend, shifted, shift)) = self.shifted_add_operands(result, lhs, rhs)
+                {
+                    if let (Some(addend), Some(shifted)) =
+                        (self.assigned_w_reg(addend), self.assigned_w_reg(shifted))
+                    {
+                        self.body.push_str(&format!(
+                            "  add {destination}, {addend}, {shifted}, lsl #{shift}\n"
+                        ));
+                        return true;
+                    }
+                }
                 if let (Some(source), Some(imm)) = (
                     self.assigned_w_reg(lhs),
                     const_i32(self.func, rhs).filter(|imm| fits_addsub_imm(*imm)),
@@ -861,6 +1500,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
                 }
             }
             BinaryOp::Iand => {
+                let lhs = self.transparent_nonnegative_sanitize(lhs).unwrap_or(lhs);
+                let rhs = self.transparent_nonnegative_sanitize(rhs).unwrap_or(rhs);
                 if let (Some(source), Some(mask)) = (
                     self.assigned_w_reg(lhs),
                     const_i32(self.func, rhs).filter(|mask| is_low_bit_mask(*mask)),
@@ -889,6 +1530,78 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             _ => {}
         }
         false
+    }
+
+    fn shifted_add_operands(
+        &self,
+        _result: ValueId,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Option<(ValueId, ValueId, i32)> {
+        [lhs, rhs]
+            .into_iter()
+            .zip([rhs, lhs])
+            .find_map(|(shifted_value, addend)| {
+                let (shifted, shift) = match defining_inst_kind(self.func, shifted_value)? {
+                    InstKind::Binary {
+                        op: BinaryOp::Ishl,
+                        lhs,
+                        rhs,
+                    } => (*lhs, const_i32(self.func, *rhs)?),
+                    InstKind::Binary {
+                        op: BinaryOp::Imul,
+                        lhs,
+                        rhs,
+                    } => {
+                        if let Some(shift) = pow2_shift(self.func, *rhs) {
+                            (*lhs, shift as i32)
+                        } else {
+                            (*rhs, pow2_shift(self.func, *lhs)? as i32)
+                        }
+                    }
+                    _ => return None,
+                };
+                let shift = (0..=4).contains(&shift).then_some(shift)?;
+                (self.value_use_counts[shifted_value.0] == 1).then_some((addend, shifted, shift))
+            })
+    }
+
+    fn fused_shifted_add_user(&self, shifted: ValueId) -> bool {
+        let ValueKind::Inst(block, inst_idx) = self.func.value(shifted).kind else {
+            return false;
+        };
+        self.func.block(block).insts[inst_idx + 1..]
+            .iter()
+            .filter_map(|inst| match (&inst.kind, inst.result) {
+                (
+                    InstKind::Binary {
+                        op: BinaryOp::Iadd,
+                        lhs,
+                        rhs,
+                    },
+                    Some(result),
+                ) => Some((result, *lhs, *rhs)),
+                _ => None,
+            })
+            .any(|(result, lhs, rhs)| {
+                if lhs != shifted && rhs != shifted {
+                    return false;
+                }
+                // Integer MADD has priority when the same add consumes a
+                // multiply.  In that case the shifted value remains an
+                // ordinary addend and must still be materialized.  Also only
+                // suppress the standalone shift when the register-only
+                // shifted-add emitter can actually select the combined form.
+                if self.fused_madd_operands(result, lhs, rhs).is_some() {
+                    return false;
+                }
+                self.shifted_add_operands(result, lhs, rhs)
+                    .is_some_and(|(addend, source, _)| {
+                        self.assigned_w_reg(result).is_some()
+                            && self.assigned_w_reg(addend).is_some()
+                            && self.assigned_w_reg(source).is_some()
+                    })
+            })
     }
 
     /// Selects `x & ~((x >> 31))` as AArch64's shifted-register BIC. This is
@@ -933,8 +1646,8 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             };
             if *shifted == source
                 && const_i32(self.func, *shift) == Some(31)
-                && self.value_use_counts[sign.0] == 1
-                && self.value_use_counts[mask.0] == 1
+                && ((self.value_use_counts[sign.0] == 1 && self.value_use_counts[mask.0] == 1)
+                    || self.is_proven_nonnegative(source))
             {
                 return Some((source, sign, mask));
             }
@@ -952,7 +1665,28 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             .filter_map(|inst| inst.result)
             .any(|candidate| {
                 self.negative_sanitize_operands(candidate)
-                    .is_some_and(|(_, sign, mask)| value == sign || value == mask)
+                    .is_some_and(|(source, sign, mask)| {
+                        (value == sign || value == mask)
+                            && (self.value_use_counts[value.0] == 1
+                                || (self.is_proven_nonnegative(source)
+                                    && self.fused_nonnegative_shift_user(value)))
+                    })
+            })
+    }
+
+    fn is_nonnegative_sanitize_intermediate(&self, value: ValueId) -> bool {
+        let ValueKind::Inst(block, inst_idx) = self.func.value(value).kind else {
+            return false;
+        };
+        self.func.blocks[block.0].insts
+            [inst_idx + 1..(inst_idx + 4).min(self.func.blocks[block.0].insts.len())]
+            .iter()
+            .filter_map(|inst| inst.result)
+            .any(|candidate| {
+                self.negative_sanitize_operands(candidate)
+                    .is_some_and(|(source, sign, mask)| {
+                        (value == sign || value == mask) && self.is_proven_nonnegative(source)
+                    })
             })
     }
 
@@ -960,6 +1694,13 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         let Some((source, _, _)) = self.negative_sanitize_operands(result) else {
             return false;
         };
+        let source_is_nonnegative = self.is_proven_nonnegative(source);
+        if source_is_nonnegative
+            && self.value_use_counts[result.0] == 1
+            && self.has_masked_transparent_sanitize_user(result)
+        {
+            return true;
+        }
         let assigned_destination = self.assigned_w_reg(result);
         let destination = assigned_destination.clone().unwrap_or_else(|| "w0".into());
         let source = if let Some(source) = self.assigned_w_reg(source) {
@@ -968,10 +1709,149 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             self.load_value_into(source, "x1");
             "w1".into()
         };
-        self.body.push_str(&format!(
-            "  bic {destination}, {source}, {source}, asr #31\n"
-        ));
+        if source_is_nonnegative {
+            if destination != source {
+                self.body
+                    .push_str(&format!("  mov {destination}, {source}\n"));
+            }
+        } else {
+            self.body.push_str(&format!(
+                "  bic {destination}, {source}, {source}, asr #31\n"
+            ));
+        }
         if assigned_destination.is_none() {
+            self.store_result(result);
+        }
+        true
+    }
+
+    fn transparent_nonnegative_sanitize(&self, value: ValueId) -> Option<ValueId> {
+        let (source, _, _) = self.negative_sanitize_operands(value)?;
+        self.is_proven_nonnegative(source).then_some(source)
+    }
+
+    fn has_masked_transparent_sanitize_user(&self, sanitized: ValueId) -> bool {
+        self.func.blocks.iter().any(|block| {
+            block.insts.iter().any(|inst| match inst.kind {
+                InstKind::Binary {
+                    op: BinaryOp::Iand,
+                    lhs,
+                    rhs,
+                } if lhs == sanitized => const_i32(self.func, rhs).is_some_and(|mask| mask >= 0),
+                InstKind::Binary {
+                    op: BinaryOp::Iand,
+                    lhs,
+                    rhs,
+                } if rhs == sanitized => const_i32(self.func, lhs).is_some_and(|mask| mask >= 0),
+                _ => false,
+            })
+        })
+    }
+
+    fn is_proven_nonnegative(&self, value: ValueId) -> bool {
+        super::emitter::value_is_nonnegative(
+            self.func,
+            value,
+            &self.parent.nonnegative_globals,
+            &mut HashSet::new(),
+        )
+    }
+
+    fn nonnegative_adjusted_shift_plan(&self, result: ValueId) -> Option<NonnegativeShiftPlan> {
+        let ValueKind::Inst(owner, _) = self.func.value(result).kind else {
+            return None;
+        };
+        let InstKind::Binary {
+            op: BinaryOp::Iashr,
+            lhs: adjusted,
+            rhs: shift,
+        } = defining_inst_kind(self.func, result)?
+        else {
+            return None;
+        };
+        let InstKind::Binary {
+            op: BinaryOp::Iadd,
+            lhs,
+            rhs,
+        } = defining_inst_kind(self.func, *adjusted)?
+        else {
+            return None;
+        };
+
+        for (source, adjustment) in [(*lhs, *rhs), (*rhs, *lhs)] {
+            let Some((sign, mask)) = signed_division_adjustment(self.func, source, adjustment)
+            else {
+                continue;
+            };
+            if !self.is_proven_nonnegative(source)
+                || self.value_use_counts[adjusted.0] != 1
+                || self.value_use_counts[adjustment.0] != 1
+            {
+                continue;
+            }
+            let mut intermediates = vec![*adjusted, adjustment];
+            if matches!(self.func.value(sign).kind, ValueKind::Inst(block, _) if block == owner)
+                && (self.value_use_counts[sign.0] == 1
+                    || (self.value_use_counts[sign.0] == 2
+                        && self.is_nonnegative_sanitize_intermediate(sign)))
+            {
+                intermediates.push(sign);
+            }
+            if let Some(mask) = mask {
+                collect_single_use_shift_tree(
+                    self.func,
+                    &self.value_use_counts,
+                    mask,
+                    owner,
+                    &mut intermediates,
+                    &mut HashSet::new(),
+                );
+            }
+            return Some(NonnegativeShiftPlan {
+                source,
+                shift: *shift,
+                intermediates,
+            });
+        }
+        None
+    }
+
+    fn fused_nonnegative_shift_user(&self, value: ValueId) -> bool {
+        let ValueKind::Inst(block, inst_idx) = self.func.value(value).kind else {
+            return false;
+        };
+        self.func.block(block).insts[inst_idx + 1..]
+            .iter()
+            .filter_map(|inst| inst.result)
+            .any(|candidate| {
+                self.nonnegative_adjusted_shift_plan(candidate)
+                    .is_some_and(|plan| plan.intermediates.contains(&value))
+            })
+    }
+
+    fn emit_fused_nonnegative_adjusted_shift(&mut self, result: ValueId) -> bool {
+        let Some(plan) = self.nonnegative_adjusted_shift_plan(result) else {
+            return false;
+        };
+        let source = self.assigned_w_reg(plan.source).unwrap_or_else(|| {
+            self.load_value_into(plan.source, "x1");
+            "w1".to_string()
+        });
+        let shift = if let Some(shift) =
+            const_i32(self.func, plan.shift).filter(|shift| (0..32).contains(shift))
+        {
+            format!("#{shift}")
+        } else {
+            self.assigned_w_reg(plan.shift).unwrap_or_else(|| {
+                self.load_value_into(plan.shift, "x2");
+                "w2".to_string()
+            })
+        };
+        let assigned = self.assigned_w_reg(result);
+        let destination = assigned.clone().unwrap_or_else(|| "w0".to_string());
+        self.body
+            .push_str(&format!("  lsr {destination}, {source}, {shift}\n"));
+        if assigned.is_none() {
             self.store_result(result);
         }
         true
@@ -1072,6 +1952,25 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             return None;
         }
 
+        let known_even_entry = self.predecessor_count(body) == 1
+            && self.func.blocks.iter().any(|block| {
+                let Some(Terminator::Branch {
+                    cond,
+                    then_target,
+                    else_target,
+                }) = block.terminator.as_ref()
+                else {
+                    return false;
+                };
+                let Some((op, value, mask, _)) = self.direct_branch_bit_test(*cond) else {
+                    return false;
+                };
+                value == *state
+                    && mask == 1
+                    && ((op == CmpOp::Eq && *then_target == body)
+                        || (op == CmpOp::Ne && *else_target == body))
+            });
+
         Some(EvenHalvingPlan {
             header: *header,
             body,
@@ -1079,6 +1978,7 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             depth,
             division,
             add,
+            known_even_entry,
         })
     }
 
@@ -1102,12 +2002,17 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         ) else {
             unreachable!("halving plan requires assigned loop registers");
         };
-        let odd = self.parent.ctx.fresh_label("halving_odd");
-        let negative = self.parent.ctx.fresh_label("halving_negative");
-        let done = self.parent.ctx.fresh_label("halving_done");
-        self.body.push_str(&format!(
-            "  tbnz {state}, #0, {odd}\n  rbit w2, {state}\n  clz w2, w2\n  tbnz {state}, #31, {negative}\n  lsr {division}, {state}, w2\n  add {add}, {depth}, w2\n  b {done}\n{negative}:\n  asr {division}, {state}, w2\n  add {add}, {depth}, w2\n  b {done}\n{odd}:\n  add {division}, {state}, {state}, lsr #31\n  asr {division}, {division}, #1\n  add {add}, {depth}, #1\n{done}:\n"
-        ));
+        if plan.known_even_entry {
+            self.body.push_str(&format!(
+                "  rbit w2, {state}\n  clz w2, w2\n  asr {division}, {state}, w2\n  add {add}, {depth}, w2\n"
+            ));
+        } else {
+            let odd = self.parent.ctx.fresh_label("halving_odd");
+            let done = self.parent.ctx.fresh_label("halving_done");
+            self.body.push_str(&format!(
+                "  tbnz {state}, #0, {odd}\n  rbit w2, {state}\n  clz w2, w2\n  asr {division}, {state}, w2\n  add {add}, {depth}, w2\n  b {done}\n{odd}:\n  add {division}, {state}, {state}, lsr #31\n  asr {division}, {division}, #1\n  add {add}, {depth}, #1\n{done}:\n"
+            ));
+        }
     }
 
     /// Folds an odd affine transition directly into the following pure
@@ -1170,10 +2075,10 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
         if *cond != header_condition {
             return false;
         }
-        let parity_block = if header_op == CmpOp::Ne {
-            *then_target
+        let (parity_block, header_exit) = if header_op == CmpOp::Ne {
+            (*then_target, *else_target)
         } else {
-            *else_target
+            (*else_target, *then_target)
         };
         let Some(Terminator::Branch {
             cond: parity_condition,
@@ -1218,11 +2123,29 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             return false;
         }
 
-        let negative = self.parent.ctx.fresh_label("known_even_negative");
+        let exit_edge = self.parent.ctx.fresh_label("halving_exit_edge");
         self.body.push_str(&format!(
-            "  rbit w2, {state_source}\n  clz w2, w2\n  tbnz {state_source}, #31, {negative}\n  lsr {state}, {state_source}, w2\n  add {depth}, {depth_source}, w2\n  b {header}\n{negative}:\n  asr {state}, {state_source}, w2\n  add {depth}, {depth_source}, w2\n  b {header}\n",
-            header = self.block_label(header.0)
+            "  rbit w2, {state_source}\n  clz w2, w2\n  asr {state}, {state_source}, w2\n  add {depth}, {depth_source}, w2\n  cmp {state}, #1\n"
         ));
+        if !self.edge_has_phi_copy(parity_block.0, odd_target.0)
+            && !self.edge_has_phi_copy(header.0, header_exit.0)
+        {
+            self.body.push_str(&format!(
+                "  b.eq {}\n  b {}\n",
+                self.block_label(header_exit.0),
+                self.block_label(odd_target.0)
+            ));
+            return true;
+        }
+        self.body.push_str(&format!("  b.eq {exit_edge}\n"));
+        self.emit_phi_copies(parity_block.0, odd_target.0);
+        self.body.push_str(&format!(
+            "  b {}\n{exit_edge}:\n",
+            self.block_label(odd_target.0)
+        ));
+        self.emit_phi_copies(header.0, header_exit.0);
+        self.body
+            .push_str(&format!("  b {}\n", self.block_label(header_exit.0)));
         true
     }
 
@@ -1249,24 +2172,39 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
             self.load_value(dividend);
             "w0".to_string()
         };
-        let identity = self.parent.ctx.fresh_label("mod_identity");
-        let slow = self.parent.ctx.fresh_label("mod_slow");
+        let fast = self.parent.ctx.fresh_label("mod_fast");
         let done = self.parent.ctx.fresh_label("mod_done");
-        self.body
-            .push_str(&format!("  tbnz {source}, #31, {slow}\n"));
-        self.body.push_str(&mov_w_imm("w1", divisor));
-        self.body
-            .push_str(&format!("  cmp {source}, w1\n  b.lt {identity}\n"));
-        self.body.push_str(&mov_w_imm("w2", twice_divisor));
-        self.body.push_str(&format!(
-            "  cmp {source}, w2\n  b.ge {slow}\n  sub {destination}, {source}, w1\n  b {done}\n{identity}:\n"
-        ));
-        if destination != source {
+        let cached_divisor = self
+            .cached_i32_constant
+            .filter(|(value, _)| *value == divisor)
+            .map(|(_, reg)| w_reg_name(reg));
+        let cached_twice_divisor = self
+            .cached_i32_double_constant
+            .filter(|(value, _)| *value == twice_divisor)
+            .map(|(_, reg)| w_reg_name(reg));
+        if let Some(twice_divisor_reg) = &cached_twice_divisor {
             self.body
-                .push_str(&format!("  mov {destination}, {source}\n"));
+                .push_str(&format!("  cmp {source}, {twice_divisor_reg}\n"));
+        } else if let Some(divisor_reg) = &cached_divisor {
+            self.body
+                .push_str(&format!("  add w2, {0}, {0}\n", divisor_reg));
+            self.body.push_str(&format!("  cmp {source}, w2\n"));
+        } else {
+            self.body.push_str(&mov_w_imm("w2", twice_divisor));
+            self.body.push_str(&format!("  cmp {source}, w2\n"));
         }
-        self.body.push_str(&format!("  b {done}\n{slow}:\n"));
+        self.body.push_str(&format!("  b.lo {fast}\n"));
         self.emit_signed_divmod_const_into(dividend, divisor, true, destination);
+        self.body.push_str(&format!("  b {done}\n{fast}:\n"));
+        let divisor_reg = if let Some(divisor_reg) = &cached_divisor {
+            divisor_reg.as_str()
+        } else {
+            self.body.push_str(&mov_w_imm("w1", divisor));
+            "w1"
+        };
+        self.body.push_str(&format!(
+            "  subs w2, {source}, {divisor_reg}\n  csel {destination}, w2, {source}, hs\n"
+        ));
         self.body.push_str(&format!("{done}:\n"));
         true
     }
@@ -1588,6 +2526,15 @@ impl<'a, 'b> AArch64IrFuncEmitter<'a, 'b> {
 
         let abs_divisor = divisor.unsigned_abs();
         if abs_divisor.is_power_of_two() {
+            if divisor > 0 && !remainder && self.is_proven_nonnegative(value) {
+                self.body.push_str(&format!(
+                    "  lsr {}, {}, #{}\n",
+                    destination,
+                    source,
+                    abs_divisor.trailing_zeros()
+                ));
+                return;
+            }
             self.emit_assigned_signed_divmod_pow2(
                 destination,
                 &source,
@@ -1892,6 +2839,81 @@ fn const_i32(func: &crate::ir::Function, value: ValueId) -> Option<i32> {
     }
 }
 
+fn phi_copy_constant(func: &crate::ir::Function, value: ValueId) -> Option<i32> {
+    match &func.value(value).kind {
+        ValueKind::Const(Const::Int(value)) => Some(*value),
+        ValueKind::Const(Const::Bool(value)) => Some(*value as i32),
+        ValueKind::Const(Const::Zero(Type::I1 | Type::I32 | Type::Ptr(_))) => Some(0),
+        _ => None,
+    }
+}
+
+fn signed_division_adjustment(
+    func: &crate::ir::Function,
+    source: ValueId,
+    adjustment: ValueId,
+) -> Option<(ValueId, Option<ValueId>)> {
+    let is_sign = |candidate: ValueId| {
+        matches!(
+            defining_inst_kind(func, candidate),
+            Some(InstKind::Binary {
+                op: BinaryOp::Iashr,
+                lhs,
+                rhs,
+            }) if *lhs == source && const_i32(func, *rhs) == Some(31)
+        )
+    };
+    if is_sign(adjustment) {
+        return Some((adjustment, None));
+    }
+    let InstKind::Binary {
+        op: BinaryOp::Iand,
+        lhs,
+        rhs,
+    } = defining_inst_kind(func, adjustment)?
+    else {
+        return None;
+    };
+    if is_sign(*lhs) {
+        Some((*lhs, Some(*rhs)))
+    } else if is_sign(*rhs) {
+        Some((*rhs, Some(*lhs)))
+    } else {
+        None
+    }
+}
+
+fn collect_single_use_shift_tree(
+    func: &crate::ir::Function,
+    use_counts: &[usize],
+    value: ValueId,
+    owner: BlockId,
+    values: &mut Vec<ValueId>,
+    visited: &mut HashSet<ValueId>,
+) {
+    if !visited.insert(value) || use_counts[value.0] != 1 {
+        return;
+    }
+    let ValueKind::Inst(block, _) = func.value(value).kind else {
+        return;
+    };
+    if block != owner {
+        return;
+    }
+    let Some(InstKind::Binary { op, lhs, rhs }) = defining_inst_kind(func, value) else {
+        return;
+    };
+    if !matches!(
+        op,
+        BinaryOp::Iadd | BinaryOp::Isub | BinaryOp::Iand | BinaryOp::Ishl
+    ) {
+        return;
+    }
+    values.push(value);
+    collect_single_use_shift_tree(func, use_counts, *lhs, owner, values, visited);
+    collect_single_use_shift_tree(func, use_counts, *rhs, owner, values, visited);
+}
+
 fn pow2_shift(func: &crate::ir::Function, value: ValueId) -> Option<u32> {
     positive_pow2_shift(const_i32(func, value)?)
 }
@@ -1973,6 +2995,167 @@ fn fits_addsub_imm(value: i32) -> bool {
 
 fn is_low_bit_mask(value: i32) -> bool {
     value > 0 && ((value as u32) & (value as u32).wrapping_add(1)) == 0
+}
+
+fn collect_condition_load_pointers(
+    func: &crate::ir::Function,
+    value: ValueId,
+    visited: &mut HashSet<ValueId>,
+    pointers: &mut Vec<ValueId>,
+) {
+    if !visited.insert(value) {
+        return;
+    }
+    let Some(kind) = defining_inst_kind(func, value) else {
+        return;
+    };
+    match kind {
+        InstKind::Load { ptr } => pointers.push(*ptr),
+        InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => {
+            collect_condition_load_pointers(func, *value, visited, pointers);
+        }
+        InstKind::Binary { lhs, rhs, .. }
+        | InstKind::Icmp { lhs, rhs, .. }
+        | InstKind::Fcmp { lhs, rhs, .. } => {
+            collect_condition_load_pointers(func, *lhs, visited, pointers);
+            collect_condition_load_pointers(func, *rhs, visited, pointers);
+        }
+        InstKind::Nop
+        | InstKind::Phi { .. }
+        | InstKind::Alloca { .. }
+        | InstKind::Store { .. }
+        | InstKind::MemZero { .. }
+        | InstKind::Gep { .. }
+        | InstKind::Call { .. } => {}
+    }
+}
+
+fn branchless_madd_load_pointers(
+    func: &crate::ir::Function,
+    updated: ValueId,
+    old: ValueId,
+    update_block: BlockId,
+) -> Option<[ValueId; 2]> {
+    let InstKind::Binary {
+        op: BinaryOp::Iadd,
+        lhs,
+        rhs,
+    } = defining_inst_kind(func, updated)?
+    else {
+        return None;
+    };
+    let product = if *lhs == old {
+        *rhs
+    } else if *rhs == old {
+        *lhs
+    } else {
+        return None;
+    };
+    let InstKind::Binary {
+        op: BinaryOp::Imul,
+        lhs,
+        rhs,
+    } = defining_inst_kind(func, product)?
+    else {
+        return None;
+    };
+
+    let load_pointer = |value| {
+        if !matches!(func.value(value).kind, ValueKind::Inst(owner, _) if owner == update_block)
+            || func.value(value).ty != Type::I32
+        {
+            return None;
+        }
+        let InstKind::Load { ptr } = defining_inst_kind(func, value)? else {
+            return None;
+        };
+        Some(*ptr)
+    };
+    Some([load_pointer(*lhs)?, load_pointer(*rhs)?])
+}
+
+/// Proves that two pointers select the same typed element coordinates in
+/// equally shaped global objects.  A load through one pointer therefore proves
+/// the other pointer dereferenceable whenever the first load executes.  This
+/// permits safe if-conversion without speculating an otherwise unchecked
+/// address.  Pointer recurrences are compared coinductively: revisiting the
+/// same value pair closes only that exact structural cycle.
+fn same_typed_global_address_shape(
+    func: &crate::ir::Function,
+    lhs: ValueId,
+    rhs: ValueId,
+    visited: &mut HashSet<(ValueId, ValueId)>,
+) -> bool {
+    if func.value(lhs).ty != func.value(rhs).ty {
+        return false;
+    }
+    if lhs == rhs {
+        return true;
+    }
+    if !visited.insert((lhs, rhs)) {
+        return true;
+    }
+
+    match (&func.value(lhs).kind, &func.value(rhs).kind) {
+        (ValueKind::Global(_), ValueKind::Global(_)) => true,
+        (ValueKind::Inst(lhs_block, lhs_idx), ValueKind::Inst(rhs_block, rhs_idx)) => {
+            let (Some(lhs_inst), Some(rhs_inst)) = (
+                func.blocks
+                    .get(lhs_block.0)
+                    .and_then(|block| block.insts.get(*lhs_idx)),
+                func.blocks
+                    .get(rhs_block.0)
+                    .and_then(|block| block.insts.get(*rhs_idx)),
+            ) else {
+                return false;
+            };
+            match (&lhs_inst.kind, &rhs_inst.kind) {
+                (
+                    InstKind::Gep {
+                        base: lhs_base,
+                        indices: lhs_indices,
+                    },
+                    InstKind::Gep {
+                        base: rhs_base,
+                        indices: rhs_indices,
+                    },
+                ) => {
+                    lhs_indices == rhs_indices
+                        && same_typed_global_address_shape(func, *lhs_base, *rhs_base, visited)
+                }
+                (
+                    InstKind::Phi {
+                        incomings: lhs_incomings,
+                    },
+                    InstKind::Phi {
+                        incomings: rhs_incomings,
+                    },
+                ) if lhs_incomings.len() == rhs_incomings.len() => {
+                    lhs_incomings.iter().all(|(lhs_pred, lhs_value)| {
+                        rhs_incomings
+                            .iter()
+                            .find_map(|(rhs_pred, rhs_value)| {
+                                (rhs_pred == lhs_pred).then_some(*rhs_value)
+                            })
+                            .is_some_and(|rhs_value| {
+                                same_typed_global_address_shape(
+                                    func, *lhs_value, rhs_value, visited,
+                                )
+                            })
+                    })
+                }
+                _ => false,
+            }
+        }
+        (ValueKind::Param, ValueKind::Param)
+        | (ValueKind::Const(_), ValueKind::Const(_))
+        | (ValueKind::Global(_), _)
+        | (ValueKind::Inst(_, _), _)
+        | (_, ValueKind::Global(_))
+        | (_, ValueKind::Inst(_, _))
+        | (_, ValueKind::Param)
+        | (_, ValueKind::Const(_)) => false,
+    }
 }
 
 fn cmp_cc(op: CmpOp) -> &'static str {

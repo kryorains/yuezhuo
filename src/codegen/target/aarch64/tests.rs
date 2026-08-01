@@ -21,6 +21,58 @@ fn block_asm<'a>(function_asm: &'a str, name: &str, block: usize) -> &'a str {
 }
 
 #[test]
+fn materializes_a_shifted_madd_addend_before_contracting_the_multiply() {
+    let mut function = Function::new("shifted_madd_addend", Type::I32);
+    let shifted_source = function.add_param("shifted_source", Type::I32);
+    let multiply_lhs = function.add_param("multiply_lhs", Type::I32);
+    let multiply_rhs = function.add_param("multiply_rhs", Type::I32);
+    let two = function.add_const(Const::Int(2));
+    let shifted = function
+        .append_inst(
+            function.entry,
+            InstKind::Binary {
+                op: BinaryOp::Imul,
+                lhs: shifted_source,
+                rhs: two,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let product = function
+        .append_inst(
+            function.entry,
+            InstKind::Binary {
+                op: BinaryOp::Imul,
+                lhs: multiply_lhs,
+                rhs: multiply_rhs,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let sum = function
+        .append_inst(
+            function.entry,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: product,
+                rhs: shifted,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    function.set_terminator(function.entry, Terminator::Return(Some(sum)));
+    assert!(function.verify().is_ok());
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let body = function_asm(&asm, "shifted_madd_addend");
+
+    assert!(body.contains("  lsl "));
+    assert!(body.contains("  madd "));
+}
+
+#[test]
 fn reduces_a_twice_bounded_signed_remainder_with_conditional_selects() {
     let mut reduce = Function::new("bounded_reduce", Type::I32);
     let input = reduce.add_param("input", Type::I32);
@@ -210,8 +262,9 @@ fn guards_a_loop_carried_additive_remainder() {
     module.add_func(function);
     let asm = emit_ir_asm(&module);
     let asm = function_asm(&asm, "additive_mod");
-    assert!(asm.contains("mod_identity"));
-    assert!(asm.contains("mod_slow"));
+    assert!(asm.contains("mod_fast"));
+    assert!(asm.contains("  b.lo "));
+    assert!(asm.contains("  csel "));
     assert!(asm.contains("  smull "));
 }
 
@@ -305,9 +358,9 @@ fn compresses_a_signed_even_halving_run_with_an_odd_fallback() {
     assert!(asm.contains("  rbit "));
     assert!(asm.contains("  clz "));
     assert!(asm.contains("halving_odd"));
-    assert!(asm.contains("halving_negative"));
+    assert!(!asm.contains("halving_negative"));
     assert!(asm.contains("  asr "));
-    assert!(asm.contains("  lsr "));
+    assert!(!asm.contains("  lsr "));
     assert!(!asm.contains("  b.le .L_halving"));
 }
 
@@ -467,7 +520,8 @@ fn compresses_a_proven_even_affine_backedge() {
     let asm = emit_ir_asm(&module);
     let asm = function_asm(&asm, "odd_affine_halving");
     assert!(!asm.contains("known_even_slow"));
-    assert!(asm.contains("known_even_negative"));
+    assert!(!asm.contains("known_even_negative"));
+    assert!(asm.contains("  b.eq .L_odd_affine_halving_bb5"));
     assert!(asm.matches("  rbit ").count() >= 2);
     assert!(asm.matches("  asr ").count() >= 2);
 }

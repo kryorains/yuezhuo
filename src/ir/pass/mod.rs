@@ -167,6 +167,10 @@ pub fn run_pipeline_with_reduction_jam_factor(
             for _ in 0..options.cfg_inline_rounds {
                 pipeline.add(CfgInlinePass::new(options.cfg_inline_global_loads));
             }
+            if options.cfg_inline_global_loads {
+                pipeline.add(GlobalScalarLocalizePass::new());
+                pipeline.add(ScalarPromotePass::new());
+            }
             pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
             pipeline.add(RangeIntegerSimplifyPass::new());
             pipeline.add(DcePass::new());
