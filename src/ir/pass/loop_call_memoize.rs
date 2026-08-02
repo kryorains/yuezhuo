@@ -833,9 +833,11 @@ int main() {
             OptLevel::O1,
             PassOptions {
                 enable_simple_loop_unroll: false,
+                enable_simple_loop_unroll_in_main: false,
                 small_expr_inline_rounds: 1,
                 cfg_inline_rounds: 0,
                 cfg_inline_global_loads: false,
+                cfg_inline_global_stores: false,
                 recursive_inline_rounds: 1,
                 enable_constant_address_count_reduction: false,
                 enable_recursive_const_specialization: false,

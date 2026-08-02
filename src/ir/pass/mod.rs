@@ -11,6 +11,7 @@ mod function_effects;
 mod gep_induction;
 mod global_const_prop;
 mod global_scalar_localize;
+mod global_write_only;
 mod guarded_max_chain;
 mod guarded_modular_multiply;
 mod guarded_shift_dispatch;
@@ -22,8 +23,10 @@ mod local_forward;
 mod local_memzero_sink;
 mod loop_analysis;
 mod loop_call_memoize;
+mod loop_division_specialize;
 mod loop_memory_promotion;
 mod modular_recurrence;
+mod odd_chain_group;
 mod pointer_recurrence_coalesce;
 mod range_integer;
 mod recursive_inline;
@@ -50,6 +53,7 @@ use dce::DcePass;
 use gep_induction::GepInductionPass;
 use global_const_prop::GlobalConstPropPass;
 use global_scalar_localize::GlobalScalarLocalizePass;
+use global_write_only::GlobalWriteOnlyPass;
 use guarded_max_chain::GuardedMaxChainPass;
 use guarded_modular_multiply::GuardedModularMultiplyPass;
 use guarded_shift_dispatch::GuardedShiftDispatchPass;
@@ -60,8 +64,10 @@ use licm::LicmPass;
 use local_forward::LocalForwardPass;
 use local_memzero_sink::LocalMemzeroSinkPass;
 use loop_call_memoize::LoopCallMemoizePass;
+use loop_division_specialize::LoopDivisionSpecializePass;
 use loop_memory_promotion::LoopMemoryPromotionPass;
 use modular_recurrence::ModularRecurrencePass;
+use odd_chain_group::OddChainGroupPass;
 use pointer_recurrence_coalesce::PointerRecurrenceCoalescePass;
 use range_integer::RangeIntegerSimplifyPass;
 use recursive_inline::{CfgInlinePass, RecursiveInlinePass};
@@ -84,9 +90,11 @@ pub enum OptLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PassOptions {
     pub enable_simple_loop_unroll: bool,
+    pub enable_simple_loop_unroll_in_main: bool,
     pub small_expr_inline_rounds: usize,
     pub cfg_inline_rounds: usize,
     pub cfg_inline_global_loads: bool,
+    pub cfg_inline_global_stores: bool,
     pub recursive_inline_rounds: usize,
     pub enable_constant_address_count_reduction: bool,
     pub enable_recursive_const_specialization: bool,
@@ -125,6 +133,7 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(GlobalConstPropPass::new(
                 options.enable_initialized_global_propagation,
             ));
+            pipeline.add(GlobalWriteOnlyPass::new());
             pipeline.add(ConstFoldPass::new());
             if options.enable_write_only_alloca_cleanup_before_inline {
                 pipeline.add(DcePass::new());
@@ -158,6 +167,7 @@ pub fn run_pipeline_with_reduction_jam_factor(
             } else {
                 pipeline.add(DcePass::preserving_write_only_allocas());
             }
+            pipeline.add(OddChainGroupPass::new());
             pipeline.add(RecursiveInlinePass::with_rounds(
                 options.recursive_inline_rounds,
             ));
@@ -165,7 +175,10 @@ pub fn run_pipeline_with_reduction_jam_factor(
                 pipeline.add(InlineSmallExprPass::new());
             }
             for _ in 0..options.cfg_inline_rounds {
-                pipeline.add(CfgInlinePass::new(options.cfg_inline_global_loads));
+                pipeline.add(CfgInlinePass::new(
+                    options.cfg_inline_global_loads,
+                    options.cfg_inline_global_stores,
+                ));
             }
             if options.cfg_inline_global_loads {
                 pipeline.add(GlobalScalarLocalizePass::new());
@@ -199,13 +212,18 @@ pub fn run_pipeline_with_reduction_jam_factor(
             }
             if options.enable_regional_global_scalar_promotion {
                 pipeline.add(RegionalGlobalScalarPass::new());
+                pipeline.add(ScalarPromotePass::new());
             }
             if options.enable_constant_address_count_reduction {
                 pipeline.add(ConstantAddressReductionPass::new());
             }
             if options.enable_simple_loop_unroll {
-                pipeline.add(SimpleLoopUnrollPass::new(max_reduction_jam_factor));
+                pipeline.add(SimpleLoopUnrollPass::new(
+                    max_reduction_jam_factor,
+                    options.enable_simple_loop_unroll_in_main,
+                ));
             }
+            pipeline.add(LoopDivisionSpecializePass::new());
             pipeline.add(InstCombinePass::new());
             pipeline.add(ConstFoldPass::new());
             pipeline.add(LoopMemoryPromotionPass::new());
@@ -220,6 +238,7 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(PointerRecurrenceCoalescePass::new());
             if options.enable_regional_global_scalar_promotion {
                 pipeline.add(RegionalGlobalScalarPass::new());
+                pipeline.add(ScalarPromotePass::new());
             }
             pipeline.add(DcePass::new());
             pipeline.add(CsePass::new());

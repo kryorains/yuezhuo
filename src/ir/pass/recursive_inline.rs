@@ -28,6 +28,7 @@ pub(super) struct RecursiveInlinePass {
 }
 pub(super) struct CfgInlinePass {
     allow_global_loads: bool,
+    allow_global_stores: bool,
 }
 
 impl RecursiveInlinePass {
@@ -44,8 +45,11 @@ impl RecursiveInlinePass {
 }
 
 impl CfgInlinePass {
-    pub(super) fn new(allow_global_loads: bool) -> Self {
-        Self { allow_global_loads }
+    pub(super) fn new(allow_global_loads: bool, allow_global_stores: bool) -> Self {
+        Self {
+            allow_global_loads,
+            allow_global_stores,
+        }
     }
 }
 
@@ -137,7 +141,9 @@ impl ModulePass for CfgInlinePass {
         let targets = CallGraphTargets::new(&snapshots);
         let candidates = snapshots
             .iter()
-            .map(|func| GeneralCallee::analyze(func, self.allow_global_loads))
+            .map(|func| {
+                GeneralCallee::analyze(func, self.allow_global_loads, self.allow_global_stores)
+            })
             .collect::<Vec<_>>();
         let mut plans = vec![Vec::new(); snapshots.len()];
         let mut module_growth = Growth::default();
@@ -236,7 +242,11 @@ struct GeneralCallee {
 }
 
 impl GeneralCallee {
-    fn analyze(func: &Function, allow_global_loads: bool) -> Option<Self> {
+    fn analyze(
+        func: &Function,
+        allow_global_loads: bool,
+        allow_global_stores: bool,
+    ) -> Option<Self> {
         if !matches!(func.ret, Type::I1 | Type::I32 | Type::F32)
             || func.blocks.is_empty()
             || func.blocks.len() > MAX_GENERAL_SOURCE_BLOCKS
@@ -269,11 +279,9 @@ impl GeneralCallee {
             || reachable_insts.len() > MAX_GENERAL_SOURCE_INST_SLOTS
             || !func.blocks.iter().enumerate().all(|(block_idx, block)| {
                 !reachable[block_idx]
-                    || (block
-                        .insts
-                        .iter()
-                        .all(|inst| is_readonly_inline_inst(func, inst, allow_global_loads))
-                        && !matches!(block.terminator, Some(Terminator::Return(None))))
+                    || (block.insts.iter().all(|inst| {
+                        is_readonly_inline_inst(func, inst, allow_global_loads, allow_global_stores)
+                    }) && !matches!(block.terminator, Some(Terminator::Return(None))))
             })
         {
             return None;
@@ -294,7 +302,12 @@ impl GeneralCallee {
     }
 }
 
-fn is_readonly_inline_inst(func: &Function, inst: &Inst, allow_global_loads: bool) -> bool {
+fn is_readonly_inline_inst(
+    func: &Function,
+    inst: &Inst,
+    allow_global_loads: bool,
+    allow_global_stores: bool,
+) -> bool {
     matches!(
         inst.kind,
         InstKind::Nop
@@ -344,8 +357,12 @@ fn is_readonly_inline_inst(func: &Function, inst: &Inst, allow_global_loads: boo
     ) || matches!(
         inst.kind,
         InstKind::Store { ptr, .. }
-            if allow_global_loads
-                && matches!(func.value(ptr).kind, ValueKind::Global(_))
+            if (allow_global_loads
+                && matches!(func.value(ptr).kind, ValueKind::Global(_)))
+                || (allow_global_stores
+                    && inline_load_root(func, ptr).is_some_and(|root| {
+                        matches!(func.value(root).kind, ValueKind::Global(_))
+                    }))
     )
 }
 
@@ -897,6 +914,76 @@ mod tests {
     use crate::ir::{CmpOp, Const};
 
     #[test]
+    fn cfg_inlines_stores_through_global_array_addresses_when_enabled() {
+        let mut store = Function::new("store_global", Type::I32);
+        let index = store.add_param("index", Type::I32);
+        let value = store.add_param("value", Type::I32);
+        let global = store.add_global_ref(
+            "items",
+            Type::Ptr(Box::new(Type::Array {
+                elem: Box::new(Type::I32),
+                len: 16,
+            })),
+        );
+        let address = store
+            .append_inst(
+                store.entry,
+                InstKind::Gep {
+                    base: global,
+                    indices: vec![index],
+                },
+                Some(Type::Ptr(Box::new(Type::I32))),
+            )
+            .unwrap();
+        store.append_inst(
+            store.entry,
+            InstKind::Store {
+                ptr: address,
+                value,
+            },
+            None,
+        );
+        let zero = store.add_const(Const::Int(0));
+        store.set_terminator(store.entry, Terminator::Return(Some(zero)));
+
+        let mut caller = Function::new("caller", Type::I32);
+        let index = caller.add_param("index", Type::I32);
+        let value = caller.add_param("value", Type::I32);
+        let result = caller
+            .append_inst(
+                caller.entry,
+                InstKind::Call {
+                    name: "store_global".into(),
+                    args: vec![index, value],
+                },
+                Some(Type::I32),
+            )
+            .unwrap();
+        caller.set_terminator(caller.entry, Terminator::Return(Some(result)));
+
+        let mut disabled = Module::new();
+        disabled.add_func(store.clone());
+        disabled.add_func(caller.clone());
+        CfgInlinePass::new(false, false).run(&mut disabled);
+        assert!(disabled.funcs[1]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, InstKind::Call { .. })));
+
+        let mut enabled = Module::new();
+        enabled.add_func(store);
+        enabled.add_func(caller);
+        CfgInlinePass::new(true, true).run(&mut enabled);
+        assert!(enabled.funcs[1]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .all(|inst| !matches!(inst.kind, InstKind::Call { .. })));
+        assert!(enabled.funcs.iter().all(|func| func.verify().is_ok()));
+    }
+
+    #[test]
     fn cfg_inlines_readonly_float_pointer_loops() {
         let mut reduce = Function::new("reduce_values", Type::F32);
         let values = reduce.add_param("values", Type::Ptr(Box::new(Type::F32)));
@@ -1001,7 +1088,7 @@ mod tests {
         let mut module = Module::new();
         module.add_func(reduce);
         module.add_func(caller);
-        CfgInlinePass::new(false).run(&mut module);
+        CfgInlinePass::new(false, false).run(&mut module);
 
         assert!(module.funcs[1].blocks.iter().all(|block| {
             block
@@ -1175,9 +1262,11 @@ mod tests {
         o1.add_func(func);
         let options = PassOptions {
             enable_simple_loop_unroll: false,
+            enable_simple_loop_unroll_in_main: false,
             small_expr_inline_rounds: 1,
             cfg_inline_rounds: 1,
             cfg_inline_global_loads: false,
+            cfg_inline_global_stores: false,
             recursive_inline_rounds: 1,
             enable_constant_address_count_reduction: false,
             enable_recursive_const_specialization: false,
