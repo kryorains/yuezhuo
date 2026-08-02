@@ -171,12 +171,8 @@ struct Candidate {
     global: ValueId,
     preheader: BlockId,
     header: BlockId,
-    latch: BlockId,
     exit: BlockId,
-    load_index: usize,
-    load_result: ValueId,
-    store_index: usize,
-    stored_value: ValueId,
+    loop_blocks: HashSet<BlockId>,
 }
 
 #[derive(Default)]
@@ -248,20 +244,14 @@ fn find_candidate(func: &Function) -> Option<Candidate> {
         }
 
         for (name, accesses) in accesses {
-            let [(load_block, load_index, load_result, load_global, load_ty)] =
-                accesses.loads.as_slice()
-            else {
+            let Some((_, _, _, load_global, load_ty)) = accesses.loads.first() else {
                 continue;
             };
-            let [(store_block, store_index, stored_value, _store_global, store_ty)] =
-                accesses.stores.as_slice()
-            else {
+            if accesses.stores.is_empty() {
                 continue;
-            };
-            if *load_block != latch
-                || *store_block != latch
-                || load_index >= store_index
-                || load_ty != store_ty
+            }
+            if accesses.loads.iter().any(|(_, _, _, _, ty)| ty != load_ty)
+                || accesses.stores.iter().any(|(_, _, _, _, ty)| ty != load_ty)
                 || !loop_memory_is_disjoint(func, natural_loop, &name)
             {
                 continue;
@@ -273,12 +263,8 @@ fn find_candidate(func: &Function) -> Option<Candidate> {
                 global: *load_global,
                 preheader,
                 header: natural_loop.header,
-                latch,
                 exit: *exit,
-                load_index: *load_index,
-                load_result: *load_result,
-                store_index: *store_index,
-                stored_value: *stored_value,
+                loop_blocks: natural_loop.blocks.clone(),
             });
         }
     }
@@ -360,6 +346,15 @@ fn pointer_is_proven_disjoint(func: &Function, pointer: ValueId, candidate: &str
 }
 
 fn promote_candidate(func: &mut Function, candidate: Candidate) {
+    let local = func
+        .append_inst(
+            candidate.preheader,
+            InstKind::Alloca {
+                ty: candidate.value_ty.clone(),
+            },
+            Some(Type::Ptr(Box::new(candidate.value_ty.clone()))),
+        )
+        .expect("regional scalar needs a local stack slot");
     let initial = func
         .append_inst(
             candidate.preheader,
@@ -369,41 +364,41 @@ fn promote_candidate(func: &mut Function, candidate: Candidate) {
             Some(candidate.value_ty.clone()),
         )
         .expect("regional global load must produce a value");
-    let phi_index = func.blocks[candidate.header.0]
-        .insts
-        .iter()
-        .take_while(|inst| matches!(inst.kind, InstKind::Phi { .. }))
-        .count();
-    let carried = func
-        .insert_inst(
-            candidate.header,
-            phi_index,
-            InstKind::Phi {
-                incomings: vec![
-                    (candidate.preheader, initial),
-                    (candidate.latch, candidate.stored_value),
-                ],
-            },
-            Some(candidate.value_ty),
-        )
-        .expect("regional global phi must produce a value");
-
-    let replacements = ValueReplacements::from([(candidate.load_result, carried)]);
-    rewrite_function_uses(func, &replacements);
-    let load = &mut func.blocks[candidate.latch.0].insts[candidate.load_index];
-    debug_assert_eq!(load.result, Some(candidate.load_result));
-    load.result = None;
-    load.kind = InstKind::Nop;
-    let store = &mut func.blocks[candidate.latch.0].insts[candidate.store_index];
-    debug_assert!(matches!(store.kind, InstKind::Store { .. }));
-    store.kind = InstKind::Nop;
+    func.append_inst(
+        candidate.preheader,
+        InstKind::Store {
+            ptr: local,
+            value: initial,
+        },
+        None,
+    );
+    for block in &candidate.loop_blocks {
+        for inst in &mut func.blocks[block.0].insts {
+            match &mut inst.kind {
+                InstKind::Load { ptr } | InstKind::Store { ptr, .. }
+                    if scalar_global_name_by_values(&func.values, *ptr)
+                        == Some(candidate.name.as_str()) =>
+                {
+                    *ptr = local;
+                }
+                _ => {}
+            }
+        }
+    }
 
     let flush = func.add_block(format!("regional.{}.flush", candidate.name));
+    let final_value = func
+        .append_inst(
+            flush,
+            InstKind::Load { ptr: local },
+            Some(candidate.value_ty),
+        )
+        .expect("regional scalar flush must load the final value");
     func.append_inst(
         flush,
         InstKind::Store {
             ptr: candidate.global,
-            value: carried,
+            value: final_value,
         },
         None,
     );

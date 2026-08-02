@@ -21,12 +21,16 @@ const MAX_FUNCTION_INSTRUCTIONS: usize = 32_768;
 /// the source program's exact iteration order.
 pub(super) struct SimpleLoopUnrollPass {
     factor: usize,
+    include_main: bool,
 }
 
 impl SimpleLoopUnrollPass {
-    pub(super) fn new(factor: usize) -> Self {
+    pub(super) fn new(factor: usize, include_main: bool) -> Self {
         assert!(matches!(factor, 2 | 4));
-        Self { factor }
+        Self {
+            factor,
+            include_main,
+        }
     }
 }
 
@@ -36,7 +40,8 @@ impl ModulePass for SimpleLoopUnrollPass {
             if func.simple_loop_unroll_decided() {
                 continue;
             }
-            unroll_simple_loops(func, self.factor);
+            let store_only = !self.include_main && func.name == "main";
+            unroll_simple_loops(func, self.factor, store_only);
             func.mark_simple_loop_unroll_decided();
         }
     }
@@ -65,7 +70,7 @@ struct Accumulator {
     header_phi_inst: usize,
 }
 
-fn unroll_simple_loops(func: &mut Function, factor: usize) {
+fn unroll_simple_loops(func: &mut Function, factor: usize, store_only: bool) {
     let Some(mut instruction_count) = func
         .blocks
         .iter()
@@ -94,7 +99,10 @@ fn unroll_simple_loops(func: &mut Function, factor: usize) {
     let mut projected_blocks = func.blocks.len();
     let mut changed = false;
     for candidate in candidates {
-        if factor == 4
+        if store_only && !is_simple_store_loop(func, &candidate) {
+            continue;
+        }
+        let candidate_factor = if factor == 4
             && (candidate.active_body_insts > MAX_FACTOR_FOUR_BODY_INSTS
                 || candidate.body_insts.iter().any(|inst| {
                     matches!(
@@ -104,11 +112,12 @@ fn unroll_simple_loops(func: &mut Function, factor: usize) {
                             ..
                         }
                     )
-                }))
-        {
-            continue;
-        }
-        let Some(growth) = candidate.active_body_insts.checked_mul(factor) else {
+                })) {
+            2
+        } else {
+            factor
+        };
+        let Some(growth) = candidate.active_body_insts.checked_mul(candidate_factor) else {
             continue;
         };
         let Some(next_cloned) = cloned_insts.checked_add(growth) else {
@@ -139,7 +148,7 @@ fn unroll_simple_loops(func: &mut Function, factor: usize) {
         {
             continue;
         }
-        apply_unroll(func, &candidate, factor);
+        apply_unroll(func, &candidate, candidate_factor);
         cloned_insts = next_cloned;
         projected_values = next_values;
         projected_blocks = next_blocks;
@@ -155,6 +164,21 @@ fn unroll_simple_loops(func: &mut Function, factor: usize) {
             );
         }
     }
+}
+
+fn is_simple_store_loop(func: &Function, candidate: &UnrollCandidate) -> bool {
+    candidate.accumulator.is_none()
+        && candidate.body_insts.iter().all(|inst| match &inst.kind {
+            InstKind::Nop | InstKind::Gep { .. } => true,
+            InstKind::Store { value, .. } => !matches!(
+                func.value(*value).kind,
+                ValueKind::Inst(owner, _) if owner == candidate.body
+            ),
+            InstKind::Binary {
+                op: BinaryOp::Iadd, ..
+            } => inst.result == Some(candidate.counter_next),
+            _ => false,
+        })
 }
 
 fn match_candidate(

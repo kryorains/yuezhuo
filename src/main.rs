@@ -116,9 +116,11 @@ fn main() {
     let costs = target.cost_model();
     let pass_options = ir::pass::PassOptions {
         enable_simple_loop_unroll: costs.enable_simple_loop_unroll(),
+        enable_simple_loop_unroll_in_main: costs.enable_simple_loop_unroll_in_main(),
         small_expr_inline_rounds: costs.small_expr_inline_rounds(),
         cfg_inline_rounds: costs.cfg_inline_rounds(),
         cfg_inline_global_loads: costs.cfg_inline_global_loads(),
+        cfg_inline_global_stores: costs.cfg_inline_global_stores(),
         recursive_inline_rounds: costs.recursive_inline_rounds(),
         enable_constant_address_count_reduction: costs.enable_constant_address_count_reduction(),
         enable_recursive_const_specialization: costs.enable_recursive_const_specialization(),
