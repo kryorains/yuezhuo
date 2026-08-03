@@ -59,6 +59,7 @@ impl ModulePass for OddChainGroupPass {
                 helper_name.clone(),
                 plan.modulus,
                 cache_name,
+                plan.kind,
             ));
             apply_plan(&mut module.funcs[func_idx], &plan, helper_name);
             if let Err(errors) = module.funcs[func_idx].verify() {
@@ -75,6 +76,22 @@ impl ModulePass for OddChainGroupPass {
 struct RecurrenceSpec {
     name: String,
     limit_global: String,
+    kind: RecurrenceKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecurrenceKind {
+    ThreeOnly,
+    ThreeThenFour,
+}
+
+impl RecurrenceKind {
+    fn failure_value(self) -> i32 {
+        match self {
+            Self::ThreeOnly => 0,
+            Self::ThreeThenFour => 7,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -86,6 +103,7 @@ struct AggregatePlan {
     limit_ptr: ValueId,
     accumulator: ValueId,
     modulus: i32,
+    kind: RecurrenceKind,
 }
 
 fn recognize_recurrence(func: &Function) -> Option<RecurrenceSpec> {
@@ -146,14 +164,7 @@ fn recognize_recurrence(func: &Function) -> Option<RecurrenceSpec> {
             else {
                 continue;
             };
-            let Some((four_transition, failure, _second_limit, second_global)) =
-                bounded_affine_branch(func, odd_four, state, 4)
-            else {
-                continue;
-            };
-            if limit_global != second_global
-                || returned_const(func, failure) != Some(7)
-                || !transition_matches(func, header, state, depth, even, Transition::Half)
+            if !transition_matches(func, header, state, depth, even, Transition::Half)
                 || !transition_matches(
                     func,
                     header,
@@ -162,6 +173,24 @@ fn recognize_recurrence(func: &Function) -> Option<RecurrenceSpec> {
                     three_transition,
                     Transition::Affine(3),
                 )
+                || !initial_state_matches(func, state, depth)
+            {
+                continue;
+            }
+            if returned_const(func, odd_four) == Some(0) {
+                return Some(RecurrenceSpec {
+                    name: func.name.clone(),
+                    limit_global,
+                    kind: RecurrenceKind::ThreeOnly,
+                });
+            }
+            let Some((four_transition, failure, _second_limit, second_global)) =
+                bounded_affine_branch(func, odd_four, state, 4)
+            else {
+                continue;
+            };
+            if limit_global != second_global
+                || returned_const(func, failure) != Some(7)
                 || !transition_matches(
                     func,
                     header,
@@ -170,13 +199,13 @@ fn recognize_recurrence(func: &Function) -> Option<RecurrenceSpec> {
                     four_transition,
                     Transition::Affine(4),
                 )
-                || !initial_state_matches(func, state, depth)
             {
                 continue;
             }
             return Some(RecurrenceSpec {
                 name: func.name.clone(),
                 limit_global,
+                kind: RecurrenceKind::ThreeThenFour,
             });
         }
     }
@@ -373,7 +402,7 @@ fn recognize_aggregate(
                         .is_some_and(|v| const_i32(func, v) == Some(0))
             })?;
             let next_accumulator = phi_incoming(func, accumulator, latch)?;
-            let (call_result, modulus) = aggregate_latch(
+            let (call_result, modulus, kind) = aggregate_latch(
                 func,
                 natural_loop,
                 latch,
@@ -407,6 +436,7 @@ fn recognize_aggregate(
                 limit_ptr,
                 accumulator,
                 modulus,
+                kind,
             });
         }
     }
@@ -455,7 +485,7 @@ fn aggregate_latch(
     next_accumulator: ValueId,
     specs: &HashMap<String, RecurrenceSpec>,
     limit_global: &str,
-) -> Option<(ValueId, i32)> {
+) -> Option<(ValueId, i32, RecurrenceKind)> {
     let InstKind::Binary {
         op: BinaryOp::Imod,
         lhs: added,
@@ -491,7 +521,7 @@ fn aggregate_latch(
     {
         return None;
     }
-    Some((call, const_i32(func, *modulus)?))
+    Some((call, const_i32(func, *modulus)?, spec.kind))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -582,7 +612,12 @@ fn apply_plan(func: &mut Function, plan: &AggregatePlan, helper_name: String) {
     }
 }
 
-fn build_grouped_helper(name: String, modulus_value: i32, cache_name: String) -> Function {
+fn build_grouped_helper(
+    name: String,
+    modulus_value: i32,
+    cache_name: String,
+    kind: RecurrenceKind,
+) -> Function {
     let mut func = Function::new(name, Type::I32);
     let limit = func.add_param("limit", Type::I32);
     let entry = func.entry;
@@ -621,7 +656,7 @@ fn build_grouped_helper(name: String, modulus_value: i32, cache_name: String) ->
     let two = get_or_add_i32_const(&mut func, 2);
     let three = get_or_add_i32_const(&mut func, 3);
     let four = get_or_add_i32_const(&mut func, 4);
-    let seven = get_or_add_i32_const(&mut func, 7);
+    let failure_value = get_or_add_i32_const(&mut func, kind.failure_value());
     let minus_one = get_or_add_i32_const(&mut func, -1);
     debug_assert!(modulus_value > 0);
     let modulus = get_or_add_i32_const(&mut func, modulus_value);
@@ -736,21 +771,31 @@ fn build_grouped_helper(name: String, modulus_value: i32, cache_name: String) ->
         Terminator::Branch {
             cond: three_fits,
             then_target: outcome,
-            else_target: odd_four,
+            else_target: if kind == RecurrenceKind::ThreeOnly {
+                failure
+            } else {
+                odd_four
+            },
         },
     );
-    let quadrupled = binary(&mut func, odd_four, BinaryOp::Imul, state, four);
-    let next_four = binary(&mut func, odd_four, BinaryOp::Iadd, quadrupled, one);
-    let four_depth = binary(&mut func, odd_four, BinaryOp::Iadd, depth, one);
-    let four_fits = compare(&mut func, odd_four, CmpOp::Le, next_four, limit);
-    func.set_terminator(
-        odd_four,
-        Terminator::Branch {
-            cond: four_fits,
-            then_target: outcome,
-            else_target: failure,
-        },
-    );
+    let four_transition = if kind == RecurrenceKind::ThreeThenFour {
+        let quadrupled = binary(&mut func, odd_four, BinaryOp::Imul, state, four);
+        let next_four = binary(&mut func, odd_four, BinaryOp::Iadd, quadrupled, one);
+        let four_depth = binary(&mut func, odd_four, BinaryOp::Iadd, depth, one);
+        let four_fits = compare(&mut func, odd_four, CmpOp::Le, next_four, limit);
+        func.set_terminator(
+            odd_four,
+            Terminator::Branch {
+                cond: four_fits,
+                then_target: outcome,
+                else_target: failure,
+            },
+        );
+        Some((next_four, four_depth))
+    } else {
+        func.set_terminator(odd_four, Terminator::Jump(failure));
+        None
+    };
     func.set_terminator(failure, Terminator::Jump(outcome_done));
     let outcome_value = func
         .append_inst(
@@ -856,7 +901,10 @@ fn build_grouped_helper(name: String, modulus_value: i32, cache_name: String) ->
         .append_inst(
             value_done,
             InstKind::Phi {
-                incomings: vec![(failed_value, seven), (successful_value, outcome_value)],
+                incomings: vec![
+                    (failed_value, failure_value),
+                    (successful_value, outcome_value),
+                ],
             },
             Some(Type::I32),
         )
@@ -930,26 +978,14 @@ fn build_grouped_helper(name: String, modulus_value: i32, cache_name: String) ->
         answer,
         vec![(entry, zero), (outer_latch, next_answer)],
     );
-    set_phi(
-        &mut func,
-        state,
-        vec![
-            (outer, odd),
-            (even, half_state),
-            (odd_three, next_three),
-            (odd_four, next_four),
-        ],
-    );
-    set_phi(
-        &mut func,
-        depth,
-        vec![
-            (outer, zero),
-            (even, even_depth),
-            (odd_three, three_depth),
-            (odd_four, four_depth),
-        ],
-    );
+    let mut state_incomings = vec![(outer, odd), (even, half_state), (odd_three, next_three)];
+    let mut depth_incomings = vec![(outer, zero), (even, even_depth), (odd_three, three_depth)];
+    if let Some((next_four, four_depth)) = four_transition {
+        state_incomings.push((odd_four, next_four));
+        depth_incomings.push((odd_four, four_depth));
+    }
+    set_phi(&mut func, state, state_incomings);
+    set_phi(&mut func, depth, depth_incomings);
     set_phi(
         &mut func,
         scaled,
@@ -1190,6 +1226,43 @@ fn cache_type() -> Type {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codegen::Target;
+    use crate::ir::lower::lower_program;
+    use crate::ir::pass::{run_pipeline_with_reduction_jam_factor, OptLevel, PassOptions};
+    use crate::parser::Parser;
+
+    fn optimize(source: &str) -> Module {
+        let mut module = lower_program(&Parser::new(source).parse_program()).unwrap();
+        let costs = Target::Riscv64.cost_model();
+        let options = PassOptions {
+            enable_simple_loop_unroll: costs.enable_simple_loop_unroll(),
+            enable_simple_loop_unroll_in_main: costs.enable_simple_loop_unroll_in_main(),
+            small_expr_inline_rounds: costs.small_expr_inline_rounds(),
+            cfg_inline_rounds: costs.cfg_inline_rounds(),
+            cfg_inline_global_loads: costs.cfg_inline_global_loads(),
+            cfg_inline_global_stores: costs.cfg_inline_global_stores(),
+            recursive_inline_rounds: costs.recursive_inline_rounds(),
+            enable_constant_address_count_reduction: costs
+                .enable_constant_address_count_reduction(),
+            enable_recursive_const_specialization: costs.enable_recursive_const_specialization(),
+            enable_initialized_global_propagation: costs.enable_initialized_global_propagation(),
+            enable_uniform_constant_arguments: costs.enable_uniform_constant_arguments(),
+            enable_loop_call_memoize: costs.enable_loop_call_memoize(),
+            enable_loop_invariant_call_memoize: costs.enable_loop_invariant_call_memoize(),
+            enable_regional_global_scalar_promotion: costs
+                .enable_regional_global_scalar_promotion(),
+            enable_full_domain_bitwise_digit: costs.enable_full_domain_bitwise_digit(),
+            enable_write_only_alloca_cleanup_before_inline: costs
+                .cleanup_write_only_allocas_before_inline(),
+        };
+        run_pipeline_with_reduction_jam_factor(
+            &mut module,
+            OptLevel::O1,
+            options,
+            costs.max_reduction_jam_factor(),
+        );
+        module
+    }
 
     #[test]
     fn grouped_helper_has_valid_ssa() {
@@ -1197,7 +1270,56 @@ mod tests {
             "__odd_chain_grouped_test".into(),
             1_000_000_007,
             "__odd_chain_cache_test".into(),
+            RecurrenceKind::ThreeThenFour,
         );
         assert!(helper.verify().is_ok(), "{:?}", helper.verify());
+
+        let simple = build_grouped_helper(
+            "__simple_odd_chain_grouped_test".into(),
+            1_000_000_007,
+            "__simple_odd_chain_cache_test".into(),
+            RecurrenceKind::ThreeOnly,
+        );
+        assert!(simple.verify().is_ok(), "{:?}", simple.verify());
+    }
+
+    #[test]
+    fn recognizes_a_bounded_three_only_chain_without_using_names() {
+        let source = r#"
+int boundary;
+int wander(int state, int depth) {
+    if (state == 1) return depth;
+    if (state % 2 == 0) return wander(state / 2, depth + 1);
+    if (state * 3 + 1 <= boundary) return wander(state * 3 + 1, depth + 1);
+    return 0;
+}
+const int modulus = 1000000007;
+int main() {
+    boundary = getint();
+    int answer = 0;
+    int index = 1;
+    while (index <= boundary) {
+        answer = (answer + wander(index, 0)) % modulus;
+        index = index + 1;
+    }
+    putint(answer);
+    return 0;
+}
+"#;
+        let optimized = optimize(source);
+        assert!(optimized
+            .funcs
+            .iter()
+            .any(|func| func.name.starts_with("__odd_chain_grouped_")));
+        assert!(optimized
+            .globals
+            .iter()
+            .any(|global| global.name.starts_with("__odd_chain_cache_")));
+
+        let rejected = optimize(&source.replace("return 0;\n}", "return 1;\n}"));
+        assert!(!rejected
+            .funcs
+            .iter()
+            .any(|func| func.name.starts_with("__odd_chain_grouped_")));
     }
 }

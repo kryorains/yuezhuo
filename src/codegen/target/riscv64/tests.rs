@@ -2,7 +2,7 @@ use super::emit_ir_asm;
 use super::regalloc::Riscv64FloatRegAlloc;
 use crate::codegen::common::{IrArgLocation, IrParamSig};
 use crate::ir::{
-    BinaryOp, CastOp, Const, Function, InstKind, Module, Terminator, Type, UnaryOp, ValueId,
+    BinaryOp, CastOp, CmpOp, Const, Function, InstKind, Module, Terminator, Type, UnaryOp, ValueId,
 };
 
 fn function_asm<'a>(asm: &'a str, name: &str) -> &'a str {
@@ -148,6 +148,278 @@ fn reduces_a_twice_bounded_signed_remainder_without_magic_division() {
     assert!(caller_asm.contains("  addiw t2, t2, 1\n"));
     assert!(caller_asm.contains("  slt t2,"));
     assert!(!caller_asm.contains("  srai t0, t0, 32\n"));
+}
+
+#[test]
+fn compresses_a_signed_even_halving_run_with_an_odd_fallback() {
+    let mut function = Function::new("halving", Type::I32);
+    let initial_state = function.add_param("state", Type::I32);
+    let initial_depth = function.add_param("depth", Type::I32);
+    let entry = function.entry;
+    let header = function.add_block("header");
+    let body = function.add_block("body");
+    let exit = function.add_block("exit");
+    let one = function.add_const(Const::Int(1));
+    let two = function.add_const(Const::Int(2));
+    let state = function
+        .append_inst(
+            header,
+            InstKind::Phi {
+                incomings: vec![(entry, initial_state)],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let depth = function
+        .append_inst(
+            header,
+            InstKind::Phi {
+                incomings: vec![(entry, initial_depth)],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let keep_going = function
+        .append_inst(
+            header,
+            InstKind::Icmp {
+                op: CmpOp::Ne,
+                lhs: state,
+                rhs: one,
+            },
+            Some(Type::I1),
+        )
+        .unwrap();
+    function.set_terminator(entry, Terminator::Jump(header));
+    function.set_terminator(
+        header,
+        Terminator::Branch {
+            cond: keep_going,
+            then_target: body,
+            else_target: exit,
+        },
+    );
+    let next_state = function
+        .append_inst(
+            body,
+            InstKind::Binary {
+                op: BinaryOp::Idiv,
+                lhs: state,
+                rhs: two,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let next_depth = function
+        .append_inst(
+            body,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: depth,
+                rhs: one,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    function.set_terminator(body, Terminator::Jump(header));
+    function.set_terminator(exit, Terminator::Return(Some(depth)));
+    let InstKind::Phi { incomings } = &mut function.blocks[header.0].insts[0].kind else {
+        panic!();
+    };
+    incomings.push((body, next_state));
+    let InstKind::Phi { incomings } = &mut function.blocks[header.0].insts[1].kind else {
+        panic!();
+    };
+    incomings.push((body, next_depth));
+    assert!(function.verify().is_ok());
+
+    let mut module = Module::new();
+    module.add_func(function);
+    let asm = emit_ir_asm(&module);
+    let asm = function_asm(&asm, "halving");
+    assert!(asm.contains("halving_run"));
+    assert!(asm.contains("halving_odd"));
+    assert!(asm.contains("  sraiw "));
+    assert!(asm.contains("  beqz t2, .L_halving_run"));
+    assert!(!asm.contains("  divw "));
+    assert!(!asm.contains("  fcvt.s.wu "));
+}
+
+#[test]
+fn compresses_a_proven_even_affine_backedge() {
+    let mut function = Function::new("odd_affine_halving", Type::I32);
+    let initial_state = function.add_param("state", Type::I32);
+    let initial_depth = function.add_param("depth", Type::I32);
+    let entry = function.entry;
+    let header = function.add_block("header");
+    let parity = function.add_block("parity");
+    let even_body = function.add_block("even");
+    let odd_body = function.add_block("odd");
+    let exit = function.add_block("exit");
+    let zero = function.add_const(Const::Int(0));
+    let one = function.add_const(Const::Int(1));
+    let two = function.add_const(Const::Int(2));
+    let three = function.add_const(Const::Int(3));
+    let state = function
+        .append_inst(
+            header,
+            InstKind::Phi {
+                incomings: vec![(entry, initial_state)],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let depth = function
+        .append_inst(
+            header,
+            InstKind::Phi {
+                incomings: vec![(entry, initial_depth)],
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let keep_going = function
+        .append_inst(
+            header,
+            InstKind::Icmp {
+                op: CmpOp::Ne,
+                lhs: state,
+                rhs: one,
+            },
+            Some(Type::I1),
+        )
+        .unwrap();
+    function.set_terminator(entry, Terminator::Jump(header));
+    function.set_terminator(
+        header,
+        Terminator::Branch {
+            cond: keep_going,
+            then_target: parity,
+            else_target: exit,
+        },
+    );
+    let low_bit = function
+        .append_inst(
+            parity,
+            InstKind::Binary {
+                op: BinaryOp::Iand,
+                lhs: state,
+                rhs: one,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let is_even = function
+        .append_inst(
+            parity,
+            InstKind::Icmp {
+                op: CmpOp::Eq,
+                lhs: low_bit,
+                rhs: zero,
+            },
+            Some(Type::I1),
+        )
+        .unwrap();
+    function.set_terminator(
+        parity,
+        Terminator::Branch {
+            cond: is_even,
+            then_target: even_body,
+            else_target: odd_body,
+        },
+    );
+    let divided = function
+        .append_inst(
+            even_body,
+            InstKind::Binary {
+                op: BinaryOp::Idiv,
+                lhs: state,
+                rhs: two,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let even_depth = function
+        .append_inst(
+            even_body,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: depth,
+                rhs: one,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    function.set_terminator(even_body, Terminator::Jump(header));
+    let product = function
+        .append_inst(
+            odd_body,
+            InstKind::Binary {
+                op: BinaryOp::Imul,
+                lhs: state,
+                rhs: three,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let affine = function
+        .append_inst(
+            odd_body,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: product,
+                rhs: one,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    let odd_depth = function
+        .append_inst(
+            odd_body,
+            InstKind::Binary {
+                op: BinaryOp::Iadd,
+                lhs: depth,
+                rhs: one,
+            },
+            Some(Type::I32),
+        )
+        .unwrap();
+    function.set_terminator(odd_body, Terminator::Jump(header));
+    function.set_terminator(exit, Terminator::Return(Some(depth)));
+    let InstKind::Phi { incomings } = &mut function.blocks[header.0].insts[0].kind else {
+        panic!();
+    };
+    incomings.extend([(even_body, divided), (odd_body, affine)]);
+    let InstKind::Phi { incomings } = &mut function.blocks[header.0].insts[1].kind else {
+        panic!();
+    };
+    incomings.extend([(even_body, even_depth), (odd_body, odd_depth)]);
+    assert!(function.verify().is_ok());
+
+    let mut ambiguous_entry = function.clone();
+    ambiguous_entry.name = "ambiguous_even_entry".into();
+    ambiguous_entry.blocks[odd_body.0].terminator = Some(Terminator::Jump(even_body));
+    for inst in &mut ambiguous_entry.blocks[header.0].insts {
+        if let InstKind::Phi { incomings } = &mut inst.kind {
+            incomings.retain(|(predecessor, _)| *predecessor != odd_body);
+        }
+    }
+    assert!(ambiguous_entry.verify().is_ok());
+
+    let mut module = Module::new();
+    module.add_func(function);
+    module.add_func(ambiguous_entry);
+    let asm = emit_ir_asm(&module);
+    let optimized = function_asm(&asm, "odd_affine_halving");
+    assert!(optimized.contains("known_even_halving"));
+    assert!(optimized.matches("  sraiw ").count() >= 2);
+    assert!(optimized.contains("  beqz t2, .L_known_even_halving"));
+    assert!(!optimized.contains("  divw "));
+    assert!(!optimized.contains("  fcvt.s.wu "));
+
+    let ambiguous = function_asm(&asm, "ambiguous_even_entry");
+    assert!(!ambiguous.contains("known_even_halving"));
+    assert!(ambiguous.contains("halving_odd"));
 }
 
 #[test]
