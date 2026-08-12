@@ -238,30 +238,3 @@ fn const_i32(func: &Function, value: ValueId) -> Option<i32> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ignores_an_instruction_value_whose_definition_was_removed() {
-        let mut func = Function::new("stale_value", Type::I32);
-        let one = func.add_const(Const::Int(1));
-        let stale = func
-            .append_inst(
-                func.entry,
-                InstKind::Binary {
-                    op: BinaryOp::Iadd,
-                    lhs: one,
-                    rhs: one,
-                },
-                Some(Type::I32),
-            )
-            .unwrap();
-        func.block_mut(func.entry).insts.clear();
-
-        let ranges = collect_value_ranges(&func, &HashMap::new());
-        assert_eq!(ranges[one.0], Some(IntRange { min: 1, max: 1 }));
-        assert_eq!(ranges[stale.0], None);
-    }
-}

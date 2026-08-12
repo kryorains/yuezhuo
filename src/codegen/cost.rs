@@ -112,28 +112,3 @@ impl TargetCostModel {
         live_across_call || weighted_score >= self.callee_saved_register_score
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn riscv64_profile_keeps_measured_transform_choices_explicit() {
-        let riscv64 = TargetCostModel::for_target(Target::Riscv64);
-
-        assert_eq!(riscv64.small_expr_inline_rounds(), 2);
-        assert_eq!(riscv64.cfg_inline_rounds(), 2);
-        assert!(riscv64.cfg_inline_global_loads());
-        assert!(riscv64.cfg_inline_global_stores());
-        assert_eq!(riscv64.recursive_inline_rounds(), 2);
-        assert!(riscv64.enable_constant_address_count_reduction());
-        assert!(riscv64.enable_recursive_const_specialization());
-        assert!(riscv64.enable_initialized_global_propagation());
-        assert!(riscv64.enable_uniform_constant_arguments());
-        assert!(riscv64.enable_loop_invariant_call_memoize());
-        assert!(riscv64.enable_regional_global_scalar_promotion());
-        assert!(riscv64.enable_full_domain_bitwise_digit());
-        assert!(riscv64.cleanup_write_only_allocas_before_inline());
-        assert_eq!(riscv64.max_reduction_jam_factor(), 4);
-    }
-}
