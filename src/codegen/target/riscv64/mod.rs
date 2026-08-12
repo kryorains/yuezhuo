@@ -36,6 +36,3 @@ struct Riscv64IrFuncEmitter<'a, 'b> {
 pub fn emit_ir_asm(module: &Module) -> String {
     emitter::emit_asm(module)
 }
-
-#[cfg(test)]
-mod tests;

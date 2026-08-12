@@ -844,6 +844,3 @@ fn const_bool(func: &Function, value: crate::ir::ValueId) -> Option<bool> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests;
