@@ -35,7 +35,6 @@ mod reduction_jam;
 mod regional_global_scalar;
 mod repeat_reduction;
 mod scalar_promote;
-mod simple_loop_unroll;
 mod simplify_cfg;
 mod small_loop_full_unroll;
 mod tail_recursion;
@@ -76,7 +75,6 @@ use reduction_jam::ReductionJamPass;
 use regional_global_scalar::{RegionalGlobalScalarPass, RegionalInvariantGlobalLoadPass};
 use repeat_reduction::RepeatReductionPass;
 use scalar_promote::ScalarPromotePass;
-use simple_loop_unroll::SimpleLoopUnrollPass;
 use simplify_cfg::SimplifyCfgPass;
 use small_loop_full_unroll::SmallLoopFullUnrollPass;
 use tail_recursion::TailRecursionPass;
@@ -89,8 +87,6 @@ pub enum OptLevel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PassOptions {
-    pub enable_simple_loop_unroll: bool,
-    pub enable_simple_loop_unroll_in_main: bool,
     pub small_expr_inline_rounds: usize,
     pub cfg_inline_rounds: usize,
     pub cfg_inline_global_loads: bool,
@@ -100,7 +96,6 @@ pub struct PassOptions {
     pub enable_recursive_const_specialization: bool,
     pub enable_initialized_global_propagation: bool,
     pub enable_uniform_constant_arguments: bool,
-    pub enable_loop_call_memoize: bool,
     pub enable_loop_invariant_call_memoize: bool,
     pub enable_regional_global_scalar_promotion: bool,
     pub enable_full_domain_bitwise_digit: bool,
@@ -204,11 +199,8 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(InvariantLoadForwardPass::new());
             pipeline.add(DcePass::new());
             pipeline.add(RepeatReductionPass::new());
-            if options.enable_loop_call_memoize {
-                pipeline.add(LoopCallMemoizePass::new());
-            }
             if options.enable_loop_invariant_call_memoize {
-                pipeline.add(LoopCallMemoizePass::new_invariant_calls());
+                pipeline.add(LoopCallMemoizePass::new());
             }
             if options.enable_regional_global_scalar_promotion {
                 pipeline.add(RegionalGlobalScalarPass::new());
@@ -217,20 +209,11 @@ pub fn run_pipeline_with_reduction_jam_factor(
             if options.enable_constant_address_count_reduction {
                 pipeline.add(ConstantAddressReductionPass::new());
             }
-            if options.enable_simple_loop_unroll {
-                pipeline.add(SimpleLoopUnrollPass::new(
-                    max_reduction_jam_factor,
-                    options.enable_simple_loop_unroll_in_main,
-                ));
-            }
             pipeline.add(LoopDivisionSpecializePass::new());
             pipeline.add(InstCombinePass::new());
             pipeline.add(ConstFoldPass::new());
             pipeline.add(LoopMemoryPromotionPass::new());
             pipeline.add(ScalarPromotePass::new());
-            // Run address strength reduction after transforms whose matching
-            // intentionally expects the source loop-phi set. In particular,
-            // this preserves the existing simple-unroll profitability gate.
             pipeline.add(GepInductionPass::new());
             // Canonicalize independently rebuilt affine starts before proving
             // constant distances between their pointer recurrences.

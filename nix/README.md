@@ -7,7 +7,7 @@ nix develop
 ```
 
 默认 Git 身份为 `kryorains <kryorains@kryorains.io>`。环境包含 Rust 工具链、
-x86_64/RISC-V64 Linux 交叉编译器，以及测试脚本依赖的 GNU 工具。
+RISC-V64 Linux 交叉编译器，以及测试脚本依赖的 GNU 工具。
 
 ## Linux 测试虚拟机
 
@@ -28,19 +28,18 @@ yuezhuo-vm down
 运行单个由项目交叉链接出的 Linux ELF：
 
 ```sh
-yuezhuo-vm run --target x86_64 target/test-work/example
 yuezhuo-vm run --target riscv64 target/test-work/example
 ```
 
 运行现有测试脚本：
 
 ```sh
-yuezhuo-vm test-functional x86_64
+yuezhuo-vm test-functional riscv64
 yuezhuo-vm test-perf riscv64
 ```
 
 VM 通过只读 9p 挂载宿主的 `/nix/store`，因此可以使用 Nix 交叉工具链的 glibc，
-也能在 guest 内使用 Linux 版 QEMU user-mode 执行 x86_64 和 RISC-V64 ELF。
+也能在 guest 内使用 Linux 版 QEMU user-mode 执行 RISC-V64 ELF。
 
 可通过以下环境变量调整运行参数：
 

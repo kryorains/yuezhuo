@@ -1261,8 +1261,6 @@ mod tests {
         let mut o1 = Module::new();
         o1.add_func(func);
         let options = PassOptions {
-            enable_simple_loop_unroll: false,
-            enable_simple_loop_unroll_in_main: false,
             small_expr_inline_rounds: 1,
             cfg_inline_rounds: 1,
             cfg_inline_global_loads: false,
@@ -1272,7 +1270,6 @@ mod tests {
             enable_recursive_const_specialization: false,
             enable_initialized_global_propagation: false,
             enable_uniform_constant_arguments: false,
-            enable_loop_call_memoize: false,
             enable_loop_invariant_call_memoize: false,
             enable_regional_global_scalar_promotion: false,
             enable_full_domain_bitwise_digit: false,

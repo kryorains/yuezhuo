@@ -17,7 +17,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <input.sysy> [output.s] [-S|--ir] [-o <out>] [-O0|-O1|-O2] [--target x86_64|riscv64] [--lex]",
+            "Usage: {} <input.sysy> [output.s] [-S|--ir] [-o <out>] [-O0|-O1|-O2] [--target riscv64] [--lex]",
             args[0]
         );
         process::exit(2);
@@ -115,8 +115,6 @@ fn main() {
     };
     let costs = target.cost_model();
     let pass_options = ir::pass::PassOptions {
-        enable_simple_loop_unroll: costs.enable_simple_loop_unroll(),
-        enable_simple_loop_unroll_in_main: costs.enable_simple_loop_unroll_in_main(),
         small_expr_inline_rounds: costs.small_expr_inline_rounds(),
         cfg_inline_rounds: costs.cfg_inline_rounds(),
         cfg_inline_global_loads: costs.cfg_inline_global_loads(),
@@ -126,7 +124,6 @@ fn main() {
         enable_recursive_const_specialization: costs.enable_recursive_const_specialization(),
         enable_initialized_global_propagation: costs.enable_initialized_global_propagation(),
         enable_uniform_constant_arguments: costs.enable_uniform_constant_arguments(),
-        enable_loop_call_memoize: costs.enable_loop_call_memoize(),
         enable_loop_invariant_call_memoize: costs.enable_loop_invariant_call_memoize(),
         enable_regional_global_scalar_promotion: costs.enable_regional_global_scalar_promotion(),
         enable_full_domain_bitwise_digit: costs.enable_full_domain_bitwise_digit(),
@@ -154,16 +151,11 @@ fn main() {
 
 fn parse_target(s: &str) -> codegen::Target {
     match s {
-        "x86_64" | "x86-64" | "amd64" => codegen::Target::X86_64,
         "riscv64" | "riscv64gc" => codegen::Target::Riscv64,
         _ => panic!("Unknown target: {}", s),
     }
 }
 
 fn default_target() -> codegen::Target {
-    match env::consts::ARCH {
-        "riscv64" => codegen::Target::Riscv64,
-        "x86_64" => codegen::Target::X86_64,
-        _ => codegen::Target::X86_64,
-    }
+    codegen::Target::Riscv64
 }

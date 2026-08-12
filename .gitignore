@@ -3,6 +3,5 @@
 /examples/*.s
 /examples/*.o
 /examples/*.riscv64
-/examples/*.x86
 
 *.pdf

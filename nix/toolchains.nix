@@ -38,14 +38,6 @@ in
 {
   inherit qemuUserAvailable;
 
-  x86_64 = mkLinuxToolchain {
-    name = "x86_64";
-    compatibilityPrefix = "x86_64-linux-gnu-";
-    crossPkgs = pkgs.pkgsCross.gnu64;
-    qemuBinary = "qemu-x86_64";
-    conventionalSysroot = "/usr/x86_64-linux-gnu";
-  };
-
   riscv64 = mkLinuxToolchain {
     name = "riscv64";
     compatibilityPrefix = "riscv64-linux-gnu-";

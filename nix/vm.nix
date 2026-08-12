@@ -236,7 +236,7 @@ pkgs.writeShellApplication {
     run_elf() {
       local target executable remote runner status remote_command
       [[ "''${1:-}" == --target && $# -eq 3 ]] || {
-        printf 'Usage: yuezhuo-vm run --target <x86_64|riscv64> <executable>\n' >&2
+        printf 'Usage: yuezhuo-vm run --target <riscv64> <executable>\n' >&2
         return 2
       }
       target=$2
@@ -252,9 +252,6 @@ pkgs.writeShellApplication {
 
       remote="/tmp/yuezhuo-$target-$$"
       case "$target" in
-        x86_64|x86-64|amd64)
-          runner=${linuxQemuUser}/bin/qemu-x86_64
-          ;;
         riscv64|riscv64gc)
           runner=${linuxQemuUser}/bin/qemu-riscv64
           ;;
@@ -334,7 +331,7 @@ pkgs.writeShellApplication {
         run_elf "$@"
         ;;
       test-functional)
-        target="''${2:-x86_64}"
+        target="''${2:-riscv64}"
         test_root="''${3:-$project_root/examples/functional}"
         up_vm
         TARGET="$target" \

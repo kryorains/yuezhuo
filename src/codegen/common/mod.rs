@@ -11,7 +11,7 @@ mod sig;
 mod types;
 mod value_uses;
 
-pub(crate) use abi::{assign_arg_locations, IrArgLocation};
+pub(crate) use abi::IrArgLocation;
 pub(crate) use call::resolve_call_sig;
 pub(crate) use cost::weighted_use_scores;
 pub(crate) use data::emit_ir_data_section;
