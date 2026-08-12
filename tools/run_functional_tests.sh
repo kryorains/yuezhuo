@@ -10,15 +10,27 @@ WORK_DIR=${WORK_DIR:-"/tmp/yuezhuo-functional-tests"}
 RUN_TIMEOUT=${RUN_TIMEOUT:-5s}
 COMPILER_FLAGS=${COMPILER_FLAGS:-}
 read -r -a compiler_flags <<< "$COMPILER_FLAGS"
+HOST_SYSTEM=$(uname -s)
+HOST_ARCH=$(uname -m)
 
 case "$TARGET" in
   x86_64|x86-64|amd64)
-    CC=${CC:-gcc}
-    RUNNER=${RUNNER:-}
+    if [[ "$HOST_SYSTEM" == Linux && "$HOST_ARCH" =~ ^(x86_64|amd64)$ ]]; then
+      CC=${CC:-gcc}
+      RUNNER=${RUNNER:-}
+    else
+      CC=${CC:-x86_64-linux-gnu-gcc}
+      RUNNER=${RUNNER:-"qemu-x86_64 -L /usr/x86_64-linux-gnu"}
+    fi
     ;;
   riscv64|riscv64gc)
-    CC=${CC:-riscv64-linux-gnu-gcc}
-    RUNNER=${RUNNER:-"qemu-riscv64 -L /usr/riscv64-linux-gnu"}
+    if [[ "$HOST_SYSTEM" == Linux && "$HOST_ARCH" =~ ^(riscv64|riscv64gc)$ ]]; then
+      CC=${CC:-gcc}
+      RUNNER=${RUNNER:-}
+    else
+      CC=${CC:-riscv64-linux-gnu-gcc}
+      RUNNER=${RUNNER:-"qemu-riscv64 -L /usr/riscv64-linux-gnu"}
+    fi
     ;;
   *)
     printf 'Unknown TARGET=%s\n' "$TARGET" >&2
@@ -78,7 +90,7 @@ while IFS= read -r sy; do
   if [[ -f "$input" ]]; then
     timeout "$RUN_TIMEOUT" "${runner_args[@]}" "$exe" <"$input" >"$actual" 2>>"$log"
   else
-    timeout "$RUN_TIMEOUT" "${runner_args[@]}" "$exe" >"$actual" 2>>"$log"
+    timeout "$RUN_TIMEOUT" "${runner_args[@]}" "$exe" </dev/null >"$actual" 2>>"$log"
   fi
   status=$?
 
