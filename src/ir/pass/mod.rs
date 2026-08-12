@@ -13,7 +13,6 @@ mod global_const_prop;
 mod global_scalar_localize;
 mod global_write_only;
 mod guarded_max_chain;
-mod guarded_modular_multiply;
 mod guarded_shift_dispatch;
 mod inline;
 mod inst_combine;
@@ -26,7 +25,6 @@ mod loop_call_memoize;
 mod loop_division_specialize;
 mod loop_memory_promotion;
 mod modular_recurrence;
-mod odd_chain_group;
 mod pointer_recurrence_coalesce;
 mod range_integer;
 mod recursive_inline;
@@ -54,7 +52,6 @@ use global_const_prop::GlobalConstPropPass;
 use global_scalar_localize::GlobalScalarLocalizePass;
 use global_write_only::GlobalWriteOnlyPass;
 use guarded_max_chain::GuardedMaxChainPass;
-use guarded_modular_multiply::GuardedModularMultiplyPass;
 use guarded_shift_dispatch::GuardedShiftDispatchPass;
 use inline::InlineSmallExprPass;
 use inst_combine::InstCombinePass;
@@ -66,7 +63,6 @@ use loop_call_memoize::LoopCallMemoizePass;
 use loop_division_specialize::LoopDivisionSpecializePass;
 use loop_memory_promotion::LoopMemoryPromotionPass;
 use modular_recurrence::ModularRecurrencePass;
-use odd_chain_group::OddChainGroupPass;
 use pointer_recurrence_coalesce::PointerRecurrenceCoalescePass;
 use range_integer::RangeIntegerSimplifyPass;
 use recursive_inline::{CfgInlinePass, RecursiveInlinePass};
@@ -148,7 +144,6 @@ pub fn run_pipeline_with_reduction_jam_factor(
             ));
             pipeline.add(GuardedShiftDispatchPass::new());
             pipeline.add(ModularRecurrencePass::new());
-            pipeline.add(GuardedModularMultiplyPass::new());
             pipeline.add(ConstSpecializePass::new(
                 options.enable_recursive_const_specialization,
                 options.enable_uniform_constant_arguments,
@@ -162,7 +157,6 @@ pub fn run_pipeline_with_reduction_jam_factor(
             } else {
                 pipeline.add(DcePass::preserving_write_only_allocas());
             }
-            pipeline.add(OddChainGroupPass::new());
             pipeline.add(RecursiveInlinePass::with_rounds(
                 options.recursive_inline_rounds,
             ));

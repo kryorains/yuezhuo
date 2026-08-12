@@ -29,9 +29,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 };
                 self.load_value_into(args[idx], &format!("a{}", reg_idx));
             }
-            if !self.emit_guarded_modular_multiply_call(name) {
-                self.body.push_str(&format!("  call {}\n", name));
-            }
+            self.body.push_str(&format!("  call {}\n", name));
             if sig.ret == Type::F32 {
                 if let Some(result) = result {
                     self.store_float_result(result, "fa0");
@@ -91,25 +89,5 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             self.adjust_sp(cleanup);
         }
         sig.ret
-    }
-
-    fn emit_guarded_modular_multiply_call(&mut self, name: &str) -> bool {
-        let Some(modulus) = self
-            .parent
-            .ctx
-            .module
-            .funcs
-            .iter()
-            .find(|func| func.name == name)
-            .and_then(|func| func.guarded_mulmod_modulus())
-        else {
-            return false;
-        };
-        let fallback = self.parent.ctx.fresh_label("modular_multiply_fallback");
-        let done = self.parent.ctx.fresh_label("modular_multiply_done");
-        self.body.push_str(&format!(
-            "  bltz a0, {fallback}\n  bltz a1, {fallback}\n  li t0, {modulus}\n  bge a0, t0, {fallback}\n  bge a1, t0, {fallback}\n  mul t1, a0, a1\n  rem a0, t1, t0\n  j {done}\n{fallback}:\n  call {name}\n{done}:\n"
-        ));
-        true
     }
 }
