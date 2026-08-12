@@ -1235,8 +1235,6 @@ mod tests {
         let mut module = lower_program(&Parser::new(source).parse_program()).unwrap();
         let costs = Target::Riscv64.cost_model();
         let options = PassOptions {
-            enable_simple_loop_unroll: costs.enable_simple_loop_unroll(),
-            enable_simple_loop_unroll_in_main: costs.enable_simple_loop_unroll_in_main(),
             small_expr_inline_rounds: costs.small_expr_inline_rounds(),
             cfg_inline_rounds: costs.cfg_inline_rounds(),
             cfg_inline_global_loads: costs.cfg_inline_global_loads(),
@@ -1247,7 +1245,6 @@ mod tests {
             enable_recursive_const_specialization: costs.enable_recursive_const_specialization(),
             enable_initialized_global_propagation: costs.enable_initialized_global_propagation(),
             enable_uniform_constant_arguments: costs.enable_uniform_constant_arguments(),
-            enable_loop_call_memoize: costs.enable_loop_call_memoize(),
             enable_loop_invariant_call_memoize: costs.enable_loop_invariant_call_memoize(),
             enable_regional_global_scalar_promotion: costs
                 .enable_regional_global_scalar_promotion(),

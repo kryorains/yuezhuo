@@ -59,7 +59,6 @@ pub struct Function {
     pub entry: BlockId,
     recursive_cfg_inline_decided: bool,
     reduction_jammed: bool,
-    simple_loop_unroll_decided: bool,
     guarded_mulmod_modulus: Option<i32>,
 }
 
@@ -101,7 +100,6 @@ impl Function {
             entry: BlockId(0),
             recursive_cfg_inline_decided: false,
             reduction_jammed: false,
-            simple_loop_unroll_decided: false,
             guarded_mulmod_modulus: None,
         };
         func.entry = func.add_block("entry");
@@ -244,14 +242,6 @@ impl Function {
 
     pub(crate) fn mark_reduction_jammed(&mut self) {
         self.reduction_jammed = true;
-    }
-
-    pub(crate) fn simple_loop_unroll_decided(&self) -> bool {
-        self.simple_loop_unroll_decided
-    }
-
-    pub(crate) fn mark_simple_loop_unroll_decided(&mut self) {
-        self.simple_loop_unroll_decided = true;
     }
 
     pub(crate) fn guarded_mulmod_modulus(&self) -> Option<i32> {

@@ -8,8 +8,6 @@ use super::Target;
 /// because an optimization has a different runtime price on each ISA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetCostModel {
-    simple_loop_unroll: bool,
-    simple_loop_unroll_main: bool,
     small_expr_inline_rounds: usize,
     cfg_inline_rounds: usize,
     cfg_inline_global_loads: bool,
@@ -19,11 +17,9 @@ pub struct TargetCostModel {
     recursive_const_specialization: bool,
     initialized_global_propagation: bool,
     uniform_constant_arguments: bool,
-    loop_call_memoize: bool,
     loop_invariant_call_memoize: bool,
     regional_global_scalar_promotion: bool,
     full_domain_bitwise_digit: bool,
-    contract_float_madd: bool,
     cleanup_write_only_allocas_before_inline: bool,
     max_reduction_jam_factor: usize,
     callee_saved_register_score: usize,
@@ -32,30 +28,7 @@ pub struct TargetCostModel {
 impl TargetCostModel {
     pub(super) const fn for_target(target: Target) -> Self {
         match target {
-            Target::X86_64 => Self {
-                simple_loop_unroll: true,
-                simple_loop_unroll_main: true,
-                small_expr_inline_rounds: 1,
-                cfg_inline_rounds: 1,
-                cfg_inline_global_loads: false,
-                cfg_inline_global_stores: false,
-                recursive_inline_rounds: 1,
-                constant_address_count_reduction: false,
-                recursive_const_specialization: false,
-                initialized_global_propagation: false,
-                uniform_constant_arguments: false,
-                loop_call_memoize: false,
-                loop_invariant_call_memoize: false,
-                regional_global_scalar_promotion: false,
-                full_domain_bitwise_digit: false,
-                contract_float_madd: false,
-                cleanup_write_only_allocas_before_inline: true,
-                max_reduction_jam_factor: 2,
-                callee_saved_register_score: 16,
-            },
             Target::Riscv64 => Self {
-                simple_loop_unroll: false,
-                simple_loop_unroll_main: false,
                 small_expr_inline_rounds: 2,
                 cfg_inline_rounds: 2,
                 cfg_inline_global_loads: true,
@@ -65,24 +38,14 @@ impl TargetCostModel {
                 recursive_const_specialization: true,
                 initialized_global_propagation: true,
                 uniform_constant_arguments: true,
-                loop_call_memoize: false,
                 loop_invariant_call_memoize: true,
                 regional_global_scalar_promotion: true,
                 full_domain_bitwise_digit: true,
-                contract_float_madd: false,
                 cleanup_write_only_allocas_before_inline: true,
                 max_reduction_jam_factor: 4,
                 callee_saved_register_score: 16,
             },
         }
-    }
-
-    pub const fn enable_simple_loop_unroll(self) -> bool {
-        self.simple_loop_unroll
-    }
-
-    pub const fn enable_simple_loop_unroll_in_main(self) -> bool {
-        self.simple_loop_unroll_main
     }
 
     pub const fn small_expr_inline_rounds(self) -> usize {
@@ -121,10 +84,6 @@ impl TargetCostModel {
         self.uniform_constant_arguments
     }
 
-    pub const fn enable_loop_call_memoize(self) -> bool {
-        self.loop_call_memoize
-    }
-
     pub const fn enable_loop_invariant_call_memoize(self) -> bool {
         self.loop_invariant_call_memoize
     }
@@ -135,10 +94,6 @@ impl TargetCostModel {
 
     pub const fn enable_full_domain_bitwise_digit(self) -> bool {
         self.full_domain_bitwise_digit
-    }
-
-    pub(crate) const fn contract_float_madd(self) -> bool {
-        self.contract_float_madd
     }
 
     pub const fn cleanup_write_only_allocas_before_inline(self) -> bool {
@@ -166,8 +121,6 @@ mod tests {
     fn riscv64_profile_keeps_measured_transform_choices_explicit() {
         let riscv64 = TargetCostModel::for_target(Target::Riscv64);
 
-        assert!(!riscv64.enable_simple_loop_unroll());
-        assert!(!riscv64.enable_simple_loop_unroll_in_main());
         assert_eq!(riscv64.small_expr_inline_rounds(), 2);
         assert_eq!(riscv64.cfg_inline_rounds(), 2);
         assert!(riscv64.cfg_inline_global_loads());
@@ -177,11 +130,9 @@ mod tests {
         assert!(riscv64.enable_recursive_const_specialization());
         assert!(riscv64.enable_initialized_global_propagation());
         assert!(riscv64.enable_uniform_constant_arguments());
-        assert!(!riscv64.enable_loop_call_memoize());
         assert!(riscv64.enable_loop_invariant_call_memoize());
         assert!(riscv64.enable_regional_global_scalar_promotion());
         assert!(riscv64.enable_full_domain_bitwise_digit());
-        assert!(!riscv64.contract_float_madd());
         assert!(riscv64.cleanup_write_only_allocas_before_inline());
         assert_eq!(riscv64.max_reduction_jam_factor(), 4);
     }

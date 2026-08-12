@@ -22,15 +22,6 @@ HOST_SYSTEM=$(uname -s)
 HOST_ARCH=$(uname -m)
 
 case "$TARGET" in
-  x86_64|x86-64|amd64)
-    if [[ "$HOST_SYSTEM" == Linux && "$HOST_ARCH" =~ ^(x86_64|amd64)$ ]]; then
-      CC=${CC:-gcc}
-      RUNNER=${RUNNER:-}
-    else
-      CC=${CC:-x86_64-linux-gnu-gcc}
-      RUNNER=${RUNNER:-"qemu-x86_64 -L /usr/x86_64-linux-gnu"}
-    fi
-    ;;
   riscv64|riscv64gc)
     if [[ "$HOST_SYSTEM" == Linux && "$HOST_ARCH" =~ ^(riscv64|riscv64gc)$ ]]; then
       CC=${CC:-gcc}

@@ -3,7 +3,7 @@ set -u
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=${1:-"$ROOT_DIR/examples/functional"}
-TARGET=${TARGET:-x86_64}
+TARGET=${TARGET:-riscv64}
 COMPILER=${COMPILER:-"$ROOT_DIR/target/debug/compiler"}
 RUNTIME=${RUNTIME:-"$ROOT_DIR/tools/sylib.c"}
 WORK_DIR=${WORK_DIR:-"/tmp/yuezhuo-functional-tests"}
@@ -14,15 +14,6 @@ HOST_SYSTEM=$(uname -s)
 HOST_ARCH=$(uname -m)
 
 case "$TARGET" in
-  x86_64|x86-64|amd64)
-    if [[ "$HOST_SYSTEM" == Linux && "$HOST_ARCH" =~ ^(x86_64|amd64)$ ]]; then
-      CC=${CC:-gcc}
-      RUNNER=${RUNNER:-}
-    else
-      CC=${CC:-x86_64-linux-gnu-gcc}
-      RUNNER=${RUNNER:-"qemu-x86_64 -L /usr/x86_64-linux-gnu"}
-    fi
-    ;;
   riscv64|riscv64gc)
     if [[ "$HOST_SYSTEM" == Linux && "$HOST_ARCH" =~ ^(riscv64|riscv64gc)$ ]]; then
       CC=${CC:-gcc}

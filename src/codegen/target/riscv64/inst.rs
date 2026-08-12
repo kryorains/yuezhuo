@@ -1,6 +1,5 @@
 use super::Riscv64IrFuncEmitter;
 use crate::codegen::common::signed_magic_positive;
-use crate::codegen::Target;
 use crate::ir::{
     BinaryOp, BlockId, CastOp, CmpOp, Const, Inst, InstKind, Terminator, Type, UnaryOp, ValueId,
     ValueKind,
@@ -147,30 +146,6 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
                 }
                 if *op == BinaryOp::Iadd && self.is_compressed_halving_add(result) {
                     return;
-                }
-                if Target::Riscv64.cost_model().contract_float_madd()
-                    && *op == BinaryOp::Fmul
-                    && self.fused_float_madd_user(result).is_some()
-                {
-                    return;
-                }
-                if Target::Riscv64.cost_model().contract_float_madd() && *op == BinaryOp::Fadd {
-                    if let Some((mul_lhs, mul_rhs, addend)) =
-                        self.fused_float_madd_operands(result, *lhs, *rhs)
-                    {
-                        let mul_lhs = self.load_or_assigned_float(mul_lhs, "fa2");
-                        let mul_rhs = self.load_or_assigned_float(mul_rhs, "fa1");
-                        let addend = self.load_or_assigned_float(addend, "fa0");
-                        let destination = self.assigned_float_reg(result).unwrap_or("fa0");
-                        self.body.push_str(&format!(
-                            "  fmadd.s {}, {}, {}, {}\n",
-                            destination, mul_lhs, mul_rhs, addend
-                        ));
-                        if self.assigned_float_reg(result).is_none() {
-                            self.store_float_result(result, destination);
-                        }
-                        return;
-                    }
                 }
                 if !self.emit_assigned_binary(result, *op, *lhs, *rhs) {
                     self.emit_binary(*op, *lhs, *rhs);
@@ -1017,52 +992,6 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         } else {
             self.load_float_value(value, scratch);
             scratch
-        }
-    }
-
-    fn fused_float_madd_user(&self, multiply: ValueId) -> Option<ValueId> {
-        if self.value_use_counts[multiply.0] != 1 {
-            return None;
-        }
-        let ValueKind::Inst(block, inst_idx) = self.func.value(multiply).kind else {
-            return None;
-        };
-        let next = self.func.block(block).insts.get(inst_idx + 1)?;
-        let result = next.result?;
-        matches!(
-            next.kind,
-            InstKind::Binary {
-                op: BinaryOp::Fadd,
-                lhs,
-                rhs,
-            } if lhs == multiply || rhs == multiply
-        )
-        .then_some(result)
-    }
-
-    fn fused_float_madd_operands(
-        &self,
-        add: ValueId,
-        lhs: ValueId,
-        rhs: ValueId,
-    ) -> Option<(ValueId, ValueId, ValueId)> {
-        let (multiply, addend) = if self.fused_float_madd_user(lhs) == Some(add) {
-            (lhs, rhs)
-        } else if self.fused_float_madd_user(rhs) == Some(add) {
-            (rhs, lhs)
-        } else {
-            return None;
-        };
-        let ValueKind::Inst(block, inst_idx) = self.func.value(multiply).kind else {
-            return None;
-        };
-        match self.func.block(block).insts.get(inst_idx)?.kind {
-            InstKind::Binary {
-                op: BinaryOp::Fmul,
-                lhs,
-                rhs,
-            } => Some((lhs, rhs, addend)),
-            _ => None,
         }
     }
 

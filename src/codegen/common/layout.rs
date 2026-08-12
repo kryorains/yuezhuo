@@ -12,10 +12,6 @@ pub(crate) struct IrFuncLayout {
 }
 
 impl IrFuncLayout {
-    pub(crate) fn new(func: &Function) -> Self {
-        Self::new_with_stack_slots(func, |_| true)
-    }
-
     /// Builds a compact frame for values that really need spill storage.
     ///
     /// `alloca` objects are always retained because the predicate describes the
