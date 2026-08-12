@@ -16,7 +16,6 @@ jobs:
       matrix:
         branch:
           - ci/riscv64
-          - ci/aarch64
     steps:
       - uses: actions/checkout@v4
         with:
