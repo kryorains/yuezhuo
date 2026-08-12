@@ -17,7 +17,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <input.sysy> [output.s] [-S|--ir] [-o <out>] [-O0|-O1|-O2] [--target x86_64|aarch64|riscv64] [--lex]",
+            "Usage: {} <input.sysy> [output.s] [-S|--ir] [-o <out>] [-O0|-O1|-O2] [--target x86_64|riscv64] [--lex]",
             args[0]
         );
         process::exit(2);
@@ -155,7 +155,6 @@ fn main() {
 fn parse_target(s: &str) -> codegen::Target {
     match s {
         "x86_64" | "x86-64" | "amd64" => codegen::Target::X86_64,
-        "aarch64" | "arm64" => codegen::Target::AArch64,
         "riscv64" | "riscv64gc" => codegen::Target::Riscv64,
         _ => panic!("Unknown target: {}", s),
     }
@@ -163,7 +162,6 @@ fn parse_target(s: &str) -> codegen::Target {
 
 fn default_target() -> codegen::Target {
     match env::consts::ARCH {
-        "aarch64" => codegen::Target::AArch64,
         "riscv64" => codegen::Target::Riscv64,
         "x86_64" => codegen::Target::X86_64,
         _ => codegen::Target::X86_64,

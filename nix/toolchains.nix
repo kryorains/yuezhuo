@@ -46,14 +46,6 @@ in
     conventionalSysroot = "/usr/x86_64-linux-gnu";
   };
 
-  aarch64 = mkLinuxToolchain {
-    name = "aarch64";
-    compatibilityPrefix = "aarch64-linux-gnu-";
-    crossPkgs = pkgs.pkgsCross.aarch64-multiplatform;
-    qemuBinary = "qemu-aarch64";
-    conventionalSysroot = "/usr/aarch64-linux-gnu";
-  };
-
   riscv64 = mkLinuxToolchain {
     name = "riscv64";
     compatibilityPrefix = "riscv64-linux-gnu-";

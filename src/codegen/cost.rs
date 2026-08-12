@@ -26,7 +26,6 @@ pub struct TargetCostModel {
     contract_float_madd: bool,
     cleanup_write_only_allocas_before_inline: bool,
     max_reduction_jam_factor: usize,
-    min_global_register_score: usize,
     callee_saved_register_score: usize,
 }
 
@@ -52,29 +51,6 @@ impl TargetCostModel {
                 contract_float_madd: false,
                 cleanup_write_only_allocas_before_inline: true,
                 max_reduction_jam_factor: 2,
-                min_global_register_score: 1,
-                callee_saved_register_score: 16,
-            },
-            Target::AArch64 => Self {
-                simple_loop_unroll: true,
-                simple_loop_unroll_main: false,
-                small_expr_inline_rounds: 1,
-                cfg_inline_rounds: 2,
-                cfg_inline_global_loads: true,
-                cfg_inline_global_stores: false,
-                recursive_inline_rounds: 2,
-                constant_address_count_reduction: false,
-                recursive_const_specialization: false,
-                initialized_global_propagation: true,
-                uniform_constant_arguments: true,
-                loop_call_memoize: true,
-                loop_invariant_call_memoize: false,
-                regional_global_scalar_promotion: false,
-                full_domain_bitwise_digit: true,
-                contract_float_madd: false,
-                cleanup_write_only_allocas_before_inline: false,
-                max_reduction_jam_factor: 4,
-                min_global_register_score: 2,
                 callee_saved_register_score: 16,
             },
             Target::Riscv64 => Self {
@@ -96,7 +72,6 @@ impl TargetCostModel {
                 contract_float_madd: false,
                 cleanup_write_only_allocas_before_inline: true,
                 max_reduction_jam_factor: 4,
-                min_global_register_score: 1,
                 callee_saved_register_score: 16,
             },
         }
@@ -174,19 +149,6 @@ impl TargetCostModel {
         self.max_reduction_jam_factor
     }
 
-    pub(crate) const fn should_allocate_global_register(
-        self,
-        weighted_score: usize,
-        is_phi: bool,
-        is_phi_copy: bool,
-        live_across_call: bool,
-    ) -> bool {
-        is_phi
-            || is_phi_copy
-            || live_across_call
-            || weighted_score >= self.min_global_register_score
-    }
-
     pub(crate) const fn should_use_callee_saved_register(
         self,
         weighted_score: usize,
@@ -201,20 +163,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_profiles_keep_measured_transform_differences_explicit() {
-        let aarch64 = TargetCostModel::for_target(Target::AArch64);
+    fn riscv64_profile_keeps_measured_transform_choices_explicit() {
         let riscv64 = TargetCostModel::for_target(Target::Riscv64);
 
-        assert!(aarch64.enable_simple_loop_unroll());
-        assert!(!aarch64.enable_simple_loop_unroll_in_main());
-        assert_eq!(aarch64.small_expr_inline_rounds(), 1);
-        assert_eq!(aarch64.cfg_inline_rounds(), 2);
-        assert!(aarch64.cfg_inline_global_loads());
-        assert!(!aarch64.cfg_inline_global_stores());
-        assert_eq!(aarch64.recursive_inline_rounds(), 2);
-        assert!(aarch64.enable_loop_call_memoize());
-        assert!(!aarch64.contract_float_madd());
-        assert!(!aarch64.cleanup_write_only_allocas_before_inline());
         assert!(!riscv64.enable_simple_loop_unroll());
         assert!(!riscv64.enable_simple_loop_unroll_in_main());
         assert_eq!(riscv64.small_expr_inline_rounds(), 2);
@@ -226,10 +177,6 @@ mod tests {
         assert!(riscv64.enable_recursive_const_specialization());
         assert!(riscv64.enable_initialized_global_propagation());
         assert!(riscv64.enable_uniform_constant_arguments());
-        assert!(aarch64.enable_initialized_global_propagation());
-        assert!(aarch64.enable_uniform_constant_arguments());
-        assert!(aarch64.enable_full_domain_bitwise_digit());
-        assert_eq!(aarch64.max_reduction_jam_factor(), 4);
         assert!(!riscv64.enable_loop_call_memoize());
         assert!(riscv64.enable_loop_invariant_call_memoize());
         assert!(riscv64.enable_regional_global_scalar_promotion());
@@ -237,14 +184,5 @@ mod tests {
         assert!(!riscv64.contract_float_madd());
         assert!(riscv64.cleanup_write_only_allocas_before_inline());
         assert_eq!(riscv64.max_reduction_jam_factor(), 4);
-    }
-
-    #[test]
-    fn phi_copy_savings_can_pay_for_a_cold_global_register() {
-        let aarch64 = TargetCostModel::for_target(Target::AArch64);
-
-        assert!(!aarch64.should_allocate_global_register(1, false, false, false));
-        assert!(aarch64.should_allocate_global_register(1, false, true, false));
-        assert!(aarch64.should_allocate_global_register(1, false, false, true));
     }
 }

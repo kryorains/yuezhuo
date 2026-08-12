@@ -7,7 +7,7 @@ nix develop
 ```
 
 默认 Git 身份为 `kryorains <kryorains@kryorains.io>`。环境包含 Rust 工具链、
-x86_64/AArch64/RISC-V64 Linux 交叉编译器，以及测试脚本依赖的 GNU 工具。
+x86_64/RISC-V64 Linux 交叉编译器，以及测试脚本依赖的 GNU 工具。
 
 ## Linux 测试虚拟机
 
@@ -28,7 +28,6 @@ yuezhuo-vm down
 运行单个由项目交叉链接出的 Linux ELF：
 
 ```sh
-yuezhuo-vm run --target aarch64 target/test-work/example
 yuezhuo-vm run --target x86_64 target/test-work/example
 yuezhuo-vm run --target riscv64 target/test-work/example
 ```
@@ -36,7 +35,6 @@ yuezhuo-vm run --target riscv64 target/test-work/example
 运行现有测试脚本：
 
 ```sh
-yuezhuo-vm test-functional aarch64
 yuezhuo-vm test-functional x86_64
 yuezhuo-vm test-perf riscv64
 ```

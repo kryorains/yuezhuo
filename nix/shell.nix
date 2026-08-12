@@ -31,7 +31,6 @@ pkgs.mkShell {
     pkgs.stdenv.cc
     linuxVm
     toolchains.x86_64
-    toolchains.aarch64
     toolchains.riscv64
   ]
   ++ lib.optionals rustupAvailable [ pkgs.rustup ];
@@ -47,9 +46,9 @@ pkgs.mkShell {
     unset CC CXX
 
     echo "Rust: $(rustc --version)"
-    echo "Linux cross-compilers: x86_64, aarch64, riscv64"
+    echo "Linux cross-compilers: x86_64, riscv64"
     ${lib.optionalString toolchains.qemuUserAvailable ''
-      echo "QEMU user-mode runners: x86_64, aarch64, riscv64"
+      echo "QEMU user-mode runners: x86_64, riscv64"
     ''}
     ${lib.optionalString (!toolchains.qemuUserAvailable) ''
       echo "QEMU user-mode runners: use yuezhuo-vm on ${pkgs.stdenv.hostPlatform.system}"
