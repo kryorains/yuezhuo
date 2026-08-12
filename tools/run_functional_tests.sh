@@ -16,10 +16,6 @@ case "$TARGET" in
     CC=${CC:-gcc}
     RUNNER=${RUNNER:-}
     ;;
-  aarch64|arm64)
-    CC=${CC:-aarch64-linux-gnu-gcc}
-    RUNNER=${RUNNER:-"qemu-aarch64 -L /usr/aarch64-linux-gnu"}
-    ;;
   riscv64|riscv64gc)
     CC=${CC:-riscv64-linux-gnu-gcc}
     RUNNER=${RUNNER:-"qemu-riscv64 -L /usr/riscv64-linux-gnu"}

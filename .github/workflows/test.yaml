@@ -28,10 +28,6 @@ jobs:
           - target: riscv64
             toolchain: gcc-riscv64-linux-gnu
             test-directory: perf-riscv64
-          - target: aarch64
-            toolchain: gcc-aarch64-linux-gnu
-            test-directory: perf-aarch64
-
     steps:
       - name: Check out source
         uses: actions/checkout@v4

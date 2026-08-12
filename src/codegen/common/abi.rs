@@ -4,7 +4,7 @@ use super::sig::IrParamSig;
 
 /// 目标 ABI 中一个实参最终被放置的位置。
 ///
-/// 目前三个后端都采用“整型/指针寄存器”和“浮点寄存器”两条独立通道；
+/// 目前两个后端都采用“整型/指针寄存器”和“浮点寄存器”两条独立通道；
 /// 超出寄存器数量后，剩余参数落到调用栈上。因此这里可以作为公共逻辑，
 /// 各目标只需要把 `usize` 映射到自己的物理寄存器名称即可。
 #[derive(Debug, Clone, Copy)]
@@ -21,8 +21,8 @@ pub(crate) enum IrArgLocation {
 /// - 其他标量类型走整型寄存器通道；
 /// - 对应通道的寄存器耗尽后改走栈。
 ///
-/// x86_64、AArch64 和 RISC-V64 在“通道选择”上相同，只是寄存器个数和名字不同，
-/// 所以把这段重复逻辑放在 common 里，避免三个 abi.rs/call.rs 各维护一份。
+/// x86_64 和 RISC-V64 在“通道选择”上相同，只是寄存器个数和名字不同，
+/// 所以把这段重复逻辑放在 common 里，避免两个 abi.rs/call.rs 各维护一份。
 pub(crate) fn assign_arg_locations(
     arg_sigs: &[IrParamSig],
     int_reg_count: usize,
