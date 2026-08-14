@@ -191,7 +191,8 @@ impl ExprKey {
             | InstKind::Alloca { .. }
             | InstKind::Load { .. }
             | InstKind::Store { .. }
-            | InstKind::MemZero { .. } => None,
+            | InstKind::MemZero { .. }
+            | InstKind::MemCopy { .. } => None,
         }
     }
 }
@@ -238,7 +239,8 @@ fn potential_key_operands(func: &Function, result: ValueId, kind: &InstKind) -> 
         | InstKind::Alloca { .. }
         | InstKind::Load { .. }
         | InstKind::Store { .. }
-        | InstKind::MemZero { .. } => None,
+        | InstKind::MemZero { .. }
+        | InstKind::MemCopy { .. } => None,
     }
 }
 

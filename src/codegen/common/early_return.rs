@@ -6,7 +6,7 @@ use std::collections::HashSet;
 // the original entry-to-slow phi copies before bypassing the duplicated guard.
 const MAX_GUARD_VALUES: usize = 12;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum EarlyReturnResult {
     Void,
     Direct(ValueId),
@@ -14,6 +14,10 @@ pub(crate) enum EarlyReturnResult {
         op: BinaryOp,
         lhs: ValueId,
         rhs: ValueId,
+    },
+    Expression {
+        block: BlockId,
+        result: ValueId,
     },
 }
 
@@ -24,8 +28,9 @@ pub(crate) struct ChainedEntryEarlyReturn {
     pub(crate) guard_block: BlockId,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct EntryEarlyReturn {
+    pub(crate) guard_block: BlockId,
     pub(crate) condition: ValueId,
     pub(crate) fast_when_true: bool,
     pub(crate) fast_block: BlockId,
@@ -33,6 +38,7 @@ pub(crate) struct EntryEarlyReturn {
     pub(crate) slow_block: BlockId,
     pub(crate) chained: Option<ChainedEntryEarlyReturn>,
     pub(crate) result: EarlyReturnResult,
+    pub(crate) entry_phi_values: Vec<(ValueId, ValueId)>,
 }
 
 /// Finds one guarded, register-only return that can execute before the prologue.
@@ -40,6 +46,10 @@ pub(crate) fn entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
     if !matches!(func.ret, Type::Void | Type::I32) || has_predecessor(func, func.entry) {
         return None;
     }
+    branch_entry_early_return(func).or_else(|| jump_entry_early_return(func))
+}
+
+fn branch_entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
     let entry = &func.blocks[func.entry.0];
     let Terminator::Branch {
         cond,
@@ -73,7 +83,7 @@ pub(crate) fn entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
         let Some(result) = early_result(func, fast_block) else {
             continue;
         };
-        let chained = chained_early_return(func, slow_block, fast_block, result);
+        let chained = chained_early_return(func, slow_block, fast_block, &result);
         let final_slow_block = chained.map_or(slow_block, |chain| {
             let Terminator::Branch {
                 then_target,
@@ -97,6 +107,7 @@ pub(crate) fn entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
             skipped_predecessors.insert(chain.guard_block);
         }
         return Some(EntryEarlyReturn {
+            guard_block: func.entry,
             condition: *cond,
             fast_when_true,
             fast_block,
@@ -104,9 +115,252 @@ pub(crate) fn entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
             slow_block: final_slow_block,
             chained,
             result,
+            entry_phi_values: Vec::new(),
         });
     }
     None
+}
+
+/// Recognizes an empty entry that feeds initial values into a loop-header
+/// guard with a small pure return on one edge. Tail-recursion elimination
+/// commonly creates this shape. Duplicating the initial guard and result before
+/// the prologue is standard shrink-wrapping; the framed path retains the
+/// original header and all loop backedges.
+fn jump_entry_early_return(func: &Function) -> Option<EntryEarlyReturn> {
+    const MAX_FAST_EXPRESSION_INSTRUCTIONS: usize = 6;
+
+    let entry = &func.blocks[func.entry.0];
+    let Terminator::Jump(guard_block) = entry.terminator.as_ref()? else {
+        return None;
+    };
+    if *guard_block == func.entry
+        || entry
+            .insts
+            .iter()
+            .any(|inst| !matches!(inst.kind, InstKind::Nop | InstKind::Alloca { .. }))
+    {
+        return None;
+    }
+    let guard = &func.blocks[guard_block.0];
+    let Terminator::Branch {
+        cond,
+        then_target,
+        else_target,
+    } = guard.terminator.as_ref()?
+    else {
+        return None;
+    };
+
+    let mut entry_phi_values = Vec::new();
+    for inst in &guard.insts {
+        let (Some(phi), InstKind::Phi { incomings }) = (inst.result, &inst.kind) else {
+            continue;
+        };
+        let mut entering = incomings
+            .iter()
+            .filter_map(|(pred, value)| (*pred == func.entry).then_some(*value));
+        let initial = entering.next()?;
+        if entering.next().is_some()
+            || !matches!(func.value(initial).ty, Type::I1 | Type::I32)
+            || !matches!(
+                func.value(initial).kind,
+                ValueKind::Param | ValueKind::Const(_)
+            )
+        {
+            return None;
+        }
+        entry_phi_values.push((phi, initial));
+    }
+    if entry_phi_values.is_empty() {
+        return None;
+    }
+
+    let mut guard_values = HashSet::new();
+    if !collect_guard_values_with_phi_inputs(
+        func,
+        *guard_block,
+        *cond,
+        &entry_phi_values,
+        &mut guard_values,
+    ) || guard_values.len() > MAX_GUARD_VALUES
+        || guard.insts.iter().any(|inst| {
+            !matches!(inst.kind, InstKind::Nop | InstKind::Phi { .. })
+                && inst
+                    .result
+                    .is_none_or(|result| !guard_values.contains(&result))
+        })
+    {
+        return None;
+    }
+
+    for (fast_when_true, fast_block, slow_block) in [
+        (true, *then_target, *else_target),
+        (false, *else_target, *then_target),
+    ] {
+        if fast_block == slow_block || !has_only_predecessor(func, fast_block, *guard_block) {
+            continue;
+        }
+        let Some(result) = expression_result(
+            func,
+            fast_block,
+            &entry_phi_values,
+            MAX_FAST_EXPRESSION_INSTRUCTIONS,
+        ) else {
+            continue;
+        };
+        return Some(EntryEarlyReturn {
+            guard_block: *guard_block,
+            condition: *cond,
+            fast_when_true,
+            fast_block,
+            // Retain the original fast block for loop iterations. Only the
+            // initial entry edge is shrink-wrapped.
+            fast_block_exclusive: false,
+            slow_block,
+            chained: None,
+            result,
+            entry_phi_values,
+        });
+    }
+    None
+}
+
+fn collect_guard_values_with_phi_inputs(
+    func: &Function,
+    owner: BlockId,
+    value: ValueId,
+    phi_inputs: &[(ValueId, ValueId)],
+    values: &mut HashSet<ValueId>,
+) -> bool {
+    if phi_inputs.iter().any(|(phi, _)| *phi == value) {
+        return true;
+    }
+    if values.contains(&value) {
+        return true;
+    }
+    if values.len() >= MAX_GUARD_VALUES {
+        return false;
+    }
+    values.insert(value);
+    match func.value(value).kind {
+        ValueKind::Param | ValueKind::Const(_) => {
+            matches!(func.value(value).ty, Type::I1 | Type::I32)
+        }
+        ValueKind::Inst(block, inst_idx) if block == owner => {
+            let Some(inst) = func.blocks[block.0].insts.get(inst_idx) else {
+                return false;
+            };
+            if inst.result != Some(value) {
+                return false;
+            }
+            match inst.kind {
+                InstKind::Icmp { lhs, rhs, .. }
+                | InstKind::Binary {
+                    op:
+                        BinaryOp::And
+                        | BinaryOp::Or
+                        | BinaryOp::Iand
+                        | BinaryOp::Ior
+                        | BinaryOp::Ixor
+                        | BinaryOp::Iadd
+                        | BinaryOp::Isub,
+                    lhs,
+                    rhs,
+                } => {
+                    collect_guard_values_with_phi_inputs(func, owner, lhs, phi_inputs, values)
+                        && collect_guard_values_with_phi_inputs(
+                            func, owner, rhs, phi_inputs, values,
+                        )
+                }
+                InstKind::Unary {
+                    op: crate::ir::UnaryOp::Not,
+                    value,
+                } => collect_guard_values_with_phi_inputs(func, owner, value, phi_inputs, values),
+                _ => false,
+            }
+        }
+        ValueKind::Inst(_, _) | ValueKind::Global(_) => false,
+    }
+}
+
+fn expression_result(
+    func: &Function,
+    block: BlockId,
+    phi_inputs: &[(ValueId, ValueId)],
+    max_instructions: usize,
+) -> Option<EarlyReturnResult> {
+    let owner = &func.blocks[block.0];
+    let Terminator::Return(Some(result)) = owner.terminator.as_ref()? else {
+        return None;
+    };
+    let active = owner
+        .insts
+        .iter()
+        .filter(|inst| !matches!(inst.kind, InstKind::Nop))
+        .collect::<Vec<_>>();
+    if active.is_empty() && expression_operand_available(func, block, *result, phi_inputs) {
+        return Some(EarlyReturnResult::Expression {
+            block,
+            result: *result,
+        });
+    }
+    if active.len() > max_instructions {
+        return None;
+    }
+    let mut available = phi_inputs
+        .iter()
+        .map(|(phi, _)| *phi)
+        .collect::<HashSet<_>>();
+    available.extend(func.params.iter().copied());
+    available.extend(func.values.iter().enumerate().filter_map(|(idx, value)| {
+        matches!(value.kind, ValueKind::Const(_)).then_some(ValueId(idx))
+    }));
+    for inst in active {
+        let (Some(inst_result), InstKind::Binary { op, lhs, rhs }) = (inst.result, &inst.kind)
+        else {
+            return None;
+        };
+        if func.value(inst_result).ty != Type::I32
+            || !matches!(
+                *op,
+                BinaryOp::Iadd
+                    | BinaryOp::Isub
+                    | BinaryOp::Imul
+                    | BinaryOp::Idiv
+                    | BinaryOp::Imod
+                    | BinaryOp::Iand
+                    | BinaryOp::Ior
+                    | BinaryOp::Ixor
+                    | BinaryOp::Ishl
+                    | BinaryOp::Iashr
+            )
+            || !available.contains(lhs)
+            || !available.contains(rhs)
+        {
+            return None;
+        }
+        available.insert(inst_result);
+    }
+    available
+        .contains(result)
+        .then_some(EarlyReturnResult::Expression {
+            block,
+            result: *result,
+        })
+}
+
+fn expression_operand_available(
+    func: &Function,
+    block: BlockId,
+    value: ValueId,
+    phi_inputs: &[(ValueId, ValueId)],
+) -> bool {
+    phi_inputs.iter().any(|(phi, _)| *phi == value)
+        || matches!(
+            func.value(value).kind,
+            ValueKind::Param | ValueKind::Const(_)
+        )
+        || matches!(func.value(value).kind, ValueKind::Inst(owner, _) if owner == block)
 }
 
 fn collect_guard_values(
@@ -196,7 +450,7 @@ fn chained_early_return(
     func: &Function,
     guard_block: BlockId,
     fast_block: BlockId,
-    result: EarlyReturnResult,
+    result: &EarlyReturnResult,
 ) -> Option<ChainedEntryEarlyReturn> {
     if !has_only_predecessor(func, guard_block, func.entry) {
         return None;
@@ -217,7 +471,7 @@ fn chained_early_return(
     } else {
         return None;
     };
-    if early_result(func, fast_block)? != result {
+    if &early_result(func, fast_block)? != result {
         return None;
     }
     let mut guard_values = HashSet::new();

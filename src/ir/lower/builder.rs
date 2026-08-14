@@ -31,8 +31,15 @@ impl<'a> FunctionLowerer<'a> {
 
     pub(super) fn memzero(&mut self, ptr: ValueId, bytes: usize) {
         if bytes != 0 {
-            self.func
-                .append_inst(self.current, InstKind::MemZero { ptr, bytes }, None);
+            self.func.append_inst(
+                self.current,
+                InstKind::MemZero {
+                    ptr,
+                    bytes,
+                    count: None,
+                },
+                None,
+            );
         }
     }
 

@@ -33,7 +33,7 @@ fn promote_function(func: &mut Function) {
     let cfg = ControlFlowGraph::new(func);
     let reachable = reachable_blocks(func, &cfg);
     let dom = Dominators::new(func, &cfg);
-    let candidates = collect_candidates(func, &reachable, &dom);
+    let candidates = collect_candidates(func, &cfg, &reachable);
     if candidates.is_empty() {
         return;
     }
@@ -110,8 +110,8 @@ fn reachable_blocks(func: &Function, cfg: &ControlFlowGraph) -> HashSet<BlockId>
 
 fn collect_candidates(
     func: &Function,
+    cfg: &ControlFlowGraph,
     reachable: &HashSet<BlockId>,
-    dom: &Dominators,
 ) -> Vec<ValueId> {
     // 候选必须是标量 alloca，且地址不能逃逸，只能被 load/store 以受控方式访问。
     let mut candidates = Vec::new();
@@ -124,7 +124,7 @@ fn collect_candidates(
         if info.rejected || info.loads.is_empty() || info.stores.is_empty() {
             continue;
         }
-        if !loads_are_defined(func, alloca, &info, dom) {
+        if !loads_are_defined(func, alloca, &info, cfg, reachable) {
             continue;
         }
         candidates.push(alloca);
@@ -214,7 +214,10 @@ fn inst_uses_value_as_escape(kind: &InstKind, value: ValueId) -> bool {
         InstKind::Nop | InstKind::Alloca { .. } => false,
         InstKind::Load { ptr } => *ptr == value,
         InstKind::Store { ptr, value: stored } => *ptr == value || *stored == value,
-        InstKind::MemZero { ptr, .. } => *ptr == value,
+        InstKind::MemZero { ptr, count, .. } => *ptr == value || *count == Some(value),
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => *dst == value || *src == value || *count == value,
         InstKind::Phi { incomings } => incomings.iter().any(|(_, incoming)| *incoming == value),
         InstKind::Unary { value: operand, .. } | InstKind::Cast { value: operand, .. } => {
             *operand == value
@@ -238,28 +241,59 @@ fn loads_are_defined(
     func: &Function,
     alloca: ValueId,
     info: &CandidateInfo,
-    dom: &Dominators,
+    cfg: &ControlFlowGraph,
+    reachable: &HashSet<BlockId>,
 ) -> bool {
-    // 保证每个 load 在所有可见路径上至少能看到一个先前 store，避免读未定义值。
-    for (load_block, load_idx) in &info.loads {
-        let mut defined = false;
-        for (store_block, store_idx) in &info.stores {
-            if store_block == load_block {
-                if store_idx < load_idx {
-                    defined = true;
-                    break;
-                }
-            } else if dom.dominates(*store_block, *load_block) {
-                defined = true;
-                break;
+    // Definite-assignment is a forward must analysis. Unlike requiring one
+    // store to dominate a load, this also proves the standard case where all
+    // arms of a conditional assign the variable before merging.
+    let mut defined_in = vec![true; func.blocks.len()];
+    let mut defined_out = vec![true; func.blocks.len()];
+    defined_in[func.entry.0] = false;
+    defined_out[func.entry.0] = block_stores_alloca(func, func.entry, alloca);
+    loop {
+        let mut changed = false;
+        for block_idx in 0..func.blocks.len() {
+            let block = BlockId(block_idx);
+            if block == func.entry || !reachable.contains(&block) {
+                continue;
+            }
+            let reachable_preds = cfg.preds[block_idx]
+                .iter()
+                .copied()
+                .filter(|pred| reachable.contains(pred))
+                .collect::<Vec<_>>();
+            let new_in = !reachable_preds.is_empty()
+                && reachable_preds.iter().all(|pred| defined_out[pred.0]);
+            let new_out = new_in || block_stores_alloca(func, block, alloca);
+            if defined_in[block_idx] != new_in || defined_out[block_idx] != new_out {
+                defined_in[block_idx] = new_in;
+                defined_out[block_idx] = new_out;
+                changed = true;
             }
         }
-        if !defined {
+        if !changed {
+            break;
+        }
+    }
+
+    for (load_block, load_idx) in &info.loads {
+        let locally_defined = func.blocks[load_block.0].insts[..*load_idx]
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::Store { ptr, .. } if ptr == alloca));
+        if !defined_in[load_block.0] && !locally_defined {
             return false;
         }
     }
 
     promoted_type(func, alloca).is_some()
+}
+
+fn block_stores_alloca(func: &Function, block: BlockId, alloca: ValueId) -> bool {
+    func.blocks[block.0]
+        .insts
+        .iter()
+        .any(|inst| matches!(inst.kind, InstKind::Store { ptr, .. } if ptr == alloca))
 }
 
 fn insert_phis(

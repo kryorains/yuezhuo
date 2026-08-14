@@ -1801,6 +1801,7 @@ fn remap_pure_kind(kind: &InstKind, values: &HashMap<ValueId, ValueId>) -> Optio
         | InstKind::Alloca { .. }
         | InstKind::Store { .. }
         | InstKind::MemZero { .. }
+        | InstKind::MemCopy { .. }
         | InstKind::Call { .. } => None,
     }
 }
@@ -2047,6 +2048,7 @@ fn is_reorderable_pure_kind(kind: &InstKind, allow_load: bool) -> bool {
         | InstKind::Alloca { .. }
         | InstKind::Store { .. }
         | InstKind::MemZero { .. }
+        | InstKind::MemCopy { .. }
         | InstKind::Call { .. } => false,
     }
 }
@@ -2069,7 +2071,8 @@ fn has_only_one_store_side_effect(func: &Function, block: BlockId) -> bool {
             | InstKind::Load { .. }
             | InstKind::Binary { .. }
             | InstKind::Call { .. }
-            | InstKind::MemZero { .. } => return false,
+            | InstKind::MemZero { .. }
+            | InstKind::MemCopy { .. } => return false,
         }
     }
     stores == 1
@@ -2546,7 +2549,13 @@ fn block_operands_cloneable(
 fn instruction_operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. }

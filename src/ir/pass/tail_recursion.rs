@@ -1,5 +1,8 @@
 use super::ModulePass;
-use crate::ir::{BlockId, Function, Inst, InstKind, Module, Terminator, Type, ValueId, ValueKind};
+use crate::ir::{
+    BinaryOp, BlockId, Const, Function, Inst, InstKind, Module, Terminator, Type, ValueId,
+    ValueKind,
+};
 use std::collections::HashSet;
 
 pub(super) struct TailRecursionPass;
@@ -23,27 +26,69 @@ struct TailCallSite {
     block: BlockId,
     call_idx: usize,
     args: Vec<ValueId>,
+    accumulation: Option<Accumulation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Accumulation {
+    combine_idx: usize,
+    contribution: ValueId,
 }
 
 fn eliminate_tail_recursion(func: &mut Function) {
-    if collect_tail_self_calls(func).is_empty() {
+    let initial_sites = collect_tail_self_calls(func);
+    if initial_sites.is_empty() {
         return;
     }
 
     let Some(param_slots) = collect_param_slots(func) else {
         return;
     };
-    let loop_entry = split_entry(func, &param_slots);
+    let accumulator =
+        if initial_sites.iter().any(|site| site.accumulation.is_some()) && func.ret == Type::I32 {
+            let zero = func.add_const(Const::Int(0));
+            let slot = func
+                .append_inst(
+                    func.entry,
+                    InstKind::Alloca { ty: Type::I32 },
+                    Some(Type::Ptr(Box::new(Type::I32))),
+                )
+                .expect("an accumulator alloca must produce a pointer");
+            func.append_inst(
+                func.entry,
+                InstKind::Store {
+                    ptr: slot,
+                    value: zero,
+                },
+                None,
+            );
+            Some((slot, zero))
+        } else {
+            None
+        };
+    let loop_entry = split_entry(func, &param_slots, accumulator);
     let mut sites = collect_tail_self_calls(func);
     if sites.is_empty() {
         return;
     }
 
-    sites.sort_by_key(|site| (site.block.0, site.call_idx));
-    for site in sites.into_iter().rev() {
-        rewrite_tail_call(func, &param_slots, loop_entry, site);
+    if let Some((accumulator, _)) = accumulator {
+        rewrite_base_returns_with_accumulator(func, accumulator, &sites);
     }
 
+    sites.sort_by_key(|site| (site.block.0, site.call_idx));
+    for site in sites.into_iter().rev() {
+        rewrite_tail_call(
+            func,
+            &param_slots,
+            accumulator.map(|(slot, _)| slot),
+            loop_entry,
+            site,
+        );
+    }
+    if accumulator.is_some() {
+        func.mark_accumulator_tail_recursion_eliminated();
+    }
     if let Err(errors) = func.verify() {
         panic!(
             "tail recursion pass produced invalid IR in {}: {:?}",
@@ -94,7 +139,11 @@ fn skip_nops(insts: &[Inst], mut cursor: usize) -> usize {
     cursor
 }
 
-fn split_entry(func: &mut Function, param_slots: &[ValueId]) -> BlockId {
+fn split_entry(
+    func: &mut Function,
+    param_slots: &[ValueId],
+    accumulator: Option<(ValueId, ValueId)>,
+) -> BlockId {
     let entry = func.entry;
     let params = func.params.clone();
     let old_terminator = func.blocks[entry.0].terminator.take();
@@ -105,7 +154,7 @@ fn split_entry(func: &mut Function, param_slots: &[ValueId]) -> BlockId {
 
     let loop_entry = func.add_block("tail.entry");
     for inst in old_insts {
-        if is_entry_prelude_inst(&inst, param_slots, &params) {
+        if is_entry_prelude_inst(&inst, param_slots, &params, accumulator) {
             new_locations.push((entry, prelude_insts.len()));
             prelude_insts.push(inst);
         } else {
@@ -166,13 +215,21 @@ fn terminator_successors(terminator: &Terminator) -> Vec<BlockId> {
     }
 }
 
-fn is_entry_prelude_inst(inst: &Inst, param_slots: &[ValueId], params: &[ValueId]) -> bool {
+fn is_entry_prelude_inst(
+    inst: &Inst,
+    param_slots: &[ValueId],
+    params: &[ValueId],
+    accumulator: Option<(ValueId, ValueId)>,
+) -> bool {
     match &inst.kind {
         InstKind::Alloca { .. } => true,
-        InstKind::Store { ptr, value } => param_slots
-            .iter()
-            .zip(params.iter())
-            .any(|(slot, param)| ptr == slot && value == param),
+        InstKind::Store { ptr, value } => {
+            param_slots
+                .iter()
+                .zip(params.iter())
+                .any(|(slot, param)| ptr == slot && value == param)
+                || accumulator == Some((*ptr, *value))
+        }
         _ => false,
     }
 }
@@ -246,30 +303,111 @@ fn tail_self_call_returning_value(
     block: BlockId,
     value: ValueId,
 ) -> Option<TailCallSite> {
-    let ValueKind::Inst(call_block, call_idx) = func.value(value).kind else {
-        return None;
-    };
-    if call_block != block || !only_nops_after(func, block, call_idx) {
-        return None;
-    }
-    if value_use_count(func, value) != 1 {
-        return None;
+    if let ValueKind::Inst(call_block, call_idx) = func.value(value).kind {
+        let inst = func.block(block).insts.get(call_idx)?;
+        if call_block == block
+            && only_nops_after(func, block, call_idx)
+            && value_use_count(func, value) == 1
+            && inst.result == Some(value)
+        {
+            if let InstKind::Call { name, args } = &inst.kind {
+                if name == &func.name && args.len() == func.params.len() {
+                    return Some(TailCallSite {
+                        block,
+                        call_idx,
+                        args: args.clone(),
+                        accumulation: None,
+                    });
+                }
+            }
+        }
     }
 
-    let inst = func.block(block).insts.get(call_idx)?;
-    if inst.result != Some(value) {
+    let ValueKind::Inst(combine_block, combine_idx) = func.value(value).kind else {
+        return None;
+    };
+    if combine_block != block
+        || !only_nops_after(func, block, combine_idx)
+        || value_use_count(func, value) != 1
+    {
         return None;
     }
+    let combine = func.block(block).insts.get(combine_idx)?;
+    let InstKind::Binary {
+        op: BinaryOp::Iadd,
+        lhs,
+        rhs,
+    } = combine.kind
+    else {
+        return None;
+    };
+    // Preserve source evaluation order: only the last self call can become the
+    // backedge.  The accumulated contribution must already be available when
+    // that call would execute.
+    let (call_result, contribution, call_idx) = [(lhs, rhs), (rhs, lhs)]
+        .into_iter()
+        .filter_map(|(call_result, contribution)| {
+            let ValueKind::Inst(call_block, call_idx) = func.value(call_result).kind else {
+                return None;
+            };
+            (call_block == block
+                && is_self_call_result(func, block, call_result)
+                && value_available_before(func, block, contribution, call_idx))
+            .then_some((call_result, contribution, call_idx))
+        })
+        .max_by_key(|(_, _, call_idx)| *call_idx)?;
+    let call_block = block;
+    if call_block != block
+        || call_idx >= combine_idx
+        || !func.block(block).insts[call_idx + 1..combine_idx]
+            .iter()
+            .all(|inst| matches!(inst.kind, InstKind::Nop))
+        || value_use_count(func, call_result) != 1
+        || func.value(contribution).ty != Type::I32
+    {
+        return None;
+    }
+    let inst = func.block(block).insts.get(call_idx)?;
     match &inst.kind {
         InstKind::Call { name, args } if name == &func.name && args.len() == func.params.len() => {
             Some(TailCallSite {
                 block,
                 call_idx,
                 args: args.clone(),
+                accumulation: Some(Accumulation {
+                    combine_idx,
+                    contribution,
+                }),
             })
         }
         _ => None,
     }
+}
+
+fn value_available_before(
+    func: &Function,
+    block: BlockId,
+    value: ValueId,
+    inst_idx: usize,
+) -> bool {
+    match func.value(value).kind {
+        ValueKind::Param | ValueKind::Const(_) | ValueKind::Global(_) => true,
+        ValueKind::Inst(owner, owner_idx) => owner != block || owner_idx < inst_idx,
+    }
+}
+
+fn is_self_call_result(func: &Function, block: BlockId, value: ValueId) -> bool {
+    let ValueKind::Inst(owner, inst_idx) = func.value(value).kind else {
+        return false;
+    };
+    owner == block
+        && matches!(
+            func.block(owner).insts.get(inst_idx),
+            Some(Inst {
+                result: Some(result),
+                kind: InstKind::Call { name, args },
+            }) if *result == value && name == &func.name && args.len() == func.params.len()
+        )
 }
 
 fn tail_self_call_returning_void(func: &Function, block: BlockId) -> Option<TailCallSite> {
@@ -287,6 +425,7 @@ fn tail_self_call_returning_void(func: &Function, block: BlockId) -> Option<Tail
                 block,
                 call_idx,
                 args: args.clone(),
+                accumulation: None,
             })
         }
         _ => None,
@@ -320,6 +459,9 @@ fn inst_value_use_count(kind: &InstKind, needle: ValueId) -> usize {
             .filter(|(_, value)| *value == needle)
             .count(),
         InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => (*ptr == needle) as usize,
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => (*dst == needle) as usize + (*src == needle) as usize + (*count == needle) as usize,
         InstKind::Store { ptr, value } => (*ptr == needle) as usize + (*value == needle) as usize,
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => (*value == needle) as usize,
         InstKind::Binary { lhs, rhs, .. }
@@ -343,6 +485,7 @@ fn terminator_value_use_count(terminator: &Terminator, needle: ValueId) -> usize
 fn rewrite_tail_call(
     func: &mut Function,
     param_slots: &[ValueId],
+    accumulator: Option<ValueId>,
     loop_entry: BlockId,
     site: TailCallSite,
 ) {
@@ -353,11 +496,74 @@ fn rewrite_tail_call(
         .map(|(ptr, value)| InstKind::Store { ptr, value })
         .collect::<Vec<_>>();
 
-    let insert_pos = site.call_idx + 1;
     func.blocks[site.block.0].insts[site.call_idx].result = None;
     func.blocks[site.block.0].insts[site.call_idx].kind = InstKind::Nop;
-    for (offset, store) in stores.into_iter().enumerate() {
-        func.insert_inst(site.block, insert_pos + offset, store, None);
+    if let Some(accumulation) = site.accumulation {
+        func.blocks[site.block.0].insts[accumulation.combine_idx].result = None;
+        func.blocks[site.block.0].insts[accumulation.combine_idx].kind = InstKind::Nop;
+        let accumulator = accumulator.expect("accumulating tail calls require an accumulator");
+        let current = func
+            .append_inst(
+                site.block,
+                InstKind::Load { ptr: accumulator },
+                Some(Type::I32),
+            )
+            .expect("an accumulator load must produce i32");
+        let updated = func
+            .append_inst(
+                site.block,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: current,
+                    rhs: accumulation.contribution,
+                },
+                Some(Type::I32),
+            )
+            .expect("an accumulator update must produce i32");
+        func.append_inst(
+            site.block,
+            InstKind::Store {
+                ptr: accumulator,
+                value: updated,
+            },
+            None,
+        );
+    }
+    for store in stores {
+        func.append_inst(site.block, store, None);
     }
     func.blocks[site.block.0].terminator = Some(Terminator::Jump(loop_entry));
+}
+
+fn rewrite_base_returns_with_accumulator(
+    func: &mut Function,
+    accumulator: ValueId,
+    sites: &[TailCallSite],
+) {
+    let tail_blocks = sites.iter().map(|site| site.block).collect::<HashSet<_>>();
+    for block_idx in 0..func.blocks.len() {
+        let block = BlockId(block_idx);
+        if tail_blocks.contains(&block) {
+            continue;
+        }
+        let Some(Terminator::Return(Some(value))) = func.blocks[block_idx].terminator.clone()
+        else {
+            continue;
+        };
+        let current = func
+            .append_inst(block, InstKind::Load { ptr: accumulator }, Some(Type::I32))
+            .expect("an accumulator load must produce i32");
+        let result = func
+            .append_inst(
+                block,
+                InstKind::Binary {
+                    op: BinaryOp::Iadd,
+                    lhs: current,
+                    rhs: value,
+                },
+                Some(Type::I32),
+            )
+            .expect("an accumulated return must produce i32");
+        func.blocks[block_idx].terminator = Some(Terminator::Return(Some(result)));
+    }
 }

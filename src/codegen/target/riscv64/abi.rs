@@ -30,6 +30,13 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         for (idx, param) in self.func.params.iter().enumerate() {
             let param_sig = &sig.params[idx];
             let assigned_reg = self.regalloc.reg(*param);
+            let is_stack_arg = matches!(locations[idx], IrArgLocation::Stack);
+            if self.value_use_counts[param.0] == 0 {
+                // Unused incoming arguments need no register move or spill.
+                // Keep the ABI stack cursor in sync for later live arguments.
+                stack_idx += usize::from(is_stack_arg);
+                continue;
+            }
             match locations[idx] {
                 IrArgLocation::IntReg(reg_idx) => {
                     let src = format!("a{}", reg_idx);

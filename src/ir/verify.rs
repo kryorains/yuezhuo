@@ -199,10 +199,39 @@ impl<'a> Verifier<'a> {
                     self.error(format!("{} has store with result", block));
                 }
             }
-            InstKind::MemZero { ptr, .. } => {
+            InstKind::MemZero { ptr, count, .. } => {
                 self.check_value_id(*ptr, "memzero pointer");
+                if let Some(count) = count {
+                    self.check_value_id(*count, "memzero element count");
+                    if self
+                        .func
+                        .values
+                        .get(count.0)
+                        .is_some_and(|value| value.ty != Type::I32)
+                    {
+                        self.error(format!("{} has non-i32 memzero element count", block));
+                    }
+                }
                 if inst.result.is_some() {
                     self.error(format!("{} has memzero with result", block));
+                }
+            }
+            InstKind::MemCopy {
+                dst, src, count, ..
+            } => {
+                self.check_value_id(*dst, "memcopy destination");
+                self.check_value_id(*src, "memcopy source");
+                self.check_value_id(*count, "memcopy element count");
+                if self
+                    .func
+                    .values
+                    .get(count.0)
+                    .is_some_and(|value| value.ty != Type::I32)
+                {
+                    self.error(format!("{} has non-i32 memcopy element count", block));
+                }
+                if inst.result.is_some() {
+                    self.error(format!("{} has memcopy with result", block));
                 }
             }
             InstKind::Unary { value, .. } => self.check_value_id(*value, "unary operand"),
@@ -495,7 +524,13 @@ impl<'a> Verifier<'a> {
 fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Phi { .. } | InstKind::Alloca { .. } => Vec::new(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. }

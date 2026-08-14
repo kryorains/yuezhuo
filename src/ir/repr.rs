@@ -58,6 +58,7 @@ pub struct Function {
     pub blocks: Vec<Block>,
     pub entry: BlockId,
     recursive_cfg_inline_decided: bool,
+    accumulator_tail_recursion_eliminated: bool,
     reduction_jammed: bool,
 }
 
@@ -96,6 +97,7 @@ impl Function {
             blocks: Vec::new(),
             entry: BlockId(0),
             recursive_cfg_inline_decided: false,
+            accumulator_tail_recursion_eliminated: false,
             reduction_jammed: false,
         };
         func.entry = func.add_block("entry");
@@ -232,6 +234,14 @@ impl Function {
         self.recursive_cfg_inline_decided = true;
     }
 
+    pub(crate) fn has_accumulator_tail_recursion_elimination(&self) -> bool {
+        self.accumulator_tail_recursion_eliminated
+    }
+
+    pub(crate) fn mark_accumulator_tail_recursion_eliminated(&mut self) {
+        self.accumulator_tail_recursion_eliminated = true;
+    }
+
     pub(crate) fn has_reduction_jam(&self) -> bool {
         self.reduction_jammed
     }
@@ -320,6 +330,13 @@ pub enum InstKind {
     MemZero {
         ptr: ValueId,
         bytes: usize,
+        count: Option<ValueId>,
+    },
+    MemCopy {
+        dst: ValueId,
+        src: ValueId,
+        element_bytes: usize,
+        count: ValueId,
     },
     Unary {
         op: UnaryOp,

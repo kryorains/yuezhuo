@@ -163,7 +163,19 @@ fn rewrite_inst_uses(inst: &mut Inst, replacements: &ValueReplacements) -> bool 
         InstKind::Store { ptr, value } => {
             rewrite_value(ptr, replacements) | rewrite_value(value, replacements)
         }
-        InstKind::MemZero { ptr, .. } => rewrite_value(ptr, replacements),
+        InstKind::MemZero { ptr, count, .. } => {
+            rewrite_value(ptr, replacements)
+                | count
+                    .as_mut()
+                    .is_some_and(|count| rewrite_value(count, replacements))
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => {
+            rewrite_value(dst, replacements)
+                | rewrite_value(src, replacements)
+                | rewrite_value(count, replacements)
+        }
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => {
             rewrite_value(value, replacements)
         }

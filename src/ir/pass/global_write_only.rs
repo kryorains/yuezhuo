@@ -97,6 +97,10 @@ fn collect_observed_globals(func: &Function, observed: &mut HashSet<String>) {
                 | InstKind::Alloca { .. }
                 | InstKind::MemZero { .. }
                 | InstKind::Gep { .. } => {}
+                InstKind::MemCopy { dst, src, .. } => {
+                    observe_pointer(func, *dst, observed);
+                    observe_pointer(func, *src, observed);
+                }
             }
         }
         if let Some(Terminator::Return(Some(value))) = &block.terminator {

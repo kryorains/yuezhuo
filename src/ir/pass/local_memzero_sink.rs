@@ -46,7 +46,12 @@ fn sink_entry_memzeros(func: &mut Function) {
         .iter()
         .enumerate()
         .filter_map(|(inst_index, inst)| {
-            let InstKind::MemZero { ptr, bytes } = inst.kind else {
+            let InstKind::MemZero {
+                ptr,
+                bytes,
+                count: None,
+            } = inst.kind
+            else {
                 return None;
             };
             is_direct_local_alloca(func, ptr).then_some(Memzero {
@@ -98,6 +103,7 @@ fn sink_entry_memzeros(func: &mut Function) {
                 InstKind::MemZero {
                     ptr: memzero.ptr,
                     bytes: memzero.bytes,
+                    count: None,
                 },
                 None,
             );
@@ -119,6 +125,7 @@ fn sink_entry_memzeros(func: &mut Function) {
             InstKind::MemZero {
                 ptr: memzero.ptr,
                 bytes: memzero.bytes,
+                count: None,
             },
             None,
         );
@@ -272,7 +279,13 @@ fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
         InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. }
@@ -330,7 +343,12 @@ fn remove_fully_overwritten_memzeros(func: &mut Function) {
     let mut candidates = Vec::new();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.insts.iter().enumerate() {
-            let InstKind::MemZero { ptr, bytes } = inst.kind else {
+            let InstKind::MemZero {
+                ptr,
+                bytes,
+                count: None,
+            } = inst.kind
+            else {
                 continue;
             };
             if local_array_len(func, ptr).is_some_and(|len| len.checked_mul(4) == Some(bytes)) {
@@ -426,6 +444,12 @@ fn memzero_is_fully_overwritten(
                 InstKind::MemZero { ptr, .. } if *ptr == root => {
                     initialized.fill(true);
                 }
+                // Comparing an address does not observe the pointee.  Loop
+                // strength reduction may replace an integer exit test with
+                // a pointer-end comparison, and that must not make an
+                // otherwise redundant initialization appear observable.
+                InstKind::Icmp { lhs, rhs, .. }
+                    if aliases.contains(lhs) || aliases.contains(rhs) => {}
                 kind if inst_operands(kind)
                     .into_iter()
                     .any(|operand| aliases.contains(&operand)) =>

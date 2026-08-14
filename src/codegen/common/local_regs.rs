@@ -13,8 +13,9 @@ pub(crate) struct IrLocalRegs {
 impl IrLocalRegs {
     pub(crate) fn new(
         func: &Function,
-        available_regs: &'static [&'static str],
+        available_regs: &[&'static str],
         allow_call_uses: bool,
+        mut excluded: impl FnMut(ValueId) -> bool,
     ) -> Self {
         if available_regs.is_empty() || func.values.len() > 16_384 {
             return Self {
@@ -25,6 +26,10 @@ impl IrLocalRegs {
         let mut candidates = HashMap::<ValueId, Candidate>::new();
         for (value_idx, value) in func.values.iter().enumerate() {
             if !matches!(value.ty, Type::I1 | Type::I32 | Type::Ptr(_)) {
+                continue;
+            }
+            let value_id = ValueId(value_idx);
+            if excluded(value_id) {
                 continue;
             }
             let ValueKind::Inst(block, inst_idx) = value.kind else {
@@ -42,14 +47,14 @@ impl IrLocalRegs {
                     inst.kind,
                     InstKind::Nop | InstKind::Phi { .. } | InstKind::Alloca { .. }
                 )
-                || (!allow_call_uses && matches!(inst.kind, InstKind::Call { .. }))
+                || (!allow_call_uses && instruction_may_call(&inst.kind))
             {
                 continue;
             }
             candidates.insert(
-                ValueId(value_idx),
+                value_id,
                 Candidate {
-                    value: ValueId(value_idx),
+                    value: value_id,
                     block,
                     start: inst_idx,
                     end: inst_idx,
@@ -63,7 +68,7 @@ impl IrLocalRegs {
             let owner = BlockId(block_idx);
             for (inst_idx, inst) in block.insts.iter().enumerate() {
                 let unsupported_use = matches!(inst.kind, InstKind::Phi { .. })
-                    || (!allow_call_uses && matches!(inst.kind, InstKind::Call { .. }));
+                    || (!allow_call_uses && instruction_may_call(&inst.kind));
                 for operand in inst_operands(&inst.kind) {
                     record_use(&mut candidates, operand, owner, inst_idx, unsupported_use);
                 }
@@ -85,9 +90,7 @@ impl IrLocalRegs {
                     .insts
                     .iter()
                     .enumerate()
-                    .filter_map(|(idx, inst)| {
-                        matches!(inst.kind, InstKind::Call { .. }).then_some(idx)
-                    })
+                    .filter_map(|(idx, inst)| instruction_may_call(&inst.kind).then_some(idx))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -144,6 +147,13 @@ impl IrLocalRegs {
     }
 }
 
+fn instruction_may_call(kind: &InstKind) -> bool {
+    matches!(
+        kind,
+        InstKind::Call { .. } | InstKind::MemZero { count: Some(_), .. } | InstKind::MemCopy { .. }
+    )
+}
+
 #[derive(Clone, Copy)]
 struct Candidate {
     value: ValueId,
@@ -182,7 +192,13 @@ fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
         InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. }

@@ -138,7 +138,11 @@ fn inst_uses_value(kind: &InstKind, value: ValueId) -> bool {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => false,
         InstKind::Phi { incomings } => incomings.iter().any(|(_, incoming)| *incoming == value),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => *ptr == value,
+        InstKind::Load { ptr } => *ptr == value,
+        InstKind::MemZero { ptr, count, .. } => *ptr == value || *count == Some(value),
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => *dst == value || *src == value || *count == value,
         InstKind::Store { ptr, value: stored } => *ptr == value || *stored == value,
         InstKind::Unary { value: operand, .. } | InstKind::Cast { value: operand, .. } => {
             *operand == value
