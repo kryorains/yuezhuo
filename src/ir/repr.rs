@@ -59,7 +59,6 @@ pub struct Function {
     pub entry: BlockId,
     recursive_cfg_inline_decided: bool,
     reduction_jammed: bool,
-    guarded_mulmod_modulus: Option<i32>,
 }
 
 impl PartialEq for Function {
@@ -70,7 +69,6 @@ impl PartialEq for Function {
             && self.values == other.values
             && self.blocks == other.blocks
             && self.entry == other.entry
-            && self.guarded_mulmod_modulus == other.guarded_mulmod_modulus
     }
 }
 
@@ -84,7 +82,6 @@ impl fmt::Debug for Function {
             .field("values", &self.values)
             .field("blocks", &self.blocks)
             .field("entry", &self.entry)
-            .field("guarded_mulmod_modulus", &self.guarded_mulmod_modulus)
             .finish()
     }
 }
@@ -100,7 +97,6 @@ impl Function {
             entry: BlockId(0),
             recursive_cfg_inline_decided: false,
             reduction_jammed: false,
-            guarded_mulmod_modulus: None,
         };
         func.entry = func.add_block("entry");
         func
@@ -242,14 +238,6 @@ impl Function {
 
     pub(crate) fn mark_reduction_jammed(&mut self) {
         self.reduction_jammed = true;
-    }
-
-    pub(crate) fn guarded_mulmod_modulus(&self) -> Option<i32> {
-        self.guarded_mulmod_modulus
-    }
-
-    pub(crate) fn mark_guarded_mulmod(&mut self, modulus: i32) {
-        self.guarded_mulmod_modulus = Some(modulus);
     }
 }
 
