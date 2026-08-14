@@ -76,10 +76,12 @@ fn find_readonly_candidate(func: &Function) -> Option<ReadonlyCandidate> {
             continue;
         };
         if natural_loop.blocks.iter().any(|block| {
-            func.blocks[block.0]
-                .insts
-                .iter()
-                .any(|inst| matches!(inst.kind, InstKind::Call { .. } | InstKind::MemZero { .. }))
+            func.blocks[block.0].insts.iter().any(|inst| {
+                matches!(
+                    inst.kind,
+                    InstKind::Call { .. } | InstKind::MemZero { .. } | InstKind::MemCopy { .. }
+                )
+            })
         }) {
             continue;
         }
@@ -203,10 +205,12 @@ fn find_candidate(func: &Function) -> Option<Candidate> {
             continue;
         }
         if natural_loop.blocks.iter().any(|block| {
-            func.blocks[block.0]
-                .insts
-                .iter()
-                .any(|inst| matches!(inst.kind, InstKind::Call { .. } | InstKind::MemZero { .. }))
+            func.blocks[block.0].insts.iter().any(|inst| {
+                matches!(
+                    inst.kind,
+                    InstKind::Call { .. } | InstKind::MemZero { .. } | InstKind::MemCopy { .. }
+                )
+            })
         }) {
             continue;
         }
@@ -292,7 +296,9 @@ fn loop_memory_is_disjoint(
         func.blocks[block.0].insts.iter().all(|inst| {
             let ptr = match &inst.kind {
                 InstKind::Load { ptr } | InstKind::Store { ptr, .. } => *ptr,
-                InstKind::MemZero { .. } | InstKind::Call { .. } => return false,
+                InstKind::MemZero { .. } | InstKind::MemCopy { .. } | InstKind::Call { .. } => {
+                    return false
+                }
                 _ => return true,
             };
             match scalar_global(func, ptr) {

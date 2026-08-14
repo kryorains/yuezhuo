@@ -58,19 +58,7 @@ fn eliminate_dead_code_with_alloca_cleanup(func: &mut Function, cleanup_write_on
 /// effect, so treating it as an unconditional DCE root needlessly keeps both
 /// the store and the stack object alive.
 fn remove_write_only_allocas(func: &mut Function) {
-    let write_only = func
-        .blocks
-        .iter()
-        .flat_map(|block| &block.insts)
-        .filter_map(|inst| match inst {
-            Inst {
-                result: Some(slot),
-                kind: InstKind::Alloca { .. },
-            } => write_only_alloca_pointers(func, *slot),
-            _ => None,
-        })
-        .flatten()
-        .collect::<HashSet<_>>();
+    let write_only = write_only_alloca_values(func);
     if write_only.is_empty() {
         return;
     }
@@ -89,7 +77,25 @@ fn remove_write_only_allocas(func: &mut Function) {
     }
 }
 
-fn write_only_alloca_pointers(func: &Function, slot: ValueId) -> Option<HashSet<ValueId>> {
+pub(super) fn write_only_alloca_values(func: &Function) -> HashSet<ValueId> {
+    func.blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter_map(|inst| match inst {
+            Inst {
+                result: Some(slot),
+                kind: InstKind::Alloca { .. },
+            } => write_only_alloca_pointers(func, *slot),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+pub(super) fn write_only_alloca_pointers(
+    func: &Function,
+    slot: ValueId,
+) -> Option<HashSet<ValueId>> {
     let mut pointers = HashSet::from([slot]);
     loop {
         let mut changed = false;
@@ -200,9 +206,13 @@ fn collect_inst_operands(inst: &Inst, used: &mut HashSet<ValueId>) {
             used.insert(*ptr);
             used.insert(*value);
         }
-        InstKind::MemZero { ptr, .. } => {
+        InstKind::MemZero { ptr, count, .. } => {
             used.insert(*ptr);
+            used.extend(count.iter().copied());
         }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => used.extend([*dst, *src, *count]),
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => {
             used.insert(*value);
         }

@@ -102,17 +102,6 @@ O0 也做标量提升，是为了给代码生成器提供统一的 SSA/phi 形�
 
 pass 不重关联或以其它方式改写浮点运算，也不把局部常量二次幂乘除主动改写成 shift；这类局部指令选择继续由现有后端负责。IR 的动态 shift 仍采用计数低 5 位语义。
 
-### `BitwiseDigitLoopPass` (`bitwise_digit_loop.rs`)
-
-识别固定 32 轮、以 `% 2`/`/ 2` 和 doubling power 逐位构造 i32 AND/OR/XOR 的规范循环。识别过程验证自然循环、phi、trip count、每轮真值表、无副作用以及完整返回关系，不读取函数、参数、块或测试名称。通用路径只在两个实参均非负时使用原生位运算，负数保留原循环语义。
-
-
-### `GuardedShiftDispatchPass` (`guarded_shift_dispatch.rs`)
-
-识别纯 i32 函数中完整、连续的 `selector == 1..N` 返回分派：每个 case 必须精确返回 `data * 2^selector` 或 `data / 2^selector`，默认分支必须原样返回 `data`，且全部基本块都属于该分派。变换不读取函数名、参数名、块名或调用点，只依据 CFG、SSA 参数身份、常量和返回表达式；case 缺口、混合运算、额外副作用或非 identity fallback 都会拒绝。
-
-新 CFG 先保护 `1 <= selector <= N`，范围外保留默认结果。乘法在 i32 wrapping 语义下直接改为动态左移；有符号除法先计算 `sign & ((1 << selector) - 1)` bias，再做算术右移，从而对负数仍严格保持向零截断，而不是错误使用向负无穷取整。当前只接受 3..30 个 case，并在改写后运行 verifier；后续常量特化、CFG 内联和 DCE 可继续折叠常量调用及清理原分派。
-
 ### `SimplifyCfgPass` (`simplify_cfg.rs`)
 
 简化控制流图。

@@ -8,6 +8,7 @@ const MAX_FOLDED_MEMORY_VALUES: usize = 8192;
 const MAX_FOLDED_MEMORY_INSTRUCTIONS: usize = 32_768;
 const MAX_FOLDED_MEMORY_USES: usize = 65_536;
 const MAX_FOLDED_MEMORY_GEPS: usize = 1024;
+const MAX_FOLDED_MEMORY_GEP_CHAIN: usize = 64;
 const MAX_FOLDED_MEMORY_TYPE_NODES: usize = 128;
 const MAX_FOLDED_MEMORY_CLONE_TYPE_NODES: usize = 65_536;
 
@@ -18,6 +19,43 @@ pub(super) struct FoldedMemoryGep {
 }
 
 impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
+    pub(super) fn emit_regalloc_materializations(&mut self) {
+        let materialized = self.regalloc.materialized().to_vec();
+        for (value, reg) in materialized {
+            match self.func.value(value).kind.clone() {
+                ValueKind::Const(value) => self.load_const_into(&value, reg),
+                ValueKind::Global(name) => {
+                    self.body.push_str(&format!("  la {reg}, {name}\n"));
+                }
+                ValueKind::Param | ValueKind::Inst(_, _) => {
+                    unreachable!("only rematerializable values are initialized here")
+                }
+            }
+        }
+        for (offset, reg) in self.regalloc.address_offsets().to_vec() {
+            self.body.push_str(&format!("  li {reg}, {offset}\n"));
+        }
+        let float_materialized = self.float_regalloc.materialized().to_vec();
+        for (value, reg) in float_materialized {
+            let bits = match self.func.value(value).kind {
+                ValueKind::Const(Const::Float(bits)) => bits,
+                ValueKind::Const(Const::Zero(Type::F32)) => 0,
+                _ => unreachable!("only floating constants are initialized here"),
+            };
+            if bits == 0 {
+                self.body.push_str(&format!("  fmv.w.x {reg}, zero\n"));
+            } else {
+                let label = self.parent.ctx.fresh_label("float");
+                self.parent.out.push_str(&format!(
+                    ".section .rodata\n.align 2\n{}:\n  .word {}\n.text\n",
+                    label, bits
+                ));
+                self.body
+                    .push_str(&format!("  la t0, {label}\n  flw {reg}, 0(t0)\n"));
+            }
+        }
+    }
+
     pub(super) fn emit_memzero(&mut self, ptr: ValueId, bytes: usize) {
         if bytes == 0 {
             return;
@@ -53,6 +91,56 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         for offset in 0..tail {
             self.body.push_str(&format!("  sb zero, {}(a0)\n", offset));
         }
+    }
+
+    pub(super) fn emit_memzero_elements(
+        &mut self,
+        ptr: ValueId,
+        count: ValueId,
+        element_bytes: usize,
+    ) {
+        debug_assert_ne!(element_bytes, 0);
+        self.load_value_into(ptr, "a0");
+        let count = self.load_or_assigned(count, "a2");
+        if element_bytes.is_power_of_two() {
+            self.body.push_str(&format!(
+                "  slli a2, {}, {}\n",
+                count,
+                element_bytes.trailing_zeros()
+            ));
+        } else {
+            self.body.push_str(&format!(
+                "  li t0, {}\n  mul a2, {}, t0\n",
+                element_bytes, count
+            ));
+        }
+        self.body.push_str("  li a1, 0\n  call memset\n");
+    }
+
+    pub(super) fn emit_memcopy_elements(
+        &mut self,
+        dst: ValueId,
+        src: ValueId,
+        count: ValueId,
+        element_bytes: usize,
+    ) {
+        debug_assert_ne!(element_bytes, 0);
+        self.load_value_into(dst, "a0");
+        self.load_value_into(src, "a1");
+        let count = self.load_or_assigned(count, "a2");
+        if element_bytes.is_power_of_two() {
+            self.body.push_str(&format!(
+                "  slli a2, {}, {}\n",
+                count,
+                element_bytes.trailing_zeros()
+            ));
+        } else {
+            self.body.push_str(&format!(
+                "  li t0, {}\n  mul a2, {}, t0\n",
+                element_bytes, count
+            ));
+        }
+        self.body.push_str("  call memcpy\n");
     }
 
     pub(super) fn assigned_reg(&self, value: ValueId) -> Option<&'static str> {
@@ -108,7 +196,13 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
             return true;
         }
         let pointer = self.assigned_reg(base);
-        let source = self.assigned_reg(value);
+        let source = self.assigned_reg(value).or_else(|| {
+            matches!(
+                self.func.value(value).kind,
+                ValueKind::Const(Const::Int(0) | Const::Bool(false) | Const::Zero(_))
+            )
+            .then_some("zero")
+        });
         if pointer.is_none() && source.is_none() {
             return false;
         }
@@ -273,6 +367,11 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
         } else if i32::try_from(offset).is_ok_and(fits_i12) {
             self.body
                 .push_str(&format!("  addi {}, {}, {}\n", destination, base, offset));
+        } else if let Some(offset_reg) = self.regalloc.address_offset_reg(offset) {
+            self.body.push_str(&format!(
+                "  add {}, {}, {}\n",
+                destination, base, offset_reg
+            ));
         } else {
             self.body.push_str(&format!(
                 "  li t0, {}\n  add {}, {}, t0\n",
@@ -434,6 +533,7 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn frame_addr(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.base_addr(dst, "s0", self.frame_slot_offset(offset));
     }
 
@@ -451,34 +551,42 @@ impl<'a, 'b> Riscv64IrFuncEmitter<'a, 'b> {
     }
 
     pub(super) fn load_frame_x(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.load_base_x(dst, "s0", self.frame_slot_offset(offset));
     }
 
     pub(super) fn load_frame_w(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.load_base_w(dst, "s0", self.frame_slot_offset(offset));
     }
 
     pub(super) fn load_raw_frame_x(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.load_base_x(dst, "s0", offset);
     }
 
     pub(super) fn load_raw_frame_w(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.load_base_w(dst, "s0", offset);
     }
 
     pub(super) fn load_raw_frame_s(&mut self, dst: &str, offset: i32) {
+        self.frame_accessed = true;
         self.load_base_s(dst, "s0", offset);
     }
 
     pub(super) fn store_frame_x(&mut self, src: &str, offset: i32) {
+        self.frame_accessed = true;
         self.store_base_x(src, "s0", self.frame_slot_offset(offset));
     }
 
     pub(super) fn store_frame_w(&mut self, src: &str, offset: i32) {
+        self.frame_accessed = true;
         self.store_base_w(src, "s0", self.frame_slot_offset(offset));
     }
 
     pub(super) fn store_frame_s(&mut self, src: &str, offset: i32) {
+        self.frame_accessed = true;
         self.store_base_s(src, "s0", self.frame_slot_offset(offset));
     }
 
@@ -732,7 +840,6 @@ fn fold_same_block_affine_memory_geps(
                         || candidate.stride != stride
                         || candidate.index.terms != index.terms
                         || func.value(candidate.result).ty != func.value(result).ty
-                        || folded.contains_key(&candidate.result)
                     {
                         return None;
                     }
@@ -740,12 +847,13 @@ fn fold_same_block_affine_memory_geps(
                         i64::from(index.constant) - i64::from(candidate.index.constant);
                     let offset = delta_indices
                         .checked_mul(stride)
-                        .and_then(|offset| i32::try_from(offset).ok())
+                        .and_then(|offset| i32::try_from(offset).ok())?;
+                    let (base, base_offset) =
+                        resolve_folded_memory_address(candidate.result, folded)?;
+                    let offset = base_offset
+                        .checked_add(offset)
                         .filter(|offset| fits_i12(*offset))?;
-                    Some(FoldedMemoryGep {
-                        base: candidate.result,
-                        offset,
-                    })
+                    Some(FoldedMemoryGep { base, offset })
                 });
                 if let Some(replacement) = replacement {
                     if folded.len() == MAX_FOLDED_MEMORY_GEPS {
@@ -762,6 +870,24 @@ fn fold_same_block_affine_memory_geps(
             });
         }
     }
+}
+
+/// Follows already-selected address-mode folds so a later affine access can
+/// reuse the same retained root with a combined encodable displacement.
+fn resolve_folded_memory_address(
+    value: ValueId,
+    folded: &HashMap<ValueId, FoldedMemoryGep>,
+) -> Option<(ValueId, i32)> {
+    let mut base = value;
+    let mut offset = 0i32;
+    for _ in 0..MAX_FOLDED_MEMORY_GEP_CHAIN {
+        let Some(address) = folded.get(&base) else {
+            return Some((base, offset));
+        };
+        offset = offset.checked_add(address.offset)?;
+        base = address.base;
+    }
+    None
 }
 
 fn affine_i32_index(func: &Function, value: ValueId, depth: usize) -> Option<AffineIndex> {
@@ -939,7 +1065,13 @@ fn instruction_operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
         InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. }

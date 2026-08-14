@@ -25,11 +25,17 @@ const MAX_GLOBAL_NAME_BYTES: usize = 1_048_576;
 /// distance. The analysis depends only on typed SSA, natural loops, and checked
 /// arithmetic; source names and aggregate dimensions are never profitability
 /// keys.
-pub(super) struct PointerRecurrenceCoalescePass;
+pub(super) struct PointerRecurrenceCoalescePass {
+    min_memory_offset: i64,
+    max_memory_offset: i64,
+}
 
 impl PointerRecurrenceCoalescePass {
-    pub(super) fn new() -> Self {
-        Self
+    pub(super) fn new(min_memory_offset: i64, max_memory_offset: i64) -> Self {
+        Self {
+            min_memory_offset,
+            max_memory_offset,
+        }
     }
 }
 
@@ -55,7 +61,12 @@ impl ModulePass for PointerRecurrenceCoalescePass {
             HashMap::new()
         };
         for func in &mut module.funcs {
-            coalesce_function(func, &unique_globals);
+            coalesce_function(
+                func,
+                &unique_globals,
+                self.min_memory_offset,
+                self.max_memory_offset,
+            );
         }
     }
 }
@@ -70,15 +81,21 @@ struct PointerRecurrence {
     step: i32,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum AddressRoot {
     Value(ValueId),
     Global(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AddressTerm {
+    Scalar(ValueId),
+    Loop(BlockId),
+}
+
 struct AddressExpr {
     root: AddressRoot,
-    dynamic_terms: HashMap<ValueId, i64>,
+    dynamic_terms: HashMap<AddressTerm, i64>,
     constant_offset: i64,
 }
 
@@ -138,8 +155,14 @@ impl ProofBudget {
     }
 }
 
-fn coalesce_function(func: &mut Function, unique_globals: &HashMap<String, usize>) {
-    let Some(plans) = plan_coalescing(func, unique_globals) else {
+fn coalesce_function(
+    func: &mut Function,
+    unique_globals: &HashMap<String, usize>,
+    min_memory_offset: i64,
+    max_memory_offset: i64,
+) {
+    let Some(plans) = plan_coalescing(func, unique_globals, min_memory_offset, max_memory_offset)
+    else {
         return;
     };
     if plans.is_empty() {
@@ -160,7 +183,12 @@ fn coalesce_function(func: &mut Function, unique_globals: &HashMap<String, usize
 fn plan_coalescing(
     func: &Function,
     unique_globals: &HashMap<String, usize>,
+    min_memory_offset: i64,
+    max_memory_offset: i64,
 ) -> Option<Vec<CoalescePlan>> {
+    if min_memory_offset > max_memory_offset {
+        return Some(Vec::new());
+    }
     if func.blocks.len() > MAX_FUNCTION_BLOCKS || func.values.len() > MAX_FUNCTION_VALUES {
         return None;
     }
@@ -214,12 +242,18 @@ fn plan_coalescing(
         return Some(Vec::new());
     }
     recurrences.sort_by_key(|recurrence| recurrence.phi.0);
+    let recurrence_by_phi = recurrences
+        .iter()
+        .copied()
+        .map(|recurrence| (recurrence.phi, recurrence))
+        .collect::<HashMap<_, _>>();
 
     let mut addresses = HashMap::new();
     for recurrence in &recurrences {
         if let Some(address) = analyze_initial_address(
             func,
             recurrence.initial,
+            &recurrence_by_phi,
             &induction_ranges,
             unique_globals,
             &mut budget,
@@ -232,84 +266,158 @@ fn plan_coalescing(
     }
 
     let mut plans = Vec::new();
-    let mut secondaries = HashSet::new();
+    let mut grouped = HashSet::new();
     let mut pair_proofs = 0usize;
-    for (primary_idx, primary) in recurrences.iter().enumerate() {
-        if secondaries.contains(&primary.phi) {
+    for seed in &recurrences {
+        if grouped.contains(&seed.phi) {
             continue;
         }
-        let Some(primary_address) = addresses.get(&primary.phi) else {
+        let Some(seed_address) = addresses.get(&seed.phi) else {
             continue;
         };
-        let primary_ty = &func.values.get(primary.phi.0)?.ty;
-        let Type::Ptr(primary_pointee) = primary_ty else {
+        let seed_ty = &func.values.get(seed.phi.0)?.ty;
+        let Type::Ptr(seed_pointee) = seed_ty else {
             continue;
         };
-        let Some(element_size) = checked_type_size(primary_pointee, &mut budget) else {
+        let Some(element_size) = checked_type_size(seed_pointee, &mut budget) else {
             continue;
         };
         if element_size <= 0 {
             continue;
         }
 
-        for secondary in recurrences.iter().skip(primary_idx + 1) {
+        let mut group = Vec::new();
+        for candidate in &recurrences {
             pair_proofs = pair_proofs.checked_add(1)?;
             if pair_proofs > MAX_PAIR_PROOFS || !budget.spend(1) {
                 return None;
             }
-            if secondaries.contains(&secondary.phi)
-                || primary.header != secondary.header
-                || primary.latch != secondary.latch
-                || primary.step != secondary.step
-                || !types_equal_bounded(
-                    primary_ty,
-                    &func.values.get(secondary.phi.0)?.ty,
-                    &mut budget,
-                )
-                || !secondary_uses_are_foldable(
-                    func,
-                    secondary,
-                    loops_by_header.get(&secondary.header).copied()?,
-                    &uses,
-                    &mut budget,
-                )
+            if grouped.contains(&candidate.phi)
+                || seed.header != candidate.header
+                || seed.latch != candidate.latch
+                || seed.step != candidate.step
+                || !types_equal_bounded(seed_ty, &func.values.get(candidate.phi.0)?.ty, &mut budget)
             {
                 continue;
             }
-            let Some(secondary_address) = addresses.get(&secondary.phi) else {
+            let Some(candidate_address) = addresses.get(&candidate.phi) else {
                 continue;
             };
-            let term_comparison_work = primary_address
+            let term_comparison_work = seed_address
                 .dynamic_terms
                 .len()
-                .checked_add(secondary_address.dynamic_terms.len())?;
+                .checked_add(candidate_address.dynamic_terms.len())?;
             if !budget.spend(term_comparison_work) {
                 return None;
             }
-            if primary_address.root != secondary_address.root
-                || primary_address.dynamic_terms != secondary_address.dynamic_terms
+            if seed_address.root != candidate_address.root
+                || seed_address.dynamic_terms != candidate_address.dynamic_terms
             {
                 continue;
             }
-            let Some(distance_bytes) = secondary_address
-                .constant_offset
-                .checked_sub(primary_address.constant_offset)
-            else {
-                continue;
+            group.push(*candidate);
+        }
+        for recurrence in &group {
+            grouped.insert(recurrence.phi);
+        }
+        if group.len() < 2 {
+            continue;
+        }
+
+        let foldable = group
+            .iter()
+            .map(|recurrence| {
+                secondary_uses_are_foldable(
+                    func,
+                    recurrence,
+                    loops_by_header.get(&recurrence.header).copied()?,
+                    &uses,
+                    &mut budget,
+                )
+                .then_some(recurrence.phi)
+            })
+            .collect::<Vec<_>>();
+        if budget.exceeded {
+            return None;
+        }
+        let foldable = group
+            .iter()
+            .zip(foldable)
+            .map(|(recurrence, foldable)| (recurrence.phi, foldable.is_some()))
+            .collect::<HashMap<_, _>>();
+        let mut remaining = group
+            .iter()
+            .map(|recurrence| recurrence.phi)
+            .collect::<HashSet<_>>();
+        while !remaining.is_empty() {
+            let mandatory_primaries = remaining
+                .iter()
+                .copied()
+                .filter(|phi| !foldable[phi])
+                .collect::<Vec<_>>();
+            let primary_candidates = if mandatory_primaries.is_empty() {
+                remaining.iter().copied().collect::<Vec<_>>()
+            } else {
+                mandatory_primaries
             };
-            if distance_bytes % element_size != 0 {
-                continue;
+            let (primary_phi, secondaries) = primary_candidates
+                .into_iter()
+                .map(|primary_phi| {
+                    let primary_offset = addresses[&primary_phi].constant_offset;
+                    let secondaries = remaining
+                        .iter()
+                        .copied()
+                        .filter(|secondary_phi| {
+                            if *secondary_phi == primary_phi || !foldable[secondary_phi] {
+                                return false;
+                            }
+                            let Some(distance_bytes) = addresses[secondary_phi]
+                                .constant_offset
+                                .checked_sub(primary_offset)
+                            else {
+                                return false;
+                            };
+                            distance_bytes >= min_memory_offset
+                                && distance_bytes <= max_memory_offset
+                                && distance_bytes % element_size == 0
+                                && i32::try_from(distance_bytes / element_size).is_ok()
+                        })
+                        .collect::<Vec<_>>();
+                    let distance_cost = secondaries.iter().fold(0u128, |cost, secondary_phi| {
+                        cost + u128::from(
+                            addresses[secondary_phi]
+                                .constant_offset
+                                .abs_diff(primary_offset),
+                        )
+                    });
+                    (primary_phi, secondaries, distance_cost)
+                })
+                .max_by_key(|(primary_phi, secondaries, distance_cost)| {
+                    (
+                        secondaries.len(),
+                        u128::MAX - *distance_cost,
+                        usize::MAX - primary_phi.0,
+                    )
+                })
+                .map(|(primary, secondaries, _)| (primary, secondaries))?;
+            remaining.remove(&primary_phi);
+            let primary = recurrences
+                .iter()
+                .find(|recurrence| recurrence.phi == primary_phi)?;
+            let primary_offset = addresses[&primary_phi].constant_offset;
+            for secondary_phi in secondaries {
+                remaining.remove(&secondary_phi);
+                let distance_bytes = addresses[&secondary_phi]
+                    .constant_offset
+                    .checked_sub(primary_offset)?;
+                let distance_index = i32::try_from(distance_bytes / element_size).ok()?;
+                plans.push(CoalescePlan {
+                    primary: primary_phi,
+                    secondary: secondary_phi,
+                    header: primary.header,
+                    distance_index,
+                });
             }
-            let Ok(distance_index) = i32::try_from(distance_bytes / element_size) else {
-                continue;
-            };
-            plans.push(CoalescePlan {
-                primary: primary.phi,
-                secondary: secondary.phi,
-                header: primary.header,
-                distance_index,
-            });
-            secondaries.insert(secondary.phi);
         }
     }
     if budget.exceeded || plans.len() > MAX_RECURRENCES {
@@ -395,42 +503,73 @@ fn analyze_pointer_recurrence(
 fn analyze_initial_address(
     func: &Function,
     initial: ValueId,
+    recurrence_by_phi: &HashMap<ValueId, PointerRecurrence>,
     induction_ranges: &HashMap<ValueId, (i64, i64)>,
     unique_globals: &HashMap<String, usize>,
     budget: &mut ProofBudget,
 ) -> Option<AddressExpr> {
     let mut current = initial;
-    let mut dynamic_terms = HashMap::<ValueId, i64>::new();
+    let mut dynamic_terms = HashMap::<AddressTerm, i64>::new();
     let mut constant_offset = 0i64;
     let mut chain_depth = 0usize;
     let mut index_count = 0usize;
+    let mut expanded_recurrences = HashSet::new();
 
     loop {
         if !budget.spend(1) {
             return None;
         }
-        let Some(InstKind::Gep { base, indices }) = defining_inst(func, current) else {
-            break;
-        };
-        chain_depth = chain_depth.checked_add(1)?;
-        index_count = index_count.checked_add(indices.len())?;
-        if chain_depth > MAX_GEP_CHAIN_DEPTH || index_count > MAX_GEP_INDICES || indices.is_empty()
-        {
-            return None;
-        }
-        let strides = typed_gep_byte_strides(func, *base, current, indices.len(), budget)?;
-        for (index, stride) in indices.iter().copied().zip(strides) {
-            let affine = analyze_affine_index(func, index, induction_ranges, budget, 0)?;
-            if let Some(term) = affine.dynamic_term {
-                let coefficient = dynamic_terms.entry(term).or_default();
-                *coefficient = coefficient.checked_add(stride)?;
-                if *coefficient == 0 {
-                    dynamic_terms.remove(&term);
-                }
+        if let Some(InstKind::Gep { base, indices }) = defining_inst(func, current) {
+            chain_depth = chain_depth.checked_add(1)?;
+            index_count = index_count.checked_add(indices.len())?;
+            if chain_depth > MAX_GEP_CHAIN_DEPTH
+                || index_count > MAX_GEP_INDICES
+                || indices.is_empty()
+            {
+                return None;
             }
-            constant_offset = constant_offset.checked_add(affine.constant.checked_mul(stride)?)?;
+            let strides = typed_gep_byte_strides(func, *base, current, indices.len(), budget)?;
+            for (index, stride) in indices.iter().copied().zip(strides) {
+                let affine = analyze_affine_index(func, index, induction_ranges, budget, 0)?;
+                if let Some(term) = affine.dynamic_term {
+                    let coefficient = dynamic_terms.entry(AddressTerm::Scalar(term)).or_default();
+                    *coefficient = coefficient.checked_add(stride)?;
+                    if *coefficient == 0 {
+                        dynamic_terms.remove(&AddressTerm::Scalar(term));
+                    }
+                }
+                constant_offset =
+                    constant_offset.checked_add(affine.constant.checked_mul(stride)?)?;
+            }
+            current = *base;
+            continue;
         }
-        current = *base;
+
+        if let Some(recurrence) = recurrence_by_phi.get(&current).copied() {
+            if !expanded_recurrences.insert(current) {
+                return None;
+            }
+            chain_depth = chain_depth.checked_add(1)?;
+            if chain_depth > MAX_GEP_CHAIN_DEPTH {
+                return None;
+            }
+            let byte_strides =
+                typed_gep_byte_strides(func, recurrence.phi, recurrence.update, 1, budget)?;
+            let [byte_stride] = byte_strides.as_slice() else {
+                return None;
+            };
+            let coefficient = i64::from(recurrence.step).checked_mul(*byte_stride)?;
+            let loop_term = AddressTerm::Loop(recurrence.header);
+            let accumulated = dynamic_terms.entry(loop_term).or_default();
+            *accumulated = accumulated.checked_add(coefficient)?;
+            if *accumulated == 0 {
+                dynamic_terms.remove(&loop_term);
+            }
+            current = recurrence.initial;
+            continue;
+        }
+
+        break;
     }
 
     let root_value = func.values.get(current.0)?;
@@ -691,6 +830,13 @@ fn collect_uses(func: &Function, budget: &mut ProofBudget) -> Option<Vec<Vec<Use
                 InstKind::MemZero { ptr, .. }
                 | InstKind::Unary { value: ptr, .. }
                 | InstKind::Cast { value: ptr, .. } => record(*ptr, UseSite::Other)?,
+                InstKind::MemCopy {
+                    dst, src, count, ..
+                } => {
+                    record(*dst, UseSite::Other)?;
+                    record(*src, UseSite::Other)?;
+                    record(*count, UseSite::Other)?;
+                }
                 InstKind::Binary { lhs, rhs, .. }
                 | InstKind::Icmp { lhs, rhs, .. }
                 | InstKind::Fcmp { lhs, rhs, .. } => {

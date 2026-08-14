@@ -261,7 +261,8 @@ fn memory_dependences_allow_fusion(
             | InstKind::Alloca { .. }
             | InstKind::Load { .. }
             | InstKind::Call { .. }
-            | InstKind::MemZero { .. } => return false,
+            | InstKind::MemZero { .. }
+            | InstKind::MemCopy { .. } => return false,
         }
     }
 
@@ -293,7 +294,8 @@ fn memory_dependences_allow_fusion(
             | InstKind::Alloca { .. }
             | InstKind::Store { .. }
             | InstKind::Call { .. }
-            | InstKind::MemZero { .. } => return false,
+            | InstKind::MemZero { .. }
+            | InstKind::MemCopy { .. } => return false,
         }
     }
     if consumed_roots.is_empty() || !consumed_roots.is_subset(&produced_roots) {
@@ -517,7 +519,8 @@ fn clone_kind(kind: &InstKind, replacements: &ValueReplacements) -> InstKind {
         | InstKind::Alloca { .. }
         | InstKind::Store { .. }
         | InstKind::Call { .. }
-        | InstKind::MemZero { .. } => {
+        | InstKind::MemZero { .. }
+        | InstKind::MemCopy { .. } => {
             unreachable!("unsupported instruction reached adjacent loop fusion")
         }
     }
@@ -551,7 +554,20 @@ fn rewrite_kind(kind: &mut InstKind, replacements: &ValueReplacements) {
                 rewrite(value);
             }
         }
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => rewrite(ptr),
+        InstKind::Load { ptr } => rewrite(ptr),
+        InstKind::MemZero { ptr, count, .. } => {
+            rewrite(ptr);
+            if let Some(count) = count {
+                rewrite(count);
+            }
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => {
+            rewrite(dst);
+            rewrite(src);
+            rewrite(count);
+        }
         InstKind::Store { ptr, value } => {
             rewrite(ptr);
             rewrite(value);
@@ -590,7 +606,13 @@ fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
         InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. }

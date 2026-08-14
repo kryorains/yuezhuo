@@ -183,6 +183,7 @@ fn operands(kind: &InstKind) -> Vec<ValueId> {
         | InstKind::Load { .. }
         | InstKind::Store { .. }
         | InstKind::MemZero { .. }
+        | InstKind::MemCopy { .. }
         | InstKind::Call { .. } => Vec::new(),
     }
 }
@@ -203,6 +204,7 @@ fn is_safe_to_hoist(kind: &InstKind) -> bool {
         | InstKind::Load { .. }
         | InstKind::Store { .. }
         | InstKind::MemZero { .. }
+        | InstKind::MemCopy { .. }
         | InstKind::Call { .. } => false,
     }
 }

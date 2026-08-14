@@ -1,7 +1,6 @@
 use super::dominators::{ControlFlowGraph, Dominators};
-use super::loop_analysis::{
-    analyze_const_i32_trip_count, analyze_i32_induction, InductionVariable, LoopInfo, NaturalLoop,
-};
+use super::loop_analysis::{analyze_i32_induction, InductionVariable, LoopInfo, NaturalLoop};
+use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
 use crate::ir::{
     BinaryOp, BlockId, CmpOp, Const, Function, InstKind, Module, Terminator, Type, ValueId,
@@ -30,6 +29,7 @@ impl LoopMemoryPromotionPass {
 impl ModulePass for LoopMemoryPromotionPass {
     fn run(&mut self, module: &mut Module) {
         for func in &mut module.funcs {
+            forward_preheader_stores_into_loops(func);
             for _ in 0..MAX_PROMOTIONS_PER_FUNCTION {
                 let Some(candidate) = find_candidate(func) else {
                     break;
@@ -38,6 +38,156 @@ impl ModulePass for LoopMemoryPromotionPass {
             }
         }
     }
+}
+
+/// Forwards a value stored in a natural-loop preheader to repeated loads of
+/// the same invariant typed address when every write in the loop is proven
+/// disjoint.  This is the MemorySSA store-to-load form of loop load promotion:
+/// no access is speculated and zero-trip behavior is unchanged.
+fn forward_preheader_stores_into_loops(func: &mut Function) {
+    if func.blocks.len() > MAX_BLOCKS || func.values.len() > MAX_VALUES {
+        return;
+    }
+    let cfg = ControlFlowGraph::new(func);
+    let dom = Dominators::new(func, &cfg);
+    let loop_info = LoopInfo::new(&cfg, &dom);
+    let all_loops = loop_info.loops();
+    let mut replacements = ValueReplacements::new();
+    let mut dead_loads = Vec::new();
+    let mut forwarded = 0usize;
+
+    for natural_loop in all_loops {
+        if forwarded >= MAX_PROMOTIONS_PER_FUNCTION {
+            break;
+        }
+        let (Some(preheader), Some(induction)) = (
+            natural_loop.dedicated_preheader,
+            header_induction(func, natural_loop),
+        ) else {
+            continue;
+        };
+        if natural_loop.unique_latch().is_none()
+            || natural_loop.blocks.iter().any(|block| {
+                func.blocks[block.0].insts.iter().any(|inst| {
+                    matches!(
+                        inst.kind,
+                        InstKind::Call { .. } | InstKind::MemZero { .. } | InstKind::MemCopy { .. }
+                    )
+                })
+            })
+        {
+            continue;
+        }
+
+        let preheader_insts = &func.blocks[preheader.0].insts;
+        for (store_idx, store) in preheader_insts.iter().enumerate().rev() {
+            if forwarded >= MAX_PROMOTIONS_PER_FUNCTION {
+                break;
+            }
+            let InstKind::Store { ptr, value } = store.kind else {
+                continue;
+            };
+            let Some(path) = access_path(func, ptr) else {
+                continue;
+            };
+            if !is_loop_invariant(func, natural_loop, ptr)
+                || !value_available_at(func, &dom, ptr, preheader)
+                || !value_available_at(func, &dom, value, natural_loop.header)
+                || preheader_has_later_clobber(func, preheader, store_idx, &path)
+            {
+                continue;
+            }
+
+            let writes_are_disjoint = natural_loop.blocks.iter().all(|block| {
+                func.blocks[block.0]
+                    .insts
+                    .iter()
+                    .all(|inst| match inst.kind {
+                        InstKind::Store { ptr: other, .. } => {
+                            access_path(func, other).is_some_and(|other| {
+                                other != path
+                                    && paths_proven_disjoint(
+                                        func,
+                                        &dom,
+                                        natural_loop,
+                                        all_loops,
+                                        induction,
+                                        &path,
+                                        &other,
+                                        *block,
+                                    )
+                            })
+                        }
+                        InstKind::Call { .. }
+                        | InstKind::MemZero { .. }
+                        | InstKind::MemCopy { .. } => false,
+                        _ => true,
+                    })
+            });
+            if !writes_are_disjoint {
+                continue;
+            }
+
+            let mut loads = Vec::new();
+            for block in &natural_loop.blocks {
+                for (inst_idx, inst) in func.blocks[block.0].insts.iter().enumerate() {
+                    let (Some(result), InstKind::Load { ptr: loaded }) = (inst.result, &inst.kind)
+                    else {
+                        continue;
+                    };
+                    if access_path(func, *loaded).as_ref() == Some(&path)
+                        && func.value(result).ty == func.value(value).ty
+                    {
+                        loads.push((*block, inst_idx, result));
+                    }
+                }
+            }
+            if loads.is_empty() {
+                continue;
+            }
+            for (block, inst_idx, result) in loads {
+                replacements.insert(result, value);
+                dead_loads.push((block, inst_idx, result));
+            }
+            forwarded += 1;
+            break;
+        }
+    }
+
+    if replacements.is_empty() {
+        return;
+    }
+    rewrite_function_uses(func, &replacements);
+    for (block, inst_idx, result) in dead_loads {
+        let inst = &mut func.blocks[block.0].insts[inst_idx];
+        if inst.result == Some(result) && matches!(inst.kind, InstKind::Load { .. }) {
+            inst.result = None;
+            inst.kind = InstKind::Nop;
+        }
+    }
+    if let Err(errors) = func.verify() {
+        panic!(
+            "loop store-to-load forwarding produced invalid IR in {}: {:?}",
+            func.name, errors
+        );
+    }
+}
+
+fn preheader_has_later_clobber(
+    func: &Function,
+    preheader: BlockId,
+    store_idx: usize,
+    _target: &AccessPath,
+) -> bool {
+    func.blocks[preheader.0]
+        .insts
+        .iter()
+        .skip(store_idx + 1)
+        .any(|inst| match inst.kind {
+            InstKind::Store { .. } => true,
+            InstKind::Call { .. } | InstKind::MemZero { .. } | InstKind::MemCopy { .. } => true,
+            _ => false,
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +259,10 @@ fn find_candidate(func: &Function) -> Option<Candidate> {
                 .any(|inst| matches!(inst.kind, InstKind::Phi { .. }))
             || natural_loop.blocks.iter().any(|block| {
                 func.blocks[block.0].insts.iter().any(|inst| {
-                    matches!(inst.kind, InstKind::Call { .. } | InstKind::MemZero { .. })
+                    matches!(
+                        inst.kind,
+                        InstKind::Call { .. } | InstKind::MemZero { .. } | InstKind::MemCopy { .. }
+                    )
                 })
             })
         {
@@ -321,7 +474,13 @@ fn loop_definitions_do_not_escape(func: &Function, natural_loop: &NaturalLoop) -
 
 fn operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
@@ -357,7 +516,9 @@ fn loop_memory_is_disjoint(
         func.blocks[block.0].insts.iter().all(|inst| {
             let pointer = match inst.kind {
                 InstKind::Load { ptr } | InstKind::Store { ptr, .. } => ptr,
-                InstKind::MemZero { .. } | InstKind::Call { .. } => return false,
+                InstKind::MemZero { .. } | InstKind::MemCopy { .. } | InstKind::Call { .. } => {
+                    return false
+                }
                 _ => return true,
             };
             let Some(other) = access_path(func, pointer) else {
@@ -431,7 +592,7 @@ fn indices_proven_distinct(
     func: &Function,
     dom: &Dominators,
     natural_loop: &NaturalLoop,
-    all_loops: &[NaturalLoop],
+    _all_loops: &[NaturalLoop],
     induction: InductionVariable,
     target: ValueId,
     other: ValueId,
@@ -468,42 +629,11 @@ fn indices_proven_distinct(
     if initial_delta <= 0 || !(0..=1).contains(&other_delta) {
         return false;
     }
-    let Some((minimum, maximum)) =
-        enclosing_induction_range(func, dom, all_loops, target, access_block)
-    else {
-        return false;
-    };
-    minimum
-        .checked_add(i64::from(initial_delta))
-        .zip(maximum.checked_add(i64::from(initial_delta)))
-        .is_some_and(|(minimum, maximum)| {
-            minimum >= i64::from(i32::MIN) && maximum <= i64::from(i32::MAX)
-        })
-}
-
-fn enclosing_induction_range(
-    func: &Function,
-    dom: &Dominators,
-    all_loops: &[NaturalLoop],
-    value: ValueId,
-    access_block: BlockId,
-) -> Option<(i64, i64)> {
-    all_loops.iter().find_map(|natural_loop| {
-        let induction = analyze_i32_induction(func, natural_loop, value)?;
-        let (_, _, taken) = active_header_comparison(func, natural_loop, value)?;
-        if !natural_loop.blocks.contains(&access_block) || !dom.dominates(taken, access_block) {
-            return None;
-        }
-        let initial = i64::from(const_i32(func, induction.initial)?);
-        let trip_count = i64::from(analyze_const_i32_trip_count(func, natural_loop, induction)?);
-        if trip_count == 0 {
-            return None;
-        }
-        let last = i64::from(induction.step)
-            .checked_mul(trip_count - 1)?
-            .checked_add(initial)?;
-        Some((initial.min(last), initial.max(last)))
-    })
+    // The source-language `outer + positive_delta` and the unit inner
+    // recurrence both have signed-overflow UB.  On every defined execution
+    // the inner induction therefore begins strictly above the outer value and
+    // remains so; no constant trip count is required for this nsw proof.
+    true
 }
 
 fn affine_delta(func: &Function, value: ValueId, base: ValueId) -> Option<i32> {

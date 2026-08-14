@@ -53,7 +53,14 @@ struct Candidate {
     preheader: BlockId,
     header: BlockId,
     latch: BlockId,
+    exit_condition: ValueId,
+    continue_on_true: bool,
+    body_entry: BlockId,
+    exit_block: BlockId,
+    exact_trip_count: Option<u32>,
+    exit_bound: Option<ValueId>,
     pointer_ty: Type,
+    byte_step: i64,
     step_index: i32,
     affine_indices: HashMap<ValueId, AffineOffset>,
 }
@@ -79,6 +86,7 @@ fn strength_reduce_function(func: &mut Function) {
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
     let loops = LoopInfo::new(&cfg, &dom).loops().to_vec();
+    let write_only_allocas = super::dce::write_only_alloca_values(func);
     let mut candidates = Vec::new();
     let mut claimed = HashSet::new();
 
@@ -205,13 +213,41 @@ fn strength_reduce_function(func: &mut Function) {
     }
 
     let mut replacements = ValueReplacements::new();
+    let mut built_pointers = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
         let pointer = build_pointer_recurrence(func, candidate);
         replacements.insert(candidate.target, pointer);
+        built_pointers.push(pointer);
     }
+
     rewrite_function_uses(func, &replacements);
     for candidate in &candidates {
         remove_replaced_gep(func, candidate.target);
+    }
+    if let Err(errors) = func.verify() {
+        panic!(
+            "GEP induction recurrence construction produced invalid IR in {}: {:?}",
+            func.name, errors
+        );
+    }
+
+    // Building and installing every recurrence first keeps all candidate
+    // dominance proofs on the same CFG snapshot. Apply exit rewrites as
+    // verifier-guarded transactions: rotating one nested loop can change the
+    // dominance assumptions of another otherwise independent recurrence.
+    let mut rewritten_exit_tests = HashSet::new();
+    for (candidate, pointer) in candidates.iter().zip(built_pointers) {
+        let key = (candidate.header, candidate.induction.phi);
+        if !rewritten_exit_tests.insert(key) {
+            continue;
+        }
+        let before = func.clone();
+        if !rewrite_exact_exit_test_with_pointer(func, candidate, pointer, &write_only_allocas)
+            || func.verify().is_err()
+        {
+            *func = before;
+            rewritten_exit_tests.remove(&key);
+        }
     }
 
     if let Err(errors) = func.verify() {
@@ -232,6 +268,19 @@ fn analyze_candidate(
 ) -> Option<Candidate> {
     let preheader = natural_loop.dedicated_preheader?;
     let latch = natural_loop.unique_latch()?;
+    let Terminator::Branch {
+        cond: exit_condition,
+        then_target,
+        else_target,
+    } = func.blocks[natural_loop.header.0].terminator.as_ref()?
+    else {
+        return None;
+    };
+    let then_inside = natural_loop.blocks.contains(then_target);
+    let else_inside = natural_loop.blocks.contains(else_target);
+    if then_inside == else_inside {
+        return None;
+    }
     let pointer_ty = func.values.get(target.0)?.ty.clone();
     let final_elem_size = match &pointer_ty {
         Type::Ptr(pointee) => checked_type_size(pointee)?.max(1),
@@ -323,7 +372,23 @@ fn analyze_candidate(
         preheader,
         header: natural_loop.header,
         latch,
+        exit_condition: *exit_condition,
+        continue_on_true: then_inside,
+        body_entry: if then_inside {
+            *then_target
+        } else {
+            *else_target
+        },
+        exit_block: if then_inside {
+            *else_target
+        } else {
+            *then_target
+        },
+        exact_trip_count: analyze_const_i32_trip_count(func, natural_loop, induction),
+        exit_bound: active_header_comparison(func, natural_loop, induction.phi)
+            .and_then(|(op, bound, _)| (op == CmpOp::Lt && induction.step == 1).then_some(bound)),
         pointer_ty,
+        byte_step,
         step_index,
         affine_indices,
     })
@@ -422,6 +487,16 @@ fn derived_index_does_not_wrap(
         return false;
     };
 
+    // Once the AddRec itself is known not to wrap, an offset directed away
+    // from the moving endpoint only needs a proof at the initial value.  This
+    // is the standard SCEV range proof for `i - k` in an increasing loop (and
+    // symmetrically `i + k` in a decreasing loop).
+    if (induction.step > 0 && offset < 0) || (induction.step < 0 && offset > 0) {
+        return initial
+            .checked_add(i64::from(offset))
+            .is_some_and(|value| value >= i64::from(i32::MIN) && value <= i64::from(i32::MAX));
+    }
+
     let modulus = gcd_u64(induction.step.unsigned_abs() as u64, 1u64 << 32) as i64;
     if modulus == 0 {
         return false;
@@ -463,7 +538,7 @@ fn active_header_guard_proves_unit_offset(
     }
     matches!(
         (induction.step, op, offset),
-        (1, CmpOp::Lt, 1) | (-1, CmpOp::Gt, -1)
+        (1, CmpOp::Lt | CmpOp::Le, 1) | (-1, CmpOp::Gt | CmpOp::Ge, -1)
     )
 }
 
@@ -521,6 +596,15 @@ fn induction_does_not_wrap(
         return true;
     }
 
+    // Front-end i32 arithmetic carries the source language's signed-overflow
+    // undefined behavior.  Consequently a unit source recurrence is an nsw
+    // AddRec independently of whether a changing/aliasing loop bound can be
+    // hoisted.  LLVM SCEV and GCC ivopts rely on the same fact; a pointer
+    // recurrence only differs after the original `iv +/- 1` has overflowed.
+    if matches!(induction.step, -1 | 1) {
+        return true;
+    }
+
     let Some((op, bound, _)) = active_header_comparison(func, natural_loop, induction.phi) else {
         return false;
     };
@@ -541,14 +625,18 @@ fn induction_does_not_wrap(
             step == 1 || constant_bound.is_some_and(|bound| bound <= i64::from(i32::MAX) - step + 1)
         }
         (true, CmpOp::Le) => {
-            constant_bound.is_some_and(|bound| bound <= i64::from(i32::MAX) - step)
+            // A unit signed induction that executes past INT_MAX has already
+            // invoked source-level signed-overflow undefined behavior.  GCC's
+            // ivopts and LLVM's nsw AddRec reasoning use the same fact.  For
+            // larger steps we still require an explicit endpoint proof.
+            step == 1 || constant_bound.is_some_and(|bound| bound <= i64::from(i32::MAX) - step)
         }
         (false, CmpOp::Gt) => {
             step == -1
                 || constant_bound.is_some_and(|bound| bound >= i64::from(i32::MIN) - step - 1)
         }
         (false, CmpOp::Ge) => {
-            constant_bound.is_some_and(|bound| bound >= i64::from(i32::MIN) - step)
+            step == -1 || constant_bound.is_some_and(|bound| bound >= i64::from(i32::MIN) - step)
         }
         _ => false,
     }
@@ -684,6 +772,250 @@ fn build_pointer_recurrence(func: &mut Function, candidate: &Candidate) -> Value
     };
     incomings[1].1 = next_pointer;
     pointer
+}
+
+/// Rewrites an exact integer induction exit test to compare the corresponding
+/// pointer recurrence against its end pointer. This is the same generic
+/// induction-variable strength reduction performed by LLVM LSR and GCC
+/// ivopts: the proof uses only the AddRec, exact trip count and pointer stride.
+fn rewrite_exact_exit_test_with_pointer(
+    func: &mut Function,
+    candidate: &Candidate,
+    pointer: ValueId,
+    write_only_allocas: &HashSet<ValueId>,
+) -> bool {
+    if write_only_allocas.contains(&candidate.root) {
+        return false;
+    }
+    let Some(trip_count) = candidate.exact_trip_count else {
+        return rotate_dynamic_exit_test_with_pointer(func, candidate, pointer);
+    };
+    let Some(initial) = const_i32(func, candidate.induction.initial).map(i64::from) else {
+        return false;
+    };
+    let Some(exit_value) = i64::from(candidate.induction.step)
+        .checked_mul(i64::from(trip_count))
+        .and_then(|distance| initial.checked_add(distance))
+        .and_then(|value| i32::try_from(value).ok())
+    else {
+        return false;
+    };
+    let exit_index = get_or_add_i32_const(func, exit_value);
+
+    // A modular machine pointer must not reach the end address before the
+    // integer recurrence reaches its exact exit value.
+    let stride = candidate.byte_step.unsigned_abs() as u128;
+    let pointer_modulus = 1u128 << 64;
+    let period = pointer_modulus / gcd_u128(stride, pointer_modulus);
+    if u128::from(trip_count) >= period {
+        return false;
+    }
+
+    let Some(Terminator::Branch { cond, .. }) = func.blocks[candidate.header.0].terminator.as_ref()
+    else {
+        return false;
+    };
+    if *cond != candidate.exit_condition {
+        return false;
+    }
+    let condition = candidate.exit_condition;
+    let Some(InstKind::Icmp { lhs, rhs, .. }) = defining_inst(func, condition) else {
+        return false;
+    };
+    if *lhs != candidate.induction.phi && *rhs != candidate.induction.phi {
+        return false;
+    }
+
+    let Some(end_pointer) = build_pointer_at_induction(func, candidate, exit_index) else {
+        return false;
+    };
+    let Some(pointer_condition) = func.append_inst(
+        candidate.header,
+        InstKind::Icmp {
+            op: if candidate.continue_on_true {
+                CmpOp::Ne
+            } else {
+                CmpOp::Eq
+            },
+            lhs: pointer,
+            rhs: end_pointer,
+        },
+        Some(Type::I1),
+    ) else {
+        return false;
+    };
+    let Some(Terminator::Branch { cond, .. }) = func.blocks[candidate.header.0].terminator.as_mut()
+    else {
+        return false;
+    };
+    *cond = pointer_condition;
+    true
+}
+
+/// Rotates a strict unit-step loop so the ordered zero-trip test remains in
+/// the preheader while subsequent iterations use pointer equality at the
+/// latch. This is the canonical dynamic-trip IV exit transform used by GCC
+/// ivopts and LLVM loop rotation/LSR.
+fn rotate_dynamic_exit_test_with_pointer(
+    func: &mut Function,
+    candidate: &Candidate,
+    pointer: ValueId,
+) -> bool {
+    let Some(bound) = candidate.exit_bound else {
+        return false;
+    };
+    if candidate
+        .affine_indices
+        .values()
+        .any(|offset| *offset != AffineOffset::Constant(0))
+    {
+        // Building a dynamic end address for `iv + offset` would require a
+        // separate signed no-wrap proof at the failed-loop endpoint.
+        return false;
+    }
+    if func.blocks[candidate.exit_block.0]
+        .insts
+        .iter()
+        .any(|inst| matches!(inst.kind, InstKind::Phi { .. }))
+        || func.blocks[candidate.header.0].insts.iter().any(|inst| {
+            !matches!(inst.kind, InstKind::Nop | InstKind::Phi { .. })
+                && inst.result != Some(candidate.exit_condition)
+        })
+        || !matches!(
+            func.blocks[candidate.preheader.0].terminator,
+            Some(Terminator::Jump(target)) if target == candidate.header
+        )
+        || !matches!(
+            func.blocks[candidate.latch.0].terminator,
+            Some(Terminator::Jump(target)) if target == candidate.header
+        )
+    {
+        return false;
+    }
+    let cfg = ControlFlowGraph::new(func);
+    let dom = Dominators::new(func, &cfg);
+    if !value_available_at(func, &dom, bound, candidate.preheader) {
+        return false;
+    }
+
+    let stride = candidate.byte_step.unsigned_abs() as u128;
+    let pointer_modulus = 1u128 << 64;
+    let period = pointer_modulus / gcd_u128(stride, pointer_modulus);
+    if period <= (1u128 << 32) {
+        // The initial ordered guard plus source signed-overflow UB bounds a
+        // strict unit-step loop below 2^32 iterations.
+        return false;
+    }
+
+    let Some(next_pointer) = pointer_latch_incoming(func, pointer, candidate.latch) else {
+        return false;
+    };
+    let Some(end_pointer) = build_pointer_at_induction(func, candidate, bound) else {
+        return false;
+    };
+    let Some(initial_condition) = func.append_inst(
+        candidate.preheader,
+        InstKind::Icmp {
+            op: CmpOp::Lt,
+            lhs: candidate.induction.initial,
+            rhs: bound,
+        },
+        Some(Type::I1),
+    ) else {
+        return false;
+    };
+    let Some(latch_condition) = func.append_inst(
+        candidate.latch,
+        InstKind::Icmp {
+            op: CmpOp::Ne,
+            lhs: next_pointer,
+            rhs: end_pointer,
+        },
+        Some(Type::I1),
+    ) else {
+        return false;
+    };
+    func.blocks[candidate.preheader.0].terminator = Some(Terminator::Branch {
+        cond: initial_condition,
+        then_target: candidate.header,
+        else_target: candidate.exit_block,
+    });
+    func.blocks[candidate.header.0].terminator = Some(Terminator::Jump(candidate.body_entry));
+    func.blocks[candidate.latch.0].terminator = Some(Terminator::Branch {
+        cond: latch_condition,
+        then_target: candidate.header,
+        else_target: candidate.exit_block,
+    });
+    true
+}
+
+fn pointer_latch_incoming(func: &Function, pointer: ValueId, latch: BlockId) -> Option<ValueId> {
+    let InstKind::Phi { incomings } = defining_inst(func, pointer)? else {
+        return None;
+    };
+    incomings
+        .iter()
+        .find_map(|(predecessor, value)| (*predecessor == latch).then_some(*value))
+}
+
+fn build_pointer_at_induction(
+    func: &mut Function,
+    candidate: &Candidate,
+    induction: ValueId,
+) -> Option<ValueId> {
+    let mut affine_values = HashMap::<AffineOffset, ValueId>::new();
+    affine_values.insert(AffineOffset::Constant(0), induction);
+    let mut pointer = candidate.root;
+    for node in &candidate.chain {
+        let mut indices = Vec::with_capacity(node.indices.len());
+        for index in &node.indices {
+            let Some(offset) = candidate.affine_indices.get(index).copied() else {
+                indices.push(*index);
+                continue;
+            };
+            if let Some(value) = affine_values.get(&offset).copied() {
+                indices.push(value);
+                continue;
+            }
+            let rhs = match offset {
+                AffineOffset::Constant(offset) => get_or_add_i32_const(func, offset),
+                AffineOffset::Invariant(value) => value,
+            };
+            let value = if const_i32(func, induction) == Some(0) {
+                rhs
+            } else {
+                func.append_inst(
+                    candidate.preheader,
+                    InstKind::Binary {
+                        op: crate::ir::BinaryOp::Iadd,
+                        lhs: induction,
+                        rhs,
+                    },
+                    Some(Type::I32),
+                )?
+            };
+            affine_values.insert(offset, value);
+            indices.push(value);
+        }
+        pointer = func.append_inst(
+            candidate.preheader,
+            InstKind::Gep {
+                base: pointer,
+                indices,
+            },
+            Some(node.result_ty.clone()),
+        )?;
+    }
+    Some(pointer)
+}
+
+fn gcd_u128(mut lhs: u128, mut rhs: u128) -> u128 {
+    while rhs != 0 {
+        let remainder = lhs % rhs;
+        lhs = rhs;
+        rhs = remainder;
+    }
+    lhs
 }
 
 fn remove_replaced_gep(func: &mut Function, value: ValueId) {
@@ -845,7 +1177,13 @@ fn checked_type_size(ty: &Type) -> Option<i64> {
 fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Phi { .. } | InstKind::Alloca { .. } => Vec::new(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. }

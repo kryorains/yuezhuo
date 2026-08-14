@@ -126,6 +126,7 @@ fn value_is_loop_invariant(
                 InstKind::Store { ptr, .. } | InstKind::MemZero { ptr, .. } => {
                     pointer_root_global(func, *ptr).is_some_and(|root| root != global)
                 }
+                InstKind::MemCopy { .. } => false,
                 InstKind::Call { name, args } => inst.result.is_some_and(|result| {
                     effects
                         .resolve_no_memory_call(func, name, result, args)

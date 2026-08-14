@@ -114,6 +114,8 @@ fn main() {
         ir::pass::OptLevel::O0
     };
     let costs = target.cost_model();
+    let (min_pointer_memory_offset, max_pointer_memory_offset) =
+        costs.pointer_memory_offset_range();
     let pass_options = ir::pass::PassOptions {
         small_expr_inline_rounds: costs.small_expr_inline_rounds(),
         cfg_inline_rounds: costs.cfg_inline_rounds(),
@@ -126,9 +128,10 @@ fn main() {
         enable_uniform_constant_arguments: costs.enable_uniform_constant_arguments(),
         enable_loop_invariant_call_memoize: costs.enable_loop_invariant_call_memoize(),
         enable_regional_global_scalar_promotion: costs.enable_regional_global_scalar_promotion(),
-        enable_full_domain_bitwise_digit: costs.enable_full_domain_bitwise_digit(),
         enable_write_only_alloca_cleanup_before_inline: costs
             .cleanup_write_only_allocas_before_inline(),
+        min_pointer_memory_offset,
+        max_pointer_memory_offset,
     };
     ir::pass::run_pipeline_with_reduction_jam_factor(
         &mut module,

@@ -65,6 +65,10 @@ impl ModulePass for RecursiveInlinePass {
                     && Candidate::analyze(source, FunctionId(func_idx), &initial_targets).is_some()
             })
             .collect::<Vec<_>>();
+        let transformed_tail_loops = initial
+            .iter()
+            .map(Function::has_accumulator_tail_recursion_elimination)
+            .collect::<Vec<_>>();
         let mut module_growth = Growth::default();
         let mut function_growth = vec![Growth::default(); module.funcs.len()];
 
@@ -74,6 +78,9 @@ impl ModulePass for RecursiveInlinePass {
             let mut changed = false;
             for (func_idx, source) in snapshots.iter().enumerate() {
                 if !eligible[func_idx] {
+                    continue;
+                }
+                if transformed_tail_loops[func_idx] && function_growth[func_idx].blocks != 0 {
                     continue;
                 }
                 let Some(candidate) = Candidate::analyze(source, FunctionId(func_idx), &targets)
@@ -581,7 +588,10 @@ fn instructions_are_cloneable(func: &Function, reachable: &[bool]) -> bool {
         block.insts.iter().all(|inst| match &inst.kind {
             // Stack-object lifetime and bulk initialization need a separate
             // frame/escape proof. Reject them rather than approximating it.
-            InstKind::Alloca { .. } | InstKind::MemZero { .. } | InstKind::Fcmp { .. } => false,
+            InstKind::Alloca { .. }
+            | InstKind::MemZero { .. }
+            | InstKind::MemCopy { .. }
+            | InstKind::Fcmp { .. } => false,
             InstKind::Unary {
                 op: UnaryOp::Fneg, ..
             }
@@ -840,9 +850,21 @@ fn clone_inst_kind(
             ptr: map(*ptr),
             value: map(*value),
         },
-        InstKind::MemZero { ptr, bytes } => InstKind::MemZero {
+        InstKind::MemZero { ptr, bytes, count } => InstKind::MemZero {
             ptr: map(*ptr),
             bytes: *bytes,
+            count: count.map(map),
+        },
+        InstKind::MemCopy {
+            dst,
+            src,
+            element_bytes,
+            count,
+        } => InstKind::MemCopy {
+            dst: map(*dst),
+            src: map(*src),
+            element_bytes: *element_bytes,
+            count: map(*count),
         },
         InstKind::Unary { op, value } => InstKind::Unary {
             op: *op,

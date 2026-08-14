@@ -87,20 +87,22 @@ pub(crate) fn natural_loop_depths(func: &Function) -> Vec<usize> {
     depths
 }
 
-/// Orders canonical natural loops as `body .. latch, header, exit`.
+/// Places blocks using a profile-free CFG trace and orders canonical natural
+/// loops as `body .. latch, header, exit`.
 ///
 /// The preheader still jumps to the header for the zero-trip check. On the hot
 /// path, however, the latch falls through to the header and the header branches
-/// back to the body, removing one unconditional branch per iteration. Block
-/// identities and CFG edges are unchanged; this is only an assembly layout.
+/// back to the body, removing one unconditional branch per iteration. A reverse
+/// postorder trace is used only when it preserves every fallthrough backedge and
+/// statically reduces control transfers. Block identities and CFG edges are
+/// unchanged; this is only an assembly layout.
 pub(crate) fn loop_rotated_block_order(func: &Function) -> Vec<usize> {
     const MAX_LAYOUT_BLOCKS: usize = 1024;
     const MAX_ROTATED_LOOPS: usize = 64;
 
     let block_count = func.blocks.len();
-    let mut order = (0..block_count).collect::<Vec<_>>();
     if block_count == 0 || block_count > MAX_LAYOUT_BLOCKS || func.entry.0 >= block_count {
-        return order;
+        return (0..block_count).collect();
     }
 
     let (predecessors, successors) = control_flow_graph(func);
@@ -124,16 +126,12 @@ pub(crate) fn loop_rotated_block_order(func: &Function) -> Vec<usize> {
     }
 
     let mut candidates = Vec::new();
+    let mut latch_exit_candidates = Vec::new();
     for (header, loop_latches) in latches.iter().enumerate() {
         let [latch] = loop_latches.as_slice() else {
             continue;
         };
-        if *latch == header
-            || !matches!(
-                func.blocks[*latch].terminator,
-                Some(Terminator::Jump(target)) if target.0 == header
-            )
-        {
+        if *latch == header {
             continue;
         }
 
@@ -154,6 +152,30 @@ pub(crate) fn loop_rotated_block_order(func: &Function) -> Vec<usize> {
             continue;
         }
 
+        let member_count = members.iter().filter(|member| **member).count();
+        if let Some(Terminator::Branch {
+            then_target,
+            else_target,
+            ..
+        }) = func.blocks[*latch].terminator.as_ref()
+        {
+            let exit = if then_target.0 == header && !members[else_target.0] {
+                Some(else_target.0)
+            } else if else_target.0 == header && !members[then_target.0] {
+                Some(then_target.0)
+            } else {
+                None
+            };
+            if let Some(exit) =
+                exit.filter(|exit| *exit != header && *exit != *latch && *exit != func.entry.0)
+            {
+                // A post-tested loop is cheapest as `header .. latch, exit`:
+                // the latch branches back and the cold exit falls through.
+                latch_exit_candidates.push((member_count, header, *latch, exit));
+                continue;
+            }
+        }
+
         let Some(Terminator::Branch {
             then_target,
             else_target,
@@ -172,25 +194,93 @@ pub(crate) fn loop_rotated_block_order(func: &Function) -> Vec<usize> {
         } else {
             then_target.0
         };
+        let latch_falls_back = matches!(
+            func.blocks[*latch].terminator,
+            Some(Terminator::Jump(target)) if target.0 == header
+        );
+        let latch_has_equivalent_branch_edges = matches!(
+            func.blocks[*latch].terminator,
+            Some(Terminator::Branch { then_target, else_target, .. })
+                if then_target.0 == header && else_target.0 == header
+        );
+        if !latch_falls_back && !latch_has_equivalent_branch_edges {
+            continue;
+        }
         if exit == header || exit == *latch || exit == func.entry.0 {
             continue;
         }
-        candidates.push((
-            members.iter().filter(|member| **member).count(),
-            header,
-            *latch,
-            exit,
-        ));
+        candidates.push((member_count, header, *latch, exit));
     }
 
-    if candidates.len() > MAX_ROTATED_LOOPS {
-        return order;
+    if candidates.len().saturating_add(latch_exit_candidates.len()) > MAX_ROTATED_LOOPS {
+        return (0..block_count).collect();
     }
 
     // Rotate inner loops before their containing loops. Every edit looks up the
     // current positions, so nested rotations remain stable.
     candidates.sort_by_key(|(member_count, _, _, _)| *member_count);
-    for (_, header, latch, exit) in candidates {
+    latch_exit_candidates.sort_by_key(|(member_count, _, _, _)| *member_count);
+    let mut reachable = vec![false; block_count];
+    for block in &reverse_postorder {
+        reachable[*block] = true;
+    }
+    let mut source_order = (0..block_count).collect::<Vec<_>>();
+    source_order.retain(|block| reachable[*block]);
+    rotate_loop_layouts(&mut source_order, &candidates);
+
+    let mut trace_order = reverse_postorder;
+    rotate_loop_layouts(&mut trace_order, &candidates);
+
+    // Loop backedges are the only profile-free edges known to be hot. Never
+    // trade one of their fallthroughs for an acyclic trace improvement. When
+    // both layouts preserve the same number, select RPO only if it eliminates
+    // at least one statically emitted jump/branch.
+    let source_backedges = fallthrough_backedges(&source_order, &successors, &dom_in, &dom_out);
+    let trace_backedges = fallthrough_backedges(&trace_order, &successors, &dom_in, &dom_out);
+    let source_transfers = estimated_control_transfers(func, &source_order);
+    let trace_transfers = estimated_control_transfers(func, &trace_order);
+    let mut chosen = if trace_backedges >= source_backedges && trace_transfers < source_transfers {
+        trace_order
+    } else {
+        source_order
+    };
+    // Latch-exit placement is a local post-layout improvement.  Keeping it
+    // out of the source-vs-RPO choice prevents one newly adjacent exit from
+    // changing unrelated diamond fallthroughs elsewhere in the function.
+    place_latch_exits(func, &mut chosen, &latch_exit_candidates);
+    chosen
+}
+
+fn place_latch_exits(
+    func: &Function,
+    order: &mut Vec<usize>,
+    candidates: &[(usize, usize, usize, usize)],
+) {
+    for (_, header, latch, exit) in candidates.iter().copied() {
+        let Some(latch_position) = order.iter().position(|block| *block == latch) else {
+            continue;
+        };
+        // If the backedge already falls through, switching the fallthrough to
+        // the exit does not reduce a control transfer and may expose a phi-copy
+        // stub on every continuing iteration.
+        if order.get(latch_position + 1) == Some(&header) {
+            continue;
+        }
+        let old_transfers = estimated_control_transfers(func, order);
+        let mut candidate = order.clone();
+        candidate.retain(|block| *block != exit);
+        let Some(latch_position) = candidate.iter().position(|block| *block == latch) else {
+            continue;
+        };
+        candidate.insert(latch_position + 1, exit);
+        if estimated_control_transfers(func, &candidate) < old_transfers {
+            *order = candidate;
+        }
+    }
+}
+
+fn rotate_loop_layouts(order: &mut Vec<usize>, candidates: &[(usize, usize, usize, usize)]) {
+    for (_, header, latch, exit) in candidates.iter().copied() {
         order.retain(|block| *block != header && *block != exit);
         let Some(latch_position) = order.iter().position(|block| *block == latch) else {
             continue;
@@ -198,12 +288,54 @@ pub(crate) fn loop_rotated_block_order(func: &Function) -> Vec<usize> {
         order.insert(latch_position + 1, header);
         order.insert(latch_position + 2, exit);
     }
-    let mut reachable = vec![false; block_count];
-    for block in reverse_postorder {
-        reachable[block] = true;
-    }
-    order.retain(|block| reachable[*block]);
+}
+
+fn fallthrough_backedges(
+    order: &[usize],
+    successors: &[Vec<usize>],
+    dom_in: &[usize],
+    dom_out: &[usize],
+) -> usize {
     order
+        .windows(2)
+        .filter(|pair| {
+            let source = pair[0];
+            let target = pair[1];
+            successors[source].contains(&target) && dominates(target, source, dom_in, dom_out)
+        })
+        .count()
+}
+
+fn estimated_control_transfers(func: &Function, order: &[usize]) -> usize {
+    order
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(position, block)| {
+            let next = order.get(position + 1).copied();
+            match func.blocks[block].terminator.as_ref() {
+                Some(Terminator::Jump(target)) => usize::from(next != Some(target.0)),
+                Some(Terminator::Branch {
+                    then_target,
+                    else_target,
+                    ..
+                }) if then_target == else_target => usize::from(next != Some(then_target.0)),
+                Some(Terminator::Branch {
+                    then_target,
+                    else_target,
+                    ..
+                }) => {
+                    if next == Some(then_target.0) || next == Some(else_target.0) {
+                        1
+                    } else {
+                        2
+                    }
+                }
+                Some(Terminator::Return(_)) => usize::from(next.is_some()),
+                None => 0,
+            }
+        })
+        .sum()
 }
 
 fn natural_loop_members(

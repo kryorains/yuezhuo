@@ -140,7 +140,7 @@ fn forward_function(func: &mut Function, effects: &FunctionEffects) {
                                 .resolve_no_memory_call(func, name, result, args)
                                 .is_some()
                         }) => {}
-                    InstKind::Call { .. } | InstKind::MemZero { .. } => {
+                    InstKind::Call { .. } | InstKind::MemZero { .. } | InstKind::MemCopy { .. } => {
                         // 调用和批量清零都可能改写内存，保守地丢弃本块内已知信息。
                         known_memory.clear();
                         known_loads.clear();
@@ -285,7 +285,9 @@ fn transfer_load_state(
                         .resolve_no_memory_call(func, name, result, args)
                         .is_some()
                 }) => {}
-            InstKind::Call { .. } | InstKind::MemZero { .. } => state.clear(),
+            InstKind::Call { .. } | InstKind::MemZero { .. } | InstKind::MemCopy { .. } => {
+                state.clear()
+            }
             _ => {}
         }
     }
@@ -355,7 +357,10 @@ fn eliminate_redundant_writebacks(func: &mut Function) -> bool {
                 continue;
             }
 
-            if matches!(inst.kind, InstKind::Call { .. } | InstKind::MemZero { .. }) {
+            if matches!(
+                inst.kind,
+                InstKind::Call { .. } | InstKind::MemZero { .. } | InstKind::MemCopy { .. }
+            ) {
                 candidates.clear();
             }
         }
@@ -402,7 +407,10 @@ fn eliminate_overwritten_stores(func: &mut Function) -> bool {
                     }
                     candidates.insert(*ptr, inst_idx);
                 }
-                InstKind::Store { .. } | InstKind::Call { .. } | InstKind::MemZero { .. } => {
+                InstKind::Store { .. }
+                | InstKind::Call { .. }
+                | InstKind::MemZero { .. }
+                | InstKind::MemCopy { .. } => {
                     candidates.clear();
                 }
                 _ => {}

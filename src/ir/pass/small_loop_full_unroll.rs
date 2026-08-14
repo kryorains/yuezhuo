@@ -236,7 +236,10 @@ fn match_candidate(func: &Function, natural_loop: &NaturalLoop) -> Option<Candid
         || body_insts.iter().any(|inst| {
             matches!(
                 inst.kind,
-                InstKind::Phi { .. } | InstKind::Alloca { .. } | InstKind::MemZero { .. }
+                InstKind::Phi { .. }
+                    | InstKind::Alloca { .. }
+                    | InstKind::MemZero { .. }
+                    | InstKind::MemCopy { .. }
             )
         })
     {
@@ -415,8 +418,21 @@ fn rewrite_inst_operands(kind: &mut InstKind, replacements: &ValueReplacements) 
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => {}
         InstKind::Phi { .. } => unreachable!("phis are rewritten with edge context"),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => {
+        InstKind::Load { ptr } => {
             rewrite_value(ptr, replacements);
+        }
+        InstKind::MemZero { ptr, count, .. } => {
+            rewrite_value(ptr, replacements);
+            if let Some(count) = count {
+                rewrite_value(count, replacements);
+            }
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => {
+            rewrite_value(dst, replacements);
+            rewrite_value(src, replacements);
+            rewrite_value(count, replacements);
         }
         InstKind::Store { ptr, value } => {
             rewrite_value(ptr, replacements);
@@ -494,7 +510,10 @@ fn remap_inst(kind: &InstKind, replacements: &ValueReplacements) -> InstKind {
             name: name.clone(),
             args: args.iter().map(|arg| map(*arg)).collect(),
         },
-        InstKind::Phi { .. } | InstKind::Alloca { .. } | InstKind::MemZero { .. } => {
+        InstKind::Phi { .. }
+        | InstKind::Alloca { .. }
+        | InstKind::MemZero { .. }
+        | InstKind::MemCopy { .. } => {
             unreachable!("unsupported instruction passed full-unroll matching")
         }
     }
@@ -504,7 +523,13 @@ fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
         InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. }

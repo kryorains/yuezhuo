@@ -19,10 +19,11 @@ pub struct TargetCostModel {
     uniform_constant_arguments: bool,
     loop_invariant_call_memoize: bool,
     regional_global_scalar_promotion: bool,
-    full_domain_bitwise_digit: bool,
     cleanup_write_only_allocas_before_inline: bool,
     max_reduction_jam_factor: usize,
     callee_saved_register_score: usize,
+    min_pointer_memory_offset: i64,
+    max_pointer_memory_offset: i64,
 }
 
 impl TargetCostModel {
@@ -40,10 +41,11 @@ impl TargetCostModel {
                 uniform_constant_arguments: true,
                 loop_invariant_call_memoize: true,
                 regional_global_scalar_promotion: true,
-                full_domain_bitwise_digit: true,
                 cleanup_write_only_allocas_before_inline: true,
                 max_reduction_jam_factor: 4,
                 callee_saved_register_score: 16,
+                min_pointer_memory_offset: -2048,
+                max_pointer_memory_offset: 2047,
             },
         }
     }
@@ -92,16 +94,19 @@ impl TargetCostModel {
         self.regional_global_scalar_promotion
     }
 
-    pub const fn enable_full_domain_bitwise_digit(self) -> bool {
-        self.full_domain_bitwise_digit
-    }
-
     pub const fn cleanup_write_only_allocas_before_inline(self) -> bool {
         self.cleanup_write_only_allocas_before_inline
     }
 
     pub const fn max_reduction_jam_factor(self) -> usize {
         self.max_reduction_jam_factor
+    }
+
+    pub const fn pointer_memory_offset_range(self) -> (i64, i64) {
+        (
+            self.min_pointer_memory_offset,
+            self.max_pointer_memory_offset,
+        )
     }
 
     pub(crate) const fn should_use_callee_saved_register(

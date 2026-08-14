@@ -141,6 +141,7 @@ fn value_range(
                 | InstKind::Load { .. }
                 | InstKind::Store { .. }
                 | InstKind::MemZero { .. }
+                | InstKind::MemCopy { .. }
                 | InstKind::Fcmp { .. }
                 | InstKind::Gep { .. } => None,
             },

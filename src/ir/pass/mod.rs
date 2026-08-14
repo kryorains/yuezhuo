@@ -1,6 +1,5 @@
 mod adjacent_loop_fusion;
 mod affine_reuse;
-mod bitwise_digit_loop;
 mod const_fold;
 mod const_specialize;
 mod constant_address_reduction;
@@ -12,7 +11,7 @@ mod gep_induction;
 mod global_const_prop;
 mod global_scalar_localize;
 mod global_write_only;
-mod guarded_shift_dispatch;
+mod induction_strength_reduce;
 mod inline;
 mod inst_combine;
 mod invariant_load;
@@ -21,10 +20,12 @@ mod local_forward;
 mod local_memzero_sink;
 mod loop_analysis;
 mod loop_call_memoize;
+mod loop_memcpy;
 mod loop_memory_promotion;
-mod modular_recurrence;
+mod loop_memset;
 mod pointer_recurrence_coalesce;
 mod range_integer;
+mod recurrence_update_sink;
 mod recursive_inline;
 mod reduction_jam;
 mod regional_global_scalar;
@@ -38,7 +39,6 @@ mod util;
 use super::Module;
 use adjacent_loop_fusion::AdjacentLoopFusionPass;
 use affine_reuse::AffineReusePass;
-use bitwise_digit_loop::BitwiseDigitLoopPass;
 use const_fold::ConstFoldPass;
 use const_specialize::ConstSpecializePass;
 use constant_address_reduction::ConstantAddressReductionPass;
@@ -48,7 +48,7 @@ use gep_induction::GepInductionPass;
 use global_const_prop::GlobalConstPropPass;
 use global_scalar_localize::GlobalScalarLocalizePass;
 use global_write_only::GlobalWriteOnlyPass;
-use guarded_shift_dispatch::GuardedShiftDispatchPass;
+use induction_strength_reduce::InductionStrengthReducePass;
 use inline::InlineSmallExprPass;
 use inst_combine::InstCombinePass;
 use invariant_load::InvariantLoadForwardPass;
@@ -56,10 +56,12 @@ use licm::LicmPass;
 use local_forward::LocalForwardPass;
 use local_memzero_sink::LocalMemzeroSinkPass;
 use loop_call_memoize::LoopCallMemoizePass;
+use loop_memcpy::LoopMemcpyPass;
 use loop_memory_promotion::LoopMemoryPromotionPass;
-use modular_recurrence::ModularRecurrencePass;
+use loop_memset::LoopMemsetPass;
 use pointer_recurrence_coalesce::PointerRecurrenceCoalescePass;
 use range_integer::RangeIntegerSimplifyPass;
+use recurrence_update_sink::RecurrenceUpdateSinkPass;
 use recursive_inline::{CfgInlinePass, RecursiveInlinePass};
 use reduction_jam::ReductionJamPass;
 use regional_global_scalar::{RegionalGlobalScalarPass, RegionalInvariantGlobalLoadPass};
@@ -88,8 +90,9 @@ pub struct PassOptions {
     pub enable_uniform_constant_arguments: bool,
     pub enable_loop_invariant_call_memoize: bool,
     pub enable_regional_global_scalar_promotion: bool,
-    pub enable_full_domain_bitwise_digit: bool,
     pub enable_write_only_alloca_cleanup_before_inline: bool,
+    pub min_pointer_memory_offset: i64,
+    pub max_pointer_memory_offset: i64,
 }
 
 pub fn run_pipeline(module: &mut Module, opt_level: OptLevel, options: PassOptions) {
@@ -132,11 +135,6 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(GlobalScalarLocalizePass::new_across_no_memory_calls());
             pipeline.add(ScalarPromotePass::new());
             pipeline.add(DcePass::new());
-            pipeline.add(BitwiseDigitLoopPass::new(
-                options.enable_full_domain_bitwise_digit,
-            ));
-            pipeline.add(GuardedShiftDispatchPass::new());
-            pipeline.add(ModularRecurrencePass::new());
             pipeline.add(ConstSpecializePass::new(
                 options.enable_recursive_const_specialization,
                 options.enable_uniform_constant_arguments,
@@ -168,6 +166,8 @@ pub fn run_pipeline_with_reduction_jam_factor(
             }
             pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
             pipeline.add(RangeIntegerSimplifyPass::new());
+            pipeline.add(SimplifyCfgPass::preserving_loop_preheaders());
+            pipeline.add(ScalarPromotePass::new());
             pipeline.add(DcePass::new());
             pipeline.add(AdjacentLoopFusionPass::new());
             pipeline.add(LocalForwardPass::new());
@@ -200,11 +200,17 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(ConstFoldPass::new());
             pipeline.add(LoopMemoryPromotionPass::new());
             pipeline.add(ScalarPromotePass::new());
+            pipeline.add(InductionStrengthReducePass::new());
+            pipeline.add(LoopMemsetPass::new());
             pipeline.add(GepInductionPass::new());
+            pipeline.add(LoopMemcpyPass::new());
             // Canonicalize independently rebuilt affine starts before proving
             // constant distances between their pointer recurrences.
             pipeline.add(CsePass::new());
-            pipeline.add(PointerRecurrenceCoalescePass::new());
+            pipeline.add(PointerRecurrenceCoalescePass::new(
+                options.min_pointer_memory_offset,
+                options.max_pointer_memory_offset,
+            ));
             if options.enable_regional_global_scalar_promotion {
                 pipeline.add(RegionalGlobalScalarPass::new());
                 pipeline.add(ScalarPromotePass::new());
@@ -217,6 +223,12 @@ pub fn run_pipeline_with_reduction_jam_factor(
             pipeline.add(DcePass::new());
             pipeline.add(LocalMemzeroSinkPass::new());
             pipeline.add(SimplifyCfgPass::new());
+            // CFG cleanup can merge conditional backedges and expose another
+            // round of canonical integer recurrences.
+            pipeline.add(InductionStrengthReducePass::new());
+            pipeline.add(InstCombinePass::new());
+            pipeline.add(CsePass::new());
+            pipeline.add(RecurrenceUpdateSinkPass::new());
             pipeline.add(DcePass::new());
         }
     }

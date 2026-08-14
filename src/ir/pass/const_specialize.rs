@@ -306,7 +306,13 @@ fn specialization_operands(kind: &InstKind) -> Vec<(ValueId, usize)> {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
         InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| (*value, 1)).collect(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![(*ptr, 1)],
+        InstKind::Load { ptr } => vec![(*ptr, 1)],
+        InstKind::MemZero { ptr, count, .. } => std::iter::once((*ptr, 1))
+            .chain(count.iter().map(|count| (*count, 1)))
+            .collect(),
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![(*dst, 1), (*src, 1), (*count, 1)],
         InstKind::Store { ptr, value } => vec![(*ptr, 1), (*value, 1)],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![(*value, 1)],
         InstKind::Binary {

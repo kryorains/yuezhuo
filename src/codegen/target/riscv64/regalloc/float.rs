@@ -1,7 +1,7 @@
 use super::{interference_graph, phi_affinities};
 use crate::codegen::common::{ir_value_use_counts, weighted_use_scores};
 use crate::codegen::Target;
-use crate::ir::{Function, InstKind, Type, ValueId, ValueKind};
+use crate::ir::{Const, Function, InstKind, Type, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
 const CALLER_SAVED_REGS: [&str; 11] = [
@@ -18,6 +18,7 @@ const MAX_LIVENESS_CELLS: usize = 262_144;
 pub(in crate::codegen::target::riscv64) struct Riscv64FloatRegAlloc {
     regs: HashMap<ValueId, &'static str>,
     used_callee_saved: Vec<&'static str>,
+    materialized: Vec<(ValueId, &'static str)>,
 }
 
 impl Riscv64FloatRegAlloc {
@@ -27,6 +28,7 @@ impl Riscv64FloatRegAlloc {
         }
 
         let use_counts = ir_value_use_counts(func);
+        let scores = weighted_use_scores(func);
         let candidate_set = func
             .values
             .iter()
@@ -39,6 +41,9 @@ impl Riscv64FloatRegAlloc {
                         func.blocks[block.0].insts[inst_idx].kind,
                         InstKind::Nop | InstKind::Alloca { .. }
                     ),
+                    ValueKind::Const(Const::Float(_) | Const::Zero(Type::F32)) => {
+                        scores[index] >= 16
+                    }
                     ValueKind::Const(_) | ValueKind::Global(_) => false,
                 };
                 (value.ty == Type::F32 && use_counts[index] != 0 && supported_kind)
@@ -54,7 +59,6 @@ impl Riscv64FloatRegAlloc {
             return Self::empty();
         }
 
-        let scores = weighted_use_scores(func);
         let costs = Target::Riscv64.cost_model();
         let Some(analysis) = interference_graph(func, &candidate_set) else {
             return Self::empty();
@@ -99,9 +103,17 @@ impl Riscv64FloatRegAlloc {
             .copied()
             .filter(|reg| occupied.contains(reg))
             .collect();
+        let mut materialized = regs
+            .iter()
+            .filter_map(|(value, reg)| {
+                matches!(func.value(*value).kind, ValueKind::Const(_)).then_some((*value, *reg))
+            })
+            .collect::<Vec<_>>();
+        materialized.sort_by_key(|(value, _)| value.0);
         Self {
             regs,
             used_callee_saved,
+            materialized,
         }
     }
 
@@ -109,6 +121,7 @@ impl Riscv64FloatRegAlloc {
         Self {
             regs: HashMap::new(),
             used_callee_saved: Vec::new(),
+            materialized: Vec::new(),
         }
     }
 
@@ -118,5 +131,9 @@ impl Riscv64FloatRegAlloc {
 
     pub(in crate::codegen::target::riscv64) fn used_callee_saved(&self) -> &[&'static str] {
         &self.used_callee_saved
+    }
+
+    pub(in crate::codegen::target::riscv64) fn materialized(&self) -> &[(ValueId, &'static str)] {
+        &self.materialized
     }
 }

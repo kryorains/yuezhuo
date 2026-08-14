@@ -51,9 +51,10 @@ impl FunctionEffects {
 
             for inst in func.blocks.iter().flat_map(|block| &block.insts) {
                 match &inst.kind {
-                    InstKind::Load { .. } | InstKind::Store { .. } | InstKind::MemZero { .. } => {
-                        no_memory[func_idx] = false
-                    }
+                    InstKind::Load { .. }
+                    | InstKind::Store { .. }
+                    | InstKind::MemZero { .. }
+                    | InstKind::MemCopy { .. } => no_memory[func_idx] = false,
                     InstKind::Call { name, args } => {
                         call_edges = call_edges.saturating_add(1);
                         if call_edges > MAX_CALL_EDGES {

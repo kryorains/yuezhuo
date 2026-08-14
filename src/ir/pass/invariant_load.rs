@@ -1,7 +1,8 @@
 mod analysis;
 
-use self::analysis::WholeProgramAliasInfo;
+use self::analysis::{MemoryRoot, WholeProgramAliasInfo};
 use super::dominators::{ControlFlowGraph, Dominators};
+use super::loop_analysis::LoopInfo;
 use super::util::{rewrite_function_uses, ValueReplacements};
 use super::ModulePass;
 use crate::ir::{BlockId, Function, InstKind, Module, ValueId, ValueKind};
@@ -62,6 +63,7 @@ fn forward_invariant_loads(
                 InstKind::Store { ptr, .. } | InstKind::MemZero { ptr, .. } => {
                     writes.push(alias_info.root(func, *ptr));
                 }
+                InstKind::MemCopy { .. } => return,
                 InstKind::Load { ptr } => {
                     load_ptrs.insert(*ptr);
                 }
@@ -82,6 +84,13 @@ fn forward_invariant_loads(
     if readonly_ptrs.is_empty() {
         return;
     }
+
+    // A direct global object is always a valid address.  Once whole-program
+    // alias analysis has proved that the function cannot modify it, its load
+    // is safe to speculate into a natural-loop preheader.  Process inner
+    // loops first so the same load can subsequently migrate out of enclosing
+    // loops, just as mature LICM implementations do.
+    hoist_readonly_global_loads(func, alias_info, &readonly_ptrs);
 
     let cfg = ControlFlowGraph::new(func);
     let dom = Dominators::new(func, &cfg);
@@ -106,6 +115,62 @@ fn forward_invariant_loads(
             "invariant load forwarding produced invalid IR in {}: {:?}",
             func.name, errors
         );
+    }
+}
+
+fn hoist_readonly_global_loads(
+    func: &mut Function,
+    alias_info: &WholeProgramAliasInfo,
+    readonly_ptrs: &HashSet<ValueId>,
+) {
+    let cfg = ControlFlowGraph::new(func);
+    let dom = Dominators::new(func, &cfg);
+    let mut loops = LoopInfo::new(&cfg, &dom).loops().to_vec();
+    loops.sort_by_key(|natural_loop| natural_loop.blocks.len());
+
+    for natural_loop in loops {
+        let Some(preheader) = natural_loop.dedicated_preheader else {
+            continue;
+        };
+        let mut locations = HashSet::new();
+        let mut candidates = Vec::new();
+        let mut blocks = natural_loop.blocks.iter().copied().collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.0);
+        for block in blocks {
+            for (inst_idx, inst) in func.blocks[block.0].insts.iter().enumerate() {
+                let (Some(result), InstKind::Load { ptr }) = (inst.result, &inst.kind) else {
+                    continue;
+                };
+                if !readonly_ptrs.contains(ptr)
+                    || !matches!(func.value(*ptr).kind, ValueKind::Global(_))
+                {
+                    continue;
+                }
+                let MemoryRoot::Global(global) = alias_info.root(func, *ptr) else {
+                    continue;
+                };
+                let location = LoadLocation::DirectGlobal(global);
+                if locations.insert(location) {
+                    candidates.push((block, inst_idx, result, *ptr));
+                }
+            }
+        }
+
+        for (block, inst_idx, result, ptr) in candidates {
+            if !natural_loop.blocks.contains(&block)
+                || !matches!(func.blocks[block.0].insts[inst_idx].kind, InstKind::Load { ptr: current } if current == ptr)
+            {
+                continue;
+            }
+            func.blocks[block.0].insts[inst_idx].result = None;
+            func.blocks[block.0].insts[inst_idx].kind = InstKind::Nop;
+            let new_idx = func.blocks[preheader.0].insts.len();
+            func.blocks[preheader.0].insts.push(crate::ir::Inst {
+                result: Some(result),
+                kind: InstKind::Load { ptr },
+            });
+            func.values[result.0].kind = ValueKind::Inst(preheader, new_idx);
+        }
     }
 }
 

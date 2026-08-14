@@ -166,7 +166,10 @@ fn loop_has_side_effects(func: &Function, natural_loop: &NaturalLoop) -> bool {
         func.blocks[block.0].insts.iter().any(|inst| {
             matches!(
                 inst.kind,
-                InstKind::Store { .. } | InstKind::MemZero { .. } | InstKind::Call { .. }
+                InstKind::Store { .. }
+                    | InstKind::MemZero { .. }
+                    | InstKind::MemCopy { .. }
+                    | InstKind::Call { .. }
             )
         })
     })
@@ -381,7 +384,13 @@ fn inst_operands(kind: &InstKind) -> Vec<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => Vec::new(),
         InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => vec![*ptr],
+        InstKind::Load { ptr } => vec![*ptr],
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => vec![*dst, *src, *count],
         InstKind::Store { ptr, value } => vec![*ptr, *value],
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => vec![*value],
         InstKind::Binary { lhs, rhs, .. }

@@ -251,7 +251,13 @@ fn inst_operands(kind: &InstKind) -> HashSet<ValueId> {
     match kind {
         InstKind::Nop | InstKind::Alloca { .. } => HashSet::new(),
         InstKind::Phi { incomings } => incomings.iter().map(|(_, value)| *value).collect(),
-        InstKind::Load { ptr } | InstKind::MemZero { ptr, .. } => HashSet::from([*ptr]),
+        InstKind::Load { ptr } => HashSet::from([*ptr]),
+        InstKind::MemZero { ptr, count, .. } => {
+            std::iter::once(*ptr).chain(count.iter().copied()).collect()
+        }
+        InstKind::MemCopy {
+            dst, src, count, ..
+        } => [*dst, *src, *count].into_iter().collect(),
         InstKind::Store { ptr, value } => HashSet::from([*ptr, *value]),
         InstKind::Unary { value, .. } | InstKind::Cast { value, .. } => HashSet::from([*value]),
         InstKind::Binary { lhs, rhs, .. }
